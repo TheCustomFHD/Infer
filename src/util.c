@@ -41,6 +41,39 @@ void inf_die(const char *fmt, ...) {
 /* and a strict-aliasing violation.                                    */
 /* ------------------------------------------------------------------ */
 
+int inf_check_byte_order(void) {
+    unsigned long probe = 1;
+    int host_big = (*(const unsigned char *) &probe) == 0;
+    unsigned char one[4];
+    float f;
+
+    if (host_big != (INFER_BIG_ENDIAN ? 1 : 0)) {
+        inf_log("byte order mismatch: this binary was compiled for a "
+                "%s-endian host but is running on a %s-endian one.",
+                INFER_BIG_ENDIAN ? "big" : "little",
+                host_big ? "big" : "little");
+        inf_log("  rebuild with -DINFER_BIG_ENDIAN=%d", host_big ? 1 : 0);
+        return -1;
+    }
+
+    /* 1.0f stored little-endian, as GGUF does. */
+    one[0] = 0x00; one[1] = 0x00; one[2] = 0x80; one[3] = 0x3F;
+    f = inf_rd_f32p(one);
+    if (f < 0.999f || f > 1.001f) {
+        inf_log("float decoding is wrong on this host "
+                "(read %g where 1.0 was expected)", (double) f);
+        return -1;
+    }
+
+    f = q_fp16_to_fp32(0x3C00);        /* fp16 1.0 */
+    if (f < 0.999f || f > 1.001f) {
+        inf_log("fp16 decoding is wrong on this host "
+                "(read %g where 1.0 was expected)", (double) f);
+        return -1;
+    }
+    return 0;
+}
+
 float inf_rd_f32p(const unsigned char *p) {
     float out;
 #if INFER_BIG_ENDIAN

@@ -344,6 +344,54 @@ can put the bytes back together.
 
 ---
 
+## 20. Byte-order autodetection is compiler-specific, and guessing is worse than failing
+
+1.11.0 made the code byte-order neutral and verified it on s390x and
+SPARC — both compiled with **GCC**. A user then built it on a real
+UltraSPARC with **Sun Studio 12.3**, and got `!!!!!!!!!!` after eight
+minutes of computation.
+
+The code was fine. The *detection* was not:
+
+| | GCC / Clang | Sun Studio |
+|---|---|---|
+| SPARC macro | `__sparc__` | `__sparc`, `__sparcv9` |
+| byte order | `__BYTE_ORDER__` | not defined |
+| unprefixed `sparc` | defined | **suppressed by `-Xc`** |
+
+Our `#if` tested `__sparc__` and `__BYTE_ORDER__`. Under `-Xc` on Sun
+Studio, *every* condition was false, so the `#else` branch selected
+little-endian — on a big-endian machine. The build was clean, the model
+loaded, the metadata printed correctly, and the output was noise.
+
+Two changes, and the second matters more:
+
+1. **Test every spelling** — `__sparc`, `__sparcv8`, `__sparcv9`,
+   `_BIG_ENDIAN`, `__hppa`, `mc68000`, and so on, with `__BYTE_ORDER__`
+   preferred when present.
+
+2. **Refuse to guess.** The `#else` branch is now `#error`, so an
+   unrecognised target fails at compile time with instructions rather
+   than silently picking one. And `gguf_open()` calls
+   `inf_check_byte_order()`, which compares `INFER_BIG_ENDIAN` against a
+   runtime probe and decodes a known bit pattern:
+
+```
+byte order mismatch: this binary was compiled for a little-endian host
+but is running on a big-endian one.
+  rebuild with -DINFER_BIG_ENDIAN=1
+```
+
+One second, at startup, instead of eight minutes of arithmetic ending in
+garbage.
+
+The general lesson: a portability macro that *guesses* converts a build
+error into a wrong-answer bug. Wrong answers that arrive confidently and
+at full speed are the most expensive kind. If the code cannot tell, it
+should say so.
+
+---
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

@@ -239,6 +239,10 @@ int gguf_open(gguf_file *g, const char *path) {
 
     memset(g, 0, sizeof(*g));
 
+    /* Cheap, once per process, and catches a build that guessed the
+     * host's byte order wrongly -- which otherwise fails silently. */
+    if (inf_check_byte_order() != 0) return -1;
+
     f = fopen(path, "rb");
     if (!f) {
         inf_log("cannot open '%s'", path);

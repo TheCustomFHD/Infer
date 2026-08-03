@@ -38,6 +38,10 @@ int main(int argc, char **argv) {
     printf("host is %s-endian (INFER_BIG_ENDIAN=%d)\n\n",
            INFER_BIG_ENDIAN ? "big" : "little", INFER_BIG_ENDIAN);
 
+    /* ---- the guard that gguf_open() relies on ---- */
+    ck("inf_check_byte_order() passes on this host",
+       inf_check_byte_order() == 0);
+
     /* ---- the detection macro must match reality ---- */
     {
         unsigned long probe = 1;

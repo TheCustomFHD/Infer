@@ -28,7 +28,7 @@
 typedef double gg_off;
 
 #ifndef INFER_VERSION
-#define INFER_VERSION "1.11.0"
+#define INFER_VERSION "1.12.0"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -45,10 +45,42 @@ typedef double gg_off;
 /* ------------------------------------------------------------------ */
 
 #ifndef INFER_BIG_ENDIAN
-#  if defined(__BIG_ENDIAN__) ||       defined(__ARMEB__) || defined(__THUMBEB__) || defined(__AARCH64EB__) ||       defined(_MIPSEB) || defined(__MIPSEB) || defined(__MIPSEB__) ||       defined(__s390__) || defined(__s390x__) ||       defined(__sparc__) || defined(__hppa__) || defined(__m68k__) ||       (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) &&        __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+   /* Compiler-specific spellings matter here. GCC and Clang define
+    * __sparc__ and __BYTE_ORDER__; Sun Studio defines neither -- it uses
+    * __sparc (one trailing underscore) and __sparcv9, and -Xc suppresses
+    * the unprefixed `sparc`. Missing that made a Sun Studio build on an
+    * UltraSPARC compile as little-endian and emit pure garbage, with no
+    * diagnostic. Check every spelling, and verify at run time below. */
+#  if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)
+#    if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#      define INFER_BIG_ENDIAN 1
+#    else
+#      define INFER_BIG_ENDIAN 0
+#    endif
+#  elif defined(__BIG_ENDIAN__) || defined(_BIG_ENDIAN) || \
+        defined(__ARMEB__) || defined(__THUMBEB__) || defined(__AARCH64EB__) || \
+        defined(_MIPSEB) || defined(__MIPSEB) || defined(__MIPSEB__) || \
+        defined(__s390__) || defined(__s390x__) || \
+        defined(__sparc__) || defined(__sparc) || defined(sparc) || \
+        defined(__sparcv8) || defined(__sparcv9) || defined(__sparc_v9__) || \
+        defined(__hppa__) || defined(__hppa) || \
+        defined(__m68k__) || defined(mc68000) || defined(__PPC__) || \
+        defined(_ARCH_PPC) || defined(__powerpc__) || defined(__ppc__) || \
+        defined(__BIG_ENDIAN) || defined(_M_PPC)
 #    define INFER_BIG_ENDIAN 1
-#  else
+#  elif defined(__LITTLE_ENDIAN__) || defined(_LITTLE_ENDIAN) || \
+        defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || \
+        defined(_M_X64) || defined(__amd64__) || \
+        defined(__ARMEL__) || defined(__AARCH64EL__) || \
+        defined(_MIPSEL) || defined(__MIPSEL) || defined(__MIPSEL__) || \
+        defined(__alpha__) || defined(__riscv)
 #    define INFER_BIG_ENDIAN 0
+#  else
+     /* Unknown target. Refuse rather than guess: guessing wrong produces
+      * a program that loads the model, reports correct metadata, runs at
+      * full speed and emits nonsense. Build with -DINFER_BIG_ENDIAN=1
+      * or =0 to say which this machine is. */
+#    error "cannot determine byte order; build with -DINFER_BIG_ENDIAN=1 (big) or =0 (little)"
 #  endif
 #endif
 
@@ -58,6 +90,13 @@ typedef double gg_off;
  * qwen35.c all need it. The little-endian path is a plain memcpy, which
  * every compiler turns into one load; the big-endian path assembles the
  * four bytes explicitly. */
+/* Verify at run time that INFER_BIG_ENDIAN matches the actual host, and
+ * that the fp32/fp16 readers behave. Returns 0 on success; on failure
+ * prints what is wrong and returns non-zero. Called by gguf_open(),
+ * because a mismatch here produces plausible-looking garbage rather
+ * than any kind of error. */
+int inf_check_byte_order(void);
+
 float inf_rd_f32p(const unsigned char *p);
 double inf_rd_f64p(const unsigned char *p);
 

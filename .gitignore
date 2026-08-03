@@ -1,5 +1,6 @@
-# build outputs
+# build outputs (binaries are named infer-<version>[-variant])
 /infer
+/infer-[0-9]*
 /infer-i486
 /infer-geode
 /infer-profile

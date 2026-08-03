@@ -1,5 +1,108 @@
 # Changelog
 
+## 1.12.0 — Solaris/SPARC support, and refusing to guess byte order
+
+1.11.0 made the code byte-order neutral and verified it on s390x and
+SPARC64 — both with GCC. A user then built it on a real UltraSPARC with
+**Sun Studio 12.3** and got `!!!!!!!!!!` after eight minutes of
+computation.
+
+The code was correct. The *detection* was not.
+
+### The bug
+
+| | GCC / Clang | Sun Studio 12.3 |
+|---|---|---|
+| SPARC macro | `__sparc__` | `__sparc`, `__sparcv9` |
+| byte order | `__BYTE_ORDER__` | not defined |
+| unprefixed `sparc` | defined | **suppressed by `-Xc`** |
+
+The `#if` tested `__sparc__` and `__BYTE_ORDER__`. Under `-Xc` on Sun
+Studio neither exists, every condition was false, and the `#else`
+selected little-endian — on a big-endian machine. Clean build, model
+loaded, correct metadata, full speed, garbage output.
+
+`1.0f` read byte-reversed is `4.6e-41`, so every quantisation scale in
+the model became a denormal near zero.
+
+### Fixed in two parts
+
+**Detect properly.** Prefer `__BYTE_ORDER__`, then test every vendor
+spelling: `__sparc`, `__sparcv8`, `__sparcv9`, `_BIG_ENDIAN`, `__hppa`,
+`mc68000`, `_M_PPC`, plus an explicit little-endian list.
+
+**Refuse to guess.** The `#else` is now `#error` with the remedy in the
+message, so an unrecognised compiler fails to build rather than
+silently choosing. And `gguf_open()` calls the new
+`inf_check_byte_order()`, which compares `INFER_BIG_ENDIAN` against a
+runtime probe and decodes a known bit pattern:
+
+```
+byte order mismatch: this binary was compiled for a little-endian host
+but is running on a big-endian one.
+  rebuild with -DINFER_BIG_ENDIAN=1
+```
+
+One second at startup, instead of eight minutes ending in noise.
+
+### Solaris / SPARC build targets
+
+```
+make solaris              Sun Studio, auto-tuned to the build host
+make solaris-gcc          GCC on Solaris
+make solaris-profile      Sun Studio + stage timers
+make solaris-gcc-profile  GCC + stage timers
+make solaris-test         the test programs
+```
+
+These encode the two things that are easy to get wrong by hand:
+
+* **`-lsocket -lnsl`** — Solaris keeps the socket API outside libc.
+  Its absence is the most likely reason a GCC build failed to link
+  where Sun Studio succeeded.
+* **Sun Studio option spellings** — `-Xc -xc99=none` for strict C90,
+  `-xO3`, `-xtarget=`. GCC's `-std=c89 -pedantic -O2` are not
+  recognised by `cc`.
+
+Cross-build for another machine with `make solaris SUNTARGET=ultra2`.
+
+The portable `i8` backend is selected automatically on SPARC and is
+**6.5–8.8× faster than `ref`** (measured per weight format under
+emulation). There is no VIS backend yet.
+
+### Versioned executables
+
+Every binary now carries its version, so several builds can share a
+directory without being renamed by hand:
+
+```
+infer-1.12.0            infer-1.12.0.exe
+infer-1.12.0-i486       infer-1.12.0-mmx.exe
+infer-1.12.0-geode      infer-1.12.0-profile.exe
+infer-1.12.0-profile    infer-1.12.0-i486-profile
+infer-1.12.0-geode-profile
+```
+
+`make version` prints it, `make checkversion` asserts it matches
+`src/infer.h`, and `make SUFFIX=` restores the plain unversioned name.
+
+### Makefile is POSIX again
+
+The version was briefly extracted with `$(shell ...)`, which is a GNU
+make extension that Solaris `/usr/ccs/bin/make` does not implement — it
+would have produced binaries named `infer-`. Now a literal, guarded by
+`make checkversion`. `:=` was likewise replaced with `=` throughout.
+
+### Also
+
+* `t_endian` asserts `inf_check_byte_order()`
+* Finding 20 in `docs/FINDINGS.md`
+
+No engine, kernel or tokeniser changes. `t_engine` output is unchanged
+and x86 performance is unaffected.
+
+---
+
 ## 1.11.0 — runs on big-endian hosts
 
 `infer` now produces bit-identical results on little- and big-endian
