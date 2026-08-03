@@ -28,7 +28,7 @@ sys_map *sys_map_file(const char *path, double offset, double length) {
     long pagesz;
     double aligned;
     size_t skew, maplen;
-    off_t off;
+    long   page_index;
     int fd;
 
     if (length <= 0.0) return NULL;
@@ -40,15 +40,23 @@ sys_map *sys_map_file(const char *path, double offset, double length) {
     pagesz = sysconf(_SC_PAGESIZE);
     if (pagesz <= 0) pagesz = 4096;
 
-    aligned = (double) ((long) (offset / (double) pagesz)) * (double) pagesz;
+    /* Page-align the offset. Kept as a `long` page *index* rather than a
+     * byte offset: with _FILE_OFFSET_BITS=64 on a 32-bit host off_t
+     * becomes `long long`, and strict C90 (Sun Studio -Xc -xc99=none)
+     * has no such type -- a cast to it is a syntax error, not a
+     * warning. Multiplying the index by the page size inside the mmap()
+     * call lets the compiler do the widening implicitly, using whatever
+     * off_t happens to be, with no 64-bit type named in our source. */
+    page_index = (long) (offset / (double) pagesz);
+    aligned = (double) page_index * (double) pagesz;
     skew    = (size_t) (offset - aligned);
     maplen  = (size_t) (length + (double) skew);
 
     fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
 
-    off = (off_t) aligned;
-    base = mmap(NULL, maplen, PROT_READ, MAP_PRIVATE, fd, off);
+    base = mmap(NULL, maplen, PROT_READ, MAP_PRIVATE, fd,
+                page_index * pagesz);
 
     /* The descriptor is not needed once the mapping exists. */
     close(fd);

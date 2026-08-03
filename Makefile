@@ -60,13 +60,14 @@ TARGET  = infer
 # asserts it still matches src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.12.0
+VERSION = 1.12.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
 .PHONY: all clean i486 geode windows windows-mmx test bench \
         profile profile-geode profile-i486 profile-windows \
-        solaris solaris-gcc solaris-profile solaris-gcc-profile solaris-test
+        solaris solaris-gcc solaris-profile solaris-gcc-profile \
+        solaris-fast solaris-test
 
 all: $(BIN)
 
@@ -100,12 +101,31 @@ $(BIN): $(CORE) $(POSIX) $(HDRS)
 # ---------------------------------------------------------------------
 SUNCC      = cc
 SUNTARGET  = native
+
+# -xO5 and -xunroll=16 come from a user's own flag set on an UltraSPARC
+# and are kept: the 4-issue in-order pipeline benefits from unrolling,
+# and neither changes results.
+#
+# Deliberately NOT included:
+#
+#   -fast   A macro that turns on -fsimple=2 and -fns, i.e. non-IEEE
+#           float: reassociation, no gradual underflow, flush-to-zero.
+#           The k-quant scales are fp16 values very close to zero and
+#           the DeltaNet recurrence accumulates over 128 steps, so
+#           flush-to-zero is a real correctness risk here, not a
+#           theoretical one. Use `make solaris-fast` to opt in and
+#           `./build/t_backend model.gguf` to check the error terms if
+#           you do.
+#
+#   -xvis   Enables VIS *intrinsics*. There is no VIS code in the
+#           project, so it has no effect. It is not harmful.
+SUNOPT     = -xO5 -xunroll=16
 # -DINFER_BIG_ENDIAN=1 is explicit on purpose. Sun Studio does not define
 # __BYTE_ORDER__, and under -Xc it suppresses the unprefixed `sparc`, so
 # autodetection has less to work with than under GCC. SPARC is always
 # big-endian, so state it rather than infer it. (infer.h would now refuse
 # to compile rather than guess, but being explicit documents the intent.)
-SUNCFLAGS  = -Xc -xc99=none -xO3 -xtarget=$(SUNTARGET) \
+SUNCFLAGS  = -Xc -xc99=none $(SUNOPT) -xtarget=$(SUNTARGET) \
              -DINFER_BIG_ENDIAN=1 -D_FILE_OFFSET_BITS=64
 SOLLIBS    = -lm -lsocket -lnsl
 
@@ -128,6 +148,12 @@ solaris-gcc-profile: $(CORE) $(POSIX)
 
 # Tests, built the same way. Solaris make has no pattern rules we can
 # rely on, so these are spelled out.
+# Opt-in: adds -fast. Verify with t_backend before trusting the output.
+solaris-fast: $(CORE) $(POSIX)
+	$(SUNCC) -Xc -xc99=none $(SUNOPT) -fast -xtarget=$(SUNTARGET) \
+		-DINFER_BIG_ENDIAN=1 -D_FILE_OFFSET_BITS=64 \
+		-o $(BIN) $(CORE) $(POSIX) $(SOLLIBS)
+
 solaris-test: $(CORE) $(POSIX)
 	@mkdir -p $(BUILD)
 	$(SUNCC) $(SUNCFLAGS) -o $(BUILD)/t_endian tests/t_endian.c \
@@ -178,14 +204,14 @@ profile-i486: $(CORE) $(POSIX)
 
 profile-geode: $(CORE) $(POSIX) $(SRCDIR)/backend_mmx.c
 	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m32 -march=geode -mtune=geode \
+		-m32 -march=i486 -mtune=geode \
 		-mmmx -mno-sse -mno-sse2 -mfpmath=387 \
 		-DINFER_HAVE_MMX -DINFER_PROFILE -D_FILE_OFFSET_BITS=64 \
 		-o $(BIN)-geode-profile $(CORE) $(POSIX) \
 		$(SRCDIR)/backend_mmx.c $(LDLIBS)
 
 profile-windows: $(CORE) $(WIN32) $(SRCDIR)/backend_mmx.c
-	$(WINCC) -std=gnu89 -Wall -O2 -march=geode -mtune=geode -mmmx \
+	$(WINCC) -std=gnu89 -Wall -O2 -march=i486 -mtune=geode -mmmx \
 		-DINFER_HAVE_MMX -DINFER_PROFILE -D_WIN32_WINNT=0x0501 \
 		-o $(BIN)-profile.exe $(CORE) $(WIN32) \
 		$(SRCDIR)/backend_mmx.c -lws2_32
@@ -198,7 +224,7 @@ profile-windows: $(CORE) $(WIN32) $(SRCDIR)/backend_mmx.c
 # ---------------------------------------------------------------------
 geode: $(CORE) $(POSIX) $(SRCDIR)/backend_mmx.c
 	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m32 -march=geode -mtune=geode \
+		-m32 -march=i486 -mtune=geode \
 		-mmmx -mno-sse -mno-sse2 -mfpmath=387 \
 		-DINFER_HAVE_MMX -D_FILE_OFFSET_BITS=64 \
 		-o $(BIN)-geode $(CORE) $(POSIX) $(SRCDIR)/backend_mmx.c $(LDLIBS)
@@ -212,7 +238,7 @@ windows: $(CORE) $(WIN32)
 
 # Windows build with the MMX backend (Pentium MMX / Geode and later).
 windows-mmx: $(CORE) $(WIN32) $(SRCDIR)/backend_mmx.c
-	$(WINCC) -std=gnu89 -Wall -O2 -march=geode -mtune=geode -mmmx \
+	$(WINCC) -std=gnu89 -Wall -O2 -march=i486 -mtune=geode -mmmx \
 		-DINFER_HAVE_MMX -D_WIN32_WINNT=0x0501 \
 		-o $(BIN)-mmx.exe $(CORE) $(WIN32) $(SRCDIR)/backend_mmx.c -lws2_32
 
@@ -288,8 +314,12 @@ $(BUILD)/t_jinja: tests/t_jinja.c | $(BUILD)
 
 # Removes this version's outputs, and the unversioned names older
 # releases used, so an upgrade does not leave stale binaries behind.
-VARIANTS := "" -i486 -geode -profile -i486-profile -geode-profile
+VARIANTS = "" -i486 -geode -profile -i486-profile -geode-profile
+# Also removes binaries left by *other* versions, so bumping VERSION
+# does not silently accumulate old builds (one got swept into a release
+# tarball exactly that way).
 clean:
+	@rm -f $(TARGET)-[0-9]*.[0-9]*.[0-9]* $(TARGET)-[0-9]*.[0-9]*.[0-9]*.exe
 	@for v in $(VARIANTS); do \
 		[ "$$v" = '""' ] && v=""; \
 		rm -f "$(BIN)$$v" "$(TARGET)$$v"; \

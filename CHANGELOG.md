@@ -1,5 +1,72 @@
 # Changelog
 
+## 1.12.1 — Solaris build fix
+
+### `sys_posix.c` would not compile with Sun Studio
+
+Reported from a real UltraSPARC:
+
+```
+"src/sys_posix.c", line 50: invalid cast expression
+cc: acomp failed for src/sys_posix.c
+```
+
+Line 50 was `off = (off_t) aligned;`. With `_FILE_OFFSET_BITS=64` on a
+32-bit host, `off_t` is a **64-bit type** — `long long` on Solaris. C90
+has no `long long`, so under `-Xc -xc99=none` a cast to it is a syntax
+error, not a warning. GCC accepts it silently as an extension, which is
+why every Linux build passed.
+
+Fixed by never naming a 64-bit type in our source. The page-aligned
+offset is kept as a `long` page *index* and multiplied by the page size
+inside the `mmap()` call, so the compiler widens implicitly using
+whatever `off_t` happens to be:
+
+```c
+page_index = (long) (offset / (double) pagesz);
+...
+base = mmap(NULL, maplen, PROT_READ, MAP_PRIVATE, fd, page_index * pagesz);
+```
+
+Verified with `gcc -std=c89 -pedantic -Werror=long-long -m32
+-D_FILE_OFFSET_BITS=64`: clean. The only remaining occurrence of the
+phrase "long long" in the codebase is the comment explaining this.
+
+### Solaris flags updated from field use
+
+`-xO5` and `-xunroll=16` adopted from a user's own flag set: the 4-issue
+in-order UltraSPARC pipeline benefits from unrolling and neither flag
+changes results.
+
+Two flags from that set are deliberately **not** default:
+
+* **`-fast`** is a macro that enables `-fsimple=2` and `-fns` — non-IEEE
+  float with reassociation and flush-to-zero. The k-quant scales are
+  fp16 values near zero and the DeltaNet recurrence accumulates over 128
+  steps, so this is a real correctness risk rather than a theoretical
+  one. Available as `make solaris-fast` for anyone who wants to try it,
+  with `./build/t_backend model.gguf` to check the error terms.
+* **`-xvis`** enables VIS intrinsics. There is no VIS code in the
+  project, so it has no effect. Harmless, just pointless.
+
+### CMOV: measured, not assumed
+
+1.12.0 moved the MMX builds to a 486 baseline, which removes CMOV.
+Measured cost of that on x86-64, MMX backend, identical work:
+
+| build | best | median |
+|---|---|---|
+| `-march=i486` (0 CMOV) | 7.68 s | 7.70 s |
+| `-march=geode` (30 CMOV) | 7.72 s | 7.72 s |
+
+**0.6%, and in favour of the no-CMOV build** — i.e. noise. Of the 30
+CMOVs the geode build emitted, only 3 were in a hot function
+(`bk_quantize_x`, once per matvec); the rest were in template parsing,
+server startup and `malloc` wrappers. There is nothing to gate: the 486
+baseline is free.
+
+---
+
 ## 1.12.0 — Solaris/SPARC support, and refusing to guess byte order
 
 1.11.0 made the code byte-order neutral and verified it on s390x and
@@ -92,6 +159,41 @@ The version was briefly extracted with `$(shell ...)`, which is a GNU
 make extension that Solaris `/usr/ccs/bin/make` does not implement — it
 would have produced binaries named `infer-`. Now a literal, guarded by
 `make checkversion`. `:=` was likewise replaced with `=` throughout.
+
+### MMX builds now have a 486 baseline
+
+`make geode` and `make windows-mmx` were compiled `-march=geode`, which
+let GCC emit **CMOV throughout ordinary code** — `xmalloc`, `gguf_open`,
+`main`. CMOV is a Pentium Pro instruction; those binaries would fault on
+a 486 or original Pentium despite the MMX kernels being runtime-gated.
+
+Both now use `-march=i486 -mtune=geode -mmmx`: baseline 486, Geode
+*scheduling*, MMX confined to `backend_mmx.c` behind its CPUID check.
+Verified 0 CMOV instructions in our code, 354 MMX instructions still
+present, both backends still bit-identical under greedy decoding.
+
+**One binary now runs on a 486 and accelerates on a Geode**, which makes
+the separate non-MMX build redundant for most users.
+
+Honest caveat: mingw's C runtime still uses CMOV in `strtod`, `pow` and
+`ldexp`, all of which we call. The Windows builds are therefore
+Pentium-Pro-and-later in practice even though our own code is
+486-clean. Documented in COMPILE.md rather than papered over.
+
+### No bundled chat template
+
+`templates/qwen-fixed-v21.3.jinja` has been removed. Third-party
+templates are their authors' work to distribute; `templates/README.md`
+now points at the source with a `curl` command instead.
+
+### Documentation
+
+`COMPILE.md` and `docs/ARCHITECTURE.md` rewritten in full. Every build
+step is now a literal copy-pasteable command with its expected output,
+including the verification commands for each target (486-purity, CMOV
+count, DLL count, MMX constant alignment). ARCHITECTURE.md gains a
+request walkthrough, the qwen35 hybrid layout, the k-quant block format,
+and why the integer kernels are shaped the way they are.
 
 ### Also
 

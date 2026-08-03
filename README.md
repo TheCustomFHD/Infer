@@ -31,10 +31,10 @@ My name is **Ada**. 😊
 | **OpenAI API** | `/v1/chat/completions` with streaming, `/v1/completions`, `/v1/models` |
 | **Interactive chat** | multi-turn, with history commands |
 | **Real Jinja templates** | renders the GGUF's own template, or any `.jinja` file |
+| **Byte-order neutral** | bit-identical output on big-endian hosts (verified on s390x and SPARC) |
 | **MCP tools** | Model Context Protocol over HTTP, in every mode |
 | **One set of options** | `--system`, `--think`, `--raw`, `--mcp`, `--template` work the same in `serve`, `chat` and `run` |
 | **Runs on a 486** | and on Windows XP, from the same sources |
-| **Byte-order neutral** | bit-identical output on big-endian hosts (verified on s390x) |
 
 ---
 
@@ -113,11 +113,17 @@ $ infer run model.gguf --port 9090
 ```sh
 make                # native
 make i486           # 32-bit, 486-safe, no MMX
-make geode          # 32-bit + MMX (Geode LX, Pentium MMX, K6…)
+make geode          # 32-bit, MMX kernels + 486 baseline
 make windows        # Windows XP, 486-safe
-make windows-mmx    # Windows XP + MMX
-make test           # seven test programs
+make windows-mmx    # Windows XP, MMX kernels + 486 baseline
+make solaris        # Solaris / SPARC, Sun Studio
+make solaris-gcc    # Solaris / SPARC, GCC
+make test           # eight test programs
 ```
+
+The MMX builds use a **486 baseline** with runtime MMX detection, so one
+binary runs on a 486 *and* accelerates on anything with MMX. Binaries
+are named `infer-<version>[-variant]`.
 
 Every target compiles with **zero warnings**. The i486 build was
 disassembled and audited: **no SSE, MMX, CMOV or any post-486

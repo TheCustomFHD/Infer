@@ -247,7 +247,7 @@ renders prompts through the same template code, so these all work.
 ```sh
 infer run model.gguf -p "What fruit?" --system "Answer in one word."
 infer run model.gguf -p "Weather in Springfield?" --mcp http://127.0.0.1:3000/mcp
-infer run model.gguf -p "..." --template templates/qwen-fixed-v21.3.jinja
+infer run model.gguf -p "..." --template qwen-fixed.jinja
 infer run model.gguf -p "..." --think
 ```
 
