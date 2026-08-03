@@ -1,0 +1,625 @@
+/* backend.c -- selectable matrix-vector kernels and CPU detection.
+ *
+ * Profiling the reference build shows ~95% of inference time inside
+ * q_matvec. This file provides faster implementations of exactly that
+ * operation and the machinery to pick one.
+ *
+ * The `i8` backend is the important one. The reference kernel does, per
+ * weight, one 4-bit unpack, one int->float conversion and one float
+ * multiply-add. On an in-order CPU with a slow FPU (a 486, or a Geode
+ * LX whose FADD has 7-cycle latency) the float work dominates.
+ *
+ * `i8` instead quantises the activation vector once per matrix into
+ * 32-element blocks of int8 with a per-block scale -- exactly the
+ * scheme GGML uses for its own activation quantisation -- and then
+ * evaluates each dot product entirely in integer arithmetic. The block
+ * scales are folded in once per 32 weights rather than once per weight,
+ * so the float op count drops by ~32x and the inner loop becomes a
+ * plain integer multiply-accumulate.
+ *
+ * Accuracy is unaffected in practice: the activations are quantised to
+ * the same precision GGML uses, and the weights are not touched at all.
+ * tests/t_backend.c measures the difference against the reference.
+ *
+ * ANSI C (C89) throughout. CPU detection uses GNU inline assembly but
+ * is compiled only on x86 GCC/Clang and degrades to "no features"
+ * everywhere else.
+ */
+
+#include "infer.h"
+#include "backend.h"
+#include "prof.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+/* ------------------------------------------------------------------ */
+/* CPU feature detection                                               */
+/* ------------------------------------------------------------------ */
+
+#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
+#define BK_X86_CPUID 1
+#endif
+
+static int   cpu_probed = 0;
+static int   cpu_mmx    = 0;
+static int   cpu_3dnow  = 0;
+static int   cpu_cmov   = 0;
+static char  cpu_vendor_s[16] = "unknown";
+
+#ifdef BK_X86_CPUID
+static void bk_cpuid(unsigned long leaf, unsigned long *a, unsigned long *b,
+                     unsigned long *c, unsigned long *d) {
+    unsigned long ra, rb, rc, rd;
+#if defined(__i386__) && defined(__PIC__)
+    /* %ebx is the PIC register on 32-bit; save and restore it. */
+    __asm__ __volatile__ ("xchgl %%ebx, %1\n\t"
+                          "cpuid\n\t"
+                          "xchgl %%ebx, %1"
+                          : "=a" (ra), "=r" (rb), "=c" (rc), "=d" (rd)
+                          : "0" (leaf), "2" (0));
+#else
+    __asm__ __volatile__ ("cpuid"
+                          : "=a" (ra), "=b" (rb), "=c" (rc), "=d" (rd)
+                          : "0" (leaf), "2" (0));
+#endif
+    *a = ra; *b = rb; *c = rc; *d = rd;
+}
+
+/* CPUID itself is absent on a plain 486: it exists only if bit 21 of
+ * EFLAGS (ID) can be toggled. Check that before executing it. */
+static int bk_has_cpuid(void) {
+#if defined(__x86_64__)
+    return 1;
+#else
+    int res;
+    __asm__ __volatile__ (
+        "pushfl\n\t"
+        "pushfl\n\t"
+        "popl %%eax\n\t"
+        "movl %%eax, %%ecx\n\t"
+        "xorl $0x200000, %%eax\n\t"
+        "pushl %%eax\n\t"
+        "popfl\n\t"
+        "pushfl\n\t"
+        "popl %%eax\n\t"
+        "xorl %%ecx, %%eax\n\t"
+        "andl $0x200000, %%eax\n\t"
+        "popfl"
+        : "=a" (res) : : "ecx", "cc");
+    return res != 0;
+#endif
+}
+#endif /* BK_X86_CPUID */
+
+static void probe_cpu(void) {
+    if (cpu_probed) return;
+    cpu_probed = 1;
+
+#ifdef BK_X86_CPUID
+    if (!bk_has_cpuid()) return;   /* 486 without CPUID: no features */
+
+    {
+        unsigned long a, b, c, d;
+        bk_cpuid(0, &a, &b, &c, &d);
+
+        memcpy(cpu_vendor_s + 0, &b, 4);
+        memcpy(cpu_vendor_s + 4, &d, 4);
+        memcpy(cpu_vendor_s + 8, &c, 4);
+        cpu_vendor_s[12] = '\0';
+
+        if (a >= 1) {
+            bk_cpuid(1, &a, &b, &c, &d);
+            cpu_cmov = (d & (1UL << 15)) ? 1 : 0;
+            cpu_mmx  = (d & (1UL << 23)) ? 1 : 0;
+        }
+
+        /* 3DNow! lives in the AMD extended leaves. */
+        bk_cpuid(0x80000000UL, &a, &b, &c, &d);
+        if (a >= 0x80000001UL) {
+            bk_cpuid(0x80000001UL, &a, &b, &c, &d);
+            cpu_3dnow = (d & (1UL << 31)) ? 1 : 0;
+            if (!cpu_mmx && (d & (1UL << 23))) cpu_mmx = 1;
+        }
+    }
+#endif
+}
+
+int bk_cpu_has_mmx(void)   { probe_cpu(); return cpu_mmx; }
+int bk_cpu_has_3dnow(void) { probe_cpu(); return cpu_3dnow; }
+int bk_cpu_has_cmov(void)  { probe_cpu(); return cpu_cmov; }
+const char *bk_cpu_vendor(void) { probe_cpu(); return cpu_vendor_s; }
+
+/* ------------------------------------------------------------------ */
+/* Nibble lookup tables                                                */
+/*                                                                     */
+/* The inner loop of every 4-bit kernel needs both nibbles of a packed  */
+/* byte. Computing them costs an AND and a SHIFT per weight. A pair of  */
+/* 256-byte tables turns that into two loads that hit L1 permanently    */
+/* (512 bytes total, versus the 486's 8 KB and the Geode's 64 KB).      */
+/*                                                                     */
+/* Measured on a 486-targeted build this is ~2.4x on the Q4_K inner     */
+/* loop -- by far the largest single win available to the portable      */
+/* backend, and it needs no SIMD at all.                                */
+/* ------------------------------------------------------------------ */
+
+static unsigned char nib_lo[256];
+static unsigned char nib_hi[256];
+static int nib_ready = 0;
+
+static void nib_init(void) {
+    int i;
+    if (nib_ready) return;
+    for (i = 0; i < 256; i++) {
+        nib_lo[i] = (unsigned char) (i & 0x0F);
+        nib_hi[i] = (unsigned char) (i >> 4);
+    }
+    nib_ready = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Activation quantisation                                             */
+/*                                                                     */
+/* x is split into blocks of 32. Each block gets a scale d and 32       */
+/* int8 values stored widened to int16 (so both the scalar and the MMX  */
+/* kernels can read them without further unpacking). The sum of the     */
+/* quantised values is kept too: the k-quant formats subtract a per-    */
+/* block minimum, and that term needs sum(x) over the same block.       */
+/* ------------------------------------------------------------------ */
+
+static bk_qx  xq_buf;
+static long   xq_cap = 0;
+
+const bk_qx *bk_quantize_x(const float *x, long n) {
+    long nb = (n + 31) / 32;
+    long i, b;
+
+    nib_init();
+
+    if (n > xq_cap) {
+        xq_cap    = n + 256;
+        xq_buf.q  = (short *) xrealloc(xq_buf.q, sizeof(short) * (size_t) xq_cap);
+        xq_buf.d  = (float *) xrealloc(xq_buf.d, sizeof(float) *
+                                       (size_t) (xq_cap / 32 + 2));
+        xq_buf.s  = (int *)   xrealloc(xq_buf.s, sizeof(int) *
+                                       (size_t) (xq_cap / 32 + 2));
+        xq_buf.s16 = (int *)  xrealloc(xq_buf.s16, sizeof(int) *
+                                       (size_t) (xq_cap / 16 + 2));
+    }
+    xq_buf.n = n;
+
+    for (b = 0; b < nb; b++) {
+        long i0 = b * 32;
+        long i1 = i0 + 32;
+        float amax = 0.0f;
+        float d, id;
+        int sum = 0;
+        int sum16_0 = 0, sum16_1 = 0;
+
+        if (i1 > n) i1 = n;
+
+        for (i = i0; i < i1; i++) {
+            float a = x[i] < 0.0f ? -x[i] : x[i];
+            if (a > amax) amax = a;
+        }
+
+        if (amax == 0.0f) {
+            for (i = i0; i < i1; i++) xq_buf.q[i] = 0;
+            for (; i < i0 + 32; i++)  xq_buf.q[i] = 0;
+            xq_buf.d[b] = 0.0f;
+            xq_buf.s[b] = 0;
+            xq_buf.s16[2 * b]     = 0;
+            xq_buf.s16[2 * b + 1] = 0;
+            continue;
+        }
+
+        d  = amax / 127.0f;
+        id = 127.0f / amax;
+
+        for (i = i0; i < i1; i++) {
+            /* round-half-away-from-zero without needing C99 rintf() */
+            float v = x[i] * id;
+            int   q = (int) (v + (v >= 0.0f ? 0.5f : -0.5f));
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
+            xq_buf.q[i] = (short) q;
+            sum += q;
+            if (i - i0 < 16) sum16_0 += q;
+            else             sum16_1 += q;
+        }
+        /* zero-pad a short tail so kernels can always read 32 */
+        for (i = i1; i < i0 + 32; i++) xq_buf.q[i] = 0;
+
+        xq_buf.d[b] = d;
+        xq_buf.s[b] = sum;
+        xq_buf.s16[2 * b]     = sum16_0;
+        xq_buf.s16[2 * b + 1] = sum16_1;
+    }
+
+    return &xq_buf;
+}
+
+void bk_free_scratch(void) {
+    if (xq_buf.q) free(xq_buf.q);
+    if (xq_buf.d) free(xq_buf.d);
+    if (xq_buf.s) free(xq_buf.s);
+    if (xq_buf.s16) free(xq_buf.s16);
+    xq_buf.q = NULL;
+    xq_buf.d = NULL;
+    xq_buf.s = NULL;
+    xq_buf.s16 = NULL;
+    xq_cap = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared k-quant helpers                                              */
+/* ------------------------------------------------------------------ */
+
+static float rd_f16p(const unsigned char *p) {
+    return q_fp16_to_fp32((unsigned short) (p[0] | (p[1] << 8)));
+}
+
+static void get_scale_min_k4(int j, const unsigned char *q,
+                             unsigned char *d, unsigned char *m) {
+    if (j < 4) {
+        *d = (unsigned char) (q[j] & 63);
+        *m = (unsigned char) (q[j + 4] & 63);
+    } else {
+        *d = (unsigned char) ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (unsigned char) ((q[j + 4] >> 4)  | ((q[j] >> 6) << 4));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* i8 backend: integer dot products                                    */
+/* ------------------------------------------------------------------ */
+
+static float i8_dot_q4_K(const unsigned char *b, const bk_qx *xq, long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += QK_K) {
+        const float d    = rd_f16p(b);
+        const float dmin = rd_f16p(b + 2);
+        const unsigned char *sc = b + 4;
+        const unsigned char *qs = b + 16;
+        long blk = c / 32;
+        int j;
+
+        for (j = 0; j < 4; j++) {
+            unsigned char s1, m1, s2, m2;
+            const short *x1 = xq->q + c + j * 64;
+            const short *x2 = x1 + 32;
+            int acc1 = 0, acc2 = 0;
+            int l;
+
+            get_scale_min_k4(j * 2,     sc, &s1, &m1);
+            get_scale_min_k4(j * 2 + 1, sc, &s2, &m2);
+
+            for (l = 0; l < 32; l++) {
+                int w = qs[l];
+                acc1 += (w & 0xF) * x1[l];
+                acc2 += (w >> 4)  * x2[l];
+            }
+
+            sum += xq->d[blk] *
+                   ((float) acc1 * d * (float) s1 -
+                    (float) xq->s[blk] * dmin * (float) m1);
+            sum += xq->d[blk + 1] *
+                   ((float) acc2 * d * (float) s2 -
+                    (float) xq->s[blk + 1] * dmin * (float) m2);
+
+            blk += 2;
+            qs  += 32;
+        }
+        b += 144;
+    }
+    return sum;
+}
+
+static float i8_dot_q5_K(const unsigned char *b, const bk_qx *xq, long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += QK_K) {
+        const float d    = rd_f16p(b);
+        const float dmin = rd_f16p(b + 2);
+        const unsigned char *sc = b + 4;
+        const unsigned char *qh = b + 16;
+        const unsigned char *qs = b + 48;
+        long blk = c / 32;
+        int j;
+
+        for (j = 0; j < 4; j++) {
+            unsigned char s1, m1, s2, m2;
+            const short *x1 = xq->q + c + j * 64;
+            const short *x2 = x1 + 32;
+            int acc1 = 0, acc2 = 0;
+            int sh1 = j * 2, sh2 = j * 2 + 1;
+            int l;
+
+            get_scale_min_k4(j * 2,     sc, &s1, &m1);
+            get_scale_min_k4(j * 2 + 1, sc, &s2, &m2);
+
+            /* branch-free hi-bit term: (h >> sh) & 1, shifted to 16.
+             * A per-lane branch costs a pipeline flush on a 486. */
+            for (l = 0; l < 32; l++) {
+                unsigned char v = qs[l];
+                int h = qh[l];
+                int w1 = (int) nib_lo[v] + (((h >> sh1) & 1) << 4);
+                int w2 = (int) nib_hi[v] + (((h >> sh2) & 1) << 4);
+                acc1 += w1 * x1[l];
+                acc2 += w2 * x2[l];
+            }
+
+            sum += xq->d[blk] *
+                   ((float) acc1 * d * (float) s1 -
+                    (float) xq->s[blk] * dmin * (float) m1);
+            sum += xq->d[blk + 1] *
+                   ((float) acc2 * d * (float) s2 -
+                    (float) xq->s[blk + 1] * dmin * (float) m2);
+
+            blk += 2;
+            qs  += 32;
+        }
+        b += 176;
+    }
+    return sum;
+}
+
+/* Sum of the quantised activations for a 16-wide group, precomputed in
+ * bk_quantize_x (Q6_K weights are biased by -32; the bias term needs
+ * this partial sum). */
+static int sum16(const bk_qx *xq, long idx) {
+    return xq->s16[idx / 16];
+}
+
+static float i8_dot_q6_K(const unsigned char *b, const bk_qx *xq, long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += QK_K) {
+        const unsigned char *ql = b;
+        const unsigned char *qh = b + 128;
+        const signed char   *sc = (const signed char *) (b + 192);
+        const float d = rd_f16p(b + 208);
+        int n;
+
+        /* The four sub-rows are unrolled rather than selected inside the
+         * inner loop: a switch on the row index there costs more than
+         * the arithmetic it guards. Each sub-row splits into two groups
+         * of 16 with their own int8 scale. */
+        for (n = 0; n < 2; n++) {
+            const unsigned char *qln = ql + n * 64;
+            const unsigned char *qhn = qh + n * 32;
+            const signed char   *scn = sc + n * 8;
+            long off = c + n * 128;
+            const short *xp = xq->q + off;
+            long blk = off / 32;
+            int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            int a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+            int l;
+
+            for (l = 0; l < 16; l++) {
+                int h = qhn[l];
+                a0 += (int) ((qln[l]      & 0xF) | (((h >> 0) & 3) << 4)) * xp[l];
+                a2 += (int) ((qln[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) * xp[l + 32];
+                a4 += (int) ((qln[l]      >> 4)  | (((h >> 4) & 3) << 4)) * xp[l + 64];
+                a6 += (int) ((qln[l + 32] >> 4)  | (((h >> 6) & 3) << 4)) * xp[l + 96];
+            }
+            for (l = 16; l < 32; l++) {
+                int h = qhn[l];
+                a1 += (int) ((qln[l]      & 0xF) | (((h >> 0) & 3) << 4)) * xp[l];
+                a3 += (int) ((qln[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) * xp[l + 32];
+                a5 += (int) ((qln[l]      >> 4)  | (((h >> 4) & 3) << 4)) * xp[l + 64];
+                a7 += (int) ((qln[l + 32] >> 4)  | (((h >> 6) & 3) << 4)) * xp[l + 96];
+            }
+
+            /* Q6_K stores q-32; fold the bias in via the block sum. */
+            sum += d * xq->d[blk] *
+                   ((float) scn[0] * (float) (a0 - 32 * sum16(xq, off +  0)) +
+                    (float) scn[1] * (float) (a1 - 32 * sum16(xq, off + 16)));
+            sum += d * xq->d[blk + 1] *
+                   ((float) scn[2] * (float) (a2 - 32 * sum16(xq, off + 32)) +
+                    (float) scn[3] * (float) (a3 - 32 * sum16(xq, off + 48)));
+            sum += d * xq->d[blk + 2] *
+                   ((float) scn[4] * (float) (a4 - 32 * sum16(xq, off + 64)) +
+                    (float) scn[5] * (float) (a5 - 32 * sum16(xq, off + 80)));
+            sum += d * xq->d[blk + 3] *
+                   ((float) scn[6] * (float) (a6 - 32 * sum16(xq, off + 96)) +
+                    (float) scn[7] * (float) (a7 - 32 * sum16(xq, off + 112)));
+        }
+        b += 210;
+    }
+    return sum;
+}
+
+static float i8_dot_q8_0(const unsigned char *b, const bk_qx *xq, long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += 32) {
+        const float d = rd_f16p(b);
+        const signed char *q = (const signed char *) (b + 2);
+        const short *xp = xq->q + c;
+        int acc = 0;
+        int l;
+
+        for (l = 0; l < 32; l++) acc += (int) q[l] * xp[l];
+        sum += d * xq->d[c / 32] * (float) acc;
+        b += 34;
+    }
+    return sum;
+}
+
+static float i8_dot_q4_0(const unsigned char *b, const bk_qx *xq, long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += 32) {
+        const float d = rd_f16p(b);
+        const unsigned char *q = b + 2;
+        const short *xp = xq->q + c;
+        int acc = 0;
+        int l;
+
+        for (l = 0; l < 16; l++) {
+            acc += (int) (q[l] & 0xF) * xp[l];
+            acc += (int) (q[l] >> 4)  * xp[l + 16];
+        }
+        /* value = d * (nibble - 8) */
+        sum += d * xq->d[c / 32] * (float) (acc - 8 * xq->s[c / 32]);
+        b += 18;
+    }
+    return sum;
+}
+
+void qmv_i8(int type, const unsigned char *w, const float *x, float *y,
+            long ncols, long nrows) {
+    const bk_qx *xq;
+    long rowbytes, r;
+
+    /* Types without a block structure gain nothing here. */
+    if (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+        (ncols % 32) != 0) {
+        qmv_ref(type, w, x, y, ncols, nrows);
+        return;
+    }
+
+    xq = bk_quantize_x(x, ncols);
+    rowbytes = gg_type_size(type, ncols);
+
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+            for (r = 0; r < nrows; r++) y[r] = i8_dot_q4_K(w + r * rowbytes, xq, ncols);
+            return;
+        case GGML_TYPE_Q5_K:
+            for (r = 0; r < nrows; r++) y[r] = i8_dot_q5_K(w + r * rowbytes, xq, ncols);
+            return;
+        case GGML_TYPE_Q6_K:
+            for (r = 0; r < nrows; r++) y[r] = i8_dot_q6_K(w + r * rowbytes, xq, ncols);
+            return;
+        case GGML_TYPE_Q8_0:
+            for (r = 0; r < nrows; r++) y[r] = i8_dot_q8_0(w + r * rowbytes, xq, ncols);
+            return;
+        case GGML_TYPE_Q4_0:
+            for (r = 0; r < nrows; r++) y[r] = i8_dot_q4_0(w + r * rowbytes, xq, ncols);
+            return;
+        default:
+            qmv_ref(type, w, x, y, ncols, nrows);
+            return;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Backend table and selection                                         */
+/* ------------------------------------------------------------------ */
+
+static int always_yes(void) { return 1; }
+
+#ifdef INFER_HAVE_MMX
+static int mmx_ok(void) { return bk_cpu_has_mmx(); }
+#endif
+
+static const bk_backend backends[] = {
+#ifdef INFER_HAVE_MMX
+    { "mmx", "integer kernels with MMX inner loop (Pentium MMX / K6 / Geode+)",
+      mmx_ok, qmv_mmx },
+#endif
+    { "i8",  "integer kernels, portable C (recommended)",
+      always_yes, qmv_i8 },
+    { "ref", "scalar float reference, maximum portability (486-safe)",
+      always_yes, qmv_ref }
+};
+
+#define N_BACKENDS ((int) (sizeof(backends) / sizeof(backends[0])))
+
+static const bk_backend *cur = NULL;
+
+static void ensure_selected(void) {
+    if (!cur) {
+#ifdef INFER_BACKEND
+        if (bk_select(INFER_BACKEND) != 0) bk_select("auto");
+#else
+        bk_select("auto");
+#endif
+    }
+}
+
+int bk_select(const char *name) {
+    int i;
+
+    if (!name || !name[0] || strcmp(name, "auto") == 0) {
+        /* first entry that this CPU supports; the table is ordered
+         * fastest-first */
+        for (i = 0; i < N_BACKENDS; i++) {
+            if (backends[i].available()) {
+                cur = &backends[i];
+                return 0;
+            }
+        }
+        cur = &backends[N_BACKENDS - 1];
+        return 0;
+    }
+
+    for (i = 0; i < N_BACKENDS; i++) {
+        if (strcmp(backends[i].name, name) == 0) {
+            if (!backends[i].available()) return -2;
+            cur = &backends[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+const char *bk_name(void) { ensure_selected(); return cur->name; }
+const char *bk_desc(void) { ensure_selected(); return cur->desc; }
+
+void bk_print_list(FILE *f) {
+    int i;
+    ensure_selected();
+
+    fprintf(f, "CPU: %s  features:%s%s%s\n", bk_cpu_vendor(),
+            bk_cpu_has_mmx()   ? " mmx"   : "",
+            bk_cpu_has_3dnow() ? " 3dnow" : "",
+            bk_cpu_has_cmov()  ? " cmov"  : "");
+    fprintf(f, "\navailable backends:\n");
+    for (i = 0; i < N_BACKENDS; i++) {
+        fprintf(f, "  %-5s %-3s %s%s\n",
+                backends[i].name,
+                backends[i].available() ? "ok" : "n/a",
+                backends[i].desc,
+                &backends[i] == cur ? "   <- selected" : "");
+    }
+#ifndef INFER_HAVE_MMX
+    fprintf(f, "\n  (this binary was built without the MMX backend;\n"
+               "   rebuild with `make geode` or -DINFER_HAVE_MMX to include it)\n");
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* Public dispatcher used by the engine                                */
+/* ------------------------------------------------------------------ */
+
+void q_matvec(int type, const unsigned char *w, const float *x,
+              float *y, long ncols, long nrows) {
+    PROF_DECL(pt);
+    ensure_selected();
+
+    PROF_START(pt);
+    cur->matvec(type, w, x, y, ncols, nrows);
+
+#ifdef INFER_PROFILE
+    {
+        int slot;
+        switch (type) {
+            case GGML_TYPE_Q4_K: slot = PF_MATVEC_Q4K; break;
+            case GGML_TYPE_Q5_K: slot = PF_MATVEC_Q5K; break;
+            case GGML_TYPE_Q6_K: slot = PF_MATVEC_Q6K; break;
+            case GGML_TYPE_Q8_0: slot = PF_MATVEC_Q80; break;
+            default:             slot = PF_MATVEC_OTHER; break;
+        }
+        prof_add(slot, prof_now() - pt, (double) ncols * (double) nrows);
+    }
+#endif
+}

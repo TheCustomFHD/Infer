@@ -1,0 +1,78 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-multilib \
+                                  gcc-mingw-w64-i686-win32
+      - name: native
+        run: make && ./infer --version
+      - name: i486
+        run: make i486 && file infer-i486
+      - name: geode
+        run: make geode
+      - name: windows
+        run: make windows && make windows-mmx
+      - name: tests
+        run: |
+          make test
+          ./build/t_align && ./build/t_jinja && ./build/t_agent
+          ./build/t_endian
+      - name: big-endian build and test (s390x under qemu)
+        run: |
+          sudo apt-get install -y gcc-s390x-linux-gnu qemu-user-static
+          s390x-linux-gnu-gcc -std=c89 -pedantic -Wall -Wextra \
+            -Wno-unused-parameter -O2 -static -o t_endian_be \
+            tests/t_endian.c src/gguf.c src/quant.c src/backend.c \
+            src/util.c src/prof.c src/sys_posix.c -lm
+          qemu-s390x-static ./t_endian_be
+          # the whole program must link for a big-endian target too
+          s390x-linux-gnu-gcc -std=c89 -O2 -static -o infer_be \
+            src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
+            src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c \
+            src/tokenizer.c src/sampler.c src/quant.c src/backend.c \
+            src/gguf.c src/json.c src/util.c src/prof.c \
+            src/net_posix.c src/sys_posix.c -lm
+      - name: no post-486 instruction in the i486 build
+        run: |
+          n=$(objdump -d infer-i486 --no-show-raw-insn \
+              | grep -oE '^\s+[0-9a-f]+:\s+[a-z0-9.]+' | awk '{print $2}' \
+              | sort -u \
+              | grep -cE '^(pmaddwd|paddd|punpck|pand|psrlw|emms|movq|movd|movap|cvtt?s|cmov|pf[a-z]+)$' || true)
+          test "$n" -eq 0
+      - name: every toggle is accepted in every mode that documents it
+        run: |
+          for m in serve chat run; do
+            for f in "--system S" "--think" "--think off" "--raw" \
+                     "--tool-rounds 2" "--quiet-tools" "--temp 0.5" \
+                     "--mcp http://127.0.0.1:1/mcp" "--template /dev/null"; do
+              if ./infer $m /nonexistent.gguf $f 2>&1 \
+                   | grep -q 'has no effect'; then
+                echo "REGRESSION: $m rejects $f"; exit 1
+              fi
+            done
+          done
+      - name: logging is opt-in, even in a -DINFER_PROFILE build
+        run: |
+          make profile
+          # --log-stages on a build without the timers must explain itself
+          ./infer run /nonexistent.gguf --log-stages 2>&1 | grep -q 'INFER_PROFILE'
+      - name: --think is one switch and does not eat the next option
+        run: |
+          ./infer chat /nonexistent.gguf --no-think 2>&1 | grep -q 'unknown option'
+          ./infer chat /nonexistent.gguf --think banana 2>&1 | grep -q 'expects on or off'
+      - name: options that do not apply are reported, not ignored
+        run: |
+          ./infer run x.gguf --port 9 2>&1 | grep -q 'has no effect'
+          ./infer serve x.gguf -p hi 2>&1 | grep -q 'has no effect'
+      - name: windows exe imports only XP-safe DLLs
+        run: |
+          i686-w64-mingw32-objdump -p infer.exe | grep 'DLL Name'
+          test "$(i686-w64-mingw32-objdump -p infer.exe | grep -c 'DLL Name')" -eq 3

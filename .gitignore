@@ -1,0 +1,19 @@
+# build outputs
+/infer
+/infer-i486
+/infer-geode
+/infer-profile
+/infer-i486-profile
+/infer-geode-profile
+*.exe
+/build/
+
+# models and logs
+*.gguf
+*.log
+perf*.txt
+
+# editors
+*.swp
+*~
+.DS_Store
