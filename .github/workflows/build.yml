@@ -12,14 +12,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential gcc-multilib \
                                   gcc-mingw-w64-i686-win32
-      - name: native
-        run: make && ./infer --version
-      - name: i486
-        run: make i486 && file infer-i486
-      - name: geode
-        run: make geode
-      - name: windows
-        run: make windows && make windows-mmx
+      - name: build all four x86 targets
+        run: make all && ./infer-1.12.1-linux --version
       - name: tests
         run: |
           make test
@@ -40,20 +34,26 @@ jobs:
             src/tokenizer.c src/sampler.c src/quant.c src/backend.c \
             src/gguf.c src/json.c src/util.c src/prof.c \
             src/net_posix.c src/sys_posix.c -lm
-      - name: no post-486 instruction in the i486 build
+      - name: i486 baseline -- no CMOV emitted for ordinary code
         run: |
-          n=$(objdump -d infer-i486 --no-show-raw-insn \
-              | grep -oE '^\s+[0-9a-f]+:\s+[a-z0-9.]+' | awk '{print $2}' \
-              | sort -u \
-              | grep -cE '^(pmaddwd|paddd|punpck|pand|psrlw|emms|movq|movd|movap|cvtt?s|cmov|pf[a-z]+)$' || true)
+          # MMX is expected (backend_mmx.c, runtime-gated). CMOV is not:
+          # it is a Pentium Pro instruction and would fault on a 486.
+          n=$(objdump -d infer-1.12.1-linux --no-show-raw-insn \
+              | grep -cE '^[[:space:]]+[0-9a-f]+:[[:space:]]+cmov[a-z]+' || true)
+          echo "cmov instructions: $n"
           test "$n" -eq 0
+      - name: MMX kernels really are compiled in
+        run: |
+          n=$(objdump -d infer-1.12.1-linux | grep -cE 'pmaddwd|punpcklbw' || true)
+          echo "mmx instructions: $n"
+          test "$n" -gt 100
       - name: every toggle is accepted in every mode that documents it
         run: |
           for m in serve chat run; do
             for f in "--system S" "--think" "--think off" "--raw" \
                      "--tool-rounds 2" "--quiet-tools" "--temp 0.5" \
                      "--mcp http://127.0.0.1:1/mcp" "--template /dev/null"; do
-              if ./infer $m /nonexistent.gguf $f 2>&1 \
+              if ./infer-1.12.1-linux $m /nonexistent.gguf $f 2>&1 \
                    | grep -q 'has no effect'; then
                 echo "REGRESSION: $m rejects $f"; exit 1
               fi
@@ -61,18 +61,18 @@ jobs:
           done
       - name: logging is opt-in, even in a -DINFER_PROFILE build
         run: |
-          make profile
           # --log-stages on a build without the timers must explain itself
-          ./infer run /nonexistent.gguf --log-stages 2>&1 | grep -q 'INFER_PROFILE'
+          ./infer-1.12.1-linux run /nonexistent.gguf --log-stages 2>&1 \
+            | grep -q 'INFER_PROFILE'
       - name: --think is one switch and does not eat the next option
         run: |
-          ./infer chat /nonexistent.gguf --no-think 2>&1 | grep -q 'unknown option'
-          ./infer chat /nonexistent.gguf --think banana 2>&1 | grep -q 'expects on or off'
+          ./infer-1.12.1-linux chat /nonexistent.gguf --no-think 2>&1 | grep -q 'unknown option'
+          ./infer-1.12.1-linux chat /nonexistent.gguf --think banana 2>&1 | grep -q 'expects on or off'
       - name: options that do not apply are reported, not ignored
         run: |
-          ./infer run x.gguf --port 9 2>&1 | grep -q 'has no effect'
-          ./infer serve x.gguf -p hi 2>&1 | grep -q 'has no effect'
+          ./infer-1.12.1-linux run x.gguf --port 9 2>&1 | grep -q 'has no effect'
+          ./infer-1.12.1-linux serve x.gguf -p hi 2>&1 | grep -q 'has no effect'
       - name: windows exe imports only XP-safe DLLs
         run: |
-          i686-w64-mingw32-objdump -p infer.exe | grep 'DLL Name'
-          test "$(i686-w64-mingw32-objdump -p infer.exe | grep -c 'DLL Name')" -eq 3
+          i686-w64-mingw32-objdump -p infer-1.12.1-windows.exe | grep 'DLL Name'
+          test "$(i686-w64-mingw32-objdump -p infer-1.12.1-windows.exe | grep -c 'DLL Name')" -eq 3

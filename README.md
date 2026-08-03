@@ -111,19 +111,26 @@ $ infer run model.gguf --port 9090
 ## Build targets
 
 ```sh
-make                # native
-make i486           # 32-bit, 486-safe, no MMX
-make geode          # 32-bit, MMX kernels + 486 baseline
-make windows        # Windows XP, 486-safe
-make windows-mmx    # Windows XP, MMX kernels + 486 baseline
-make solaris        # Solaris / SPARC, Sun Studio
-make solaris-gcc    # Solaris / SPARC, GCC
-make test           # eight test programs
+make linux              # Linux/x86        -> infer-1.12.1-linux
+make linux-profile      # ...with profiler -> infer-1.12.1-linux-profile
+make windows            # Windows XP/x86   -> infer-1.12.1-windows.exe
+make windows-profile    # ...with profiler -> infer-1.12.1-windows-profile.exe
+make all                # all four
+
+make solaris            # Solaris/SPARC, Sun Studio, 64-bit
+make solaris-gcc        # Solaris/SPARC, GCC, 64-bit
+
+make test               # eight test programs
 ```
 
-The MMX builds use a **486 baseline** with runtime MMX detection, so one
-binary runs on a 486 *and* accelerates on anything with MMX. Binaries
-are named `infer-<version>[-variant]`.
+**All four x86 builds contain all three backends** — `mmx`, `i8`, `ref` —
+and select the fastest the CPU supports at run time. All four use an
+**i486 baseline**, so one binary runs on a 486 and accelerates on
+anything with MMX. The only choice is whether you want the profiler
+(~2% slower, prints nothing unless asked).
+
+Solaris/SPARC is deliberately separate: different compiler, different
+flags, big-endian, 64-bit.
 
 Every target compiles with **zero warnings**. The i486 build was
 disassembled and audited: **no SSE, MMX, CMOV or any post-486

@@ -40,13 +40,25 @@ sys_map *sys_map_file(const char *path, double offset, double length) {
     pagesz = sysconf(_SC_PAGESIZE);
     if (pagesz <= 0) pagesz = 4096;
 
-    /* Page-align the offset. Kept as a `long` page *index* rather than a
-     * byte offset: with _FILE_OFFSET_BITS=64 on a 32-bit host off_t
-     * becomes `long long`, and strict C90 (Sun Studio -Xc -xc99=none)
-     * has no such type -- a cast to it is a syntax error, not a
-     * warning. Multiplying the index by the page size inside the mmap()
-     * call lets the compiler do the widening implicitly, using whatever
-     * off_t happens to be, with no 64-bit type named in our source. */
+    /* Page-align the offset, keeping a `long` page *index* rather than a
+     * byte offset, and never naming a 64-bit type.
+     *
+     * This matters on Solaris with Sun Studio in strict C90 mode. -Xc
+     * undefines _LONGLONG_TYPE, because C90 has no `long long`, and
+     * <sys/types.h> then falls back to
+     *
+     *     typedef union { double _d; int32_t _l[2]; } longlong_t;
+     *
+     * With _FILE_OFFSET_BITS=64 on a 32-bit build off_t becomes that
+     * union: it cannot be cast to, assigned from an integer, or used in
+     * arithmetic, and passing anything to mmap()'s offset argument
+     * fails to compile.
+     *
+     * The supported configuration is therefore a 64-bit build (-m64),
+     * where off_t is already a plain 64-bit long and large-file support
+     * is automatic. Passing `page_index * pagesz` -- long times long --
+     * is then correct everywhere, and on 32-bit glibc it still widens
+     * implicitly to whatever off_t is. */
     page_index = (long) (offset / (double) pagesz);
     aligned = (double) page_index * (double) pagesz;
     skew    = (size_t) (offset - aligned);

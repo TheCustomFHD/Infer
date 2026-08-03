@@ -284,6 +284,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Report an unusable --log-stages before doing any work: loading a
+     * 500 MB model only to say "that flag does nothing" wastes the
+     * user's time, and if the path is wrong they never see it at all. */
+    if (o.log_stages && !PROF_ENABLED) {
+        inf_log("--log-stages needs a build with -DINFER_PROFILE "
+                "(make linux-profile / windows-profile / solaris-profile); "
+                "this build has no stage timers compiled in");
+        o.log_stages = 0;
+    }
+
     if (o.mode == MODE_INFO) return cmd_info(o.model_path);
 
     inf_log("infer %s -- loading %s", INFER_VERSION, o.model_path);
@@ -318,12 +328,6 @@ int main(int argc, char **argv) {
      * measurement *possible*, not compulsory: the timers stay compiled
      * in, and --log-perf / --log-stages decide whether anything is
      * printed. */
-    if (o.log_stages && !PROF_ENABLED) {
-        inf_log("--log-stages needs a build with -DINFER_PROFILE "
-                "(make profile / profile-geode / profile-windows); "
-                "this build has no stage timers compiled in");
-        o.log_stages = 0;
-    }
     prof_stages_enabled = o.log_stages;
 
     if (o.log_perf || o.log_stages || o.log_file) {

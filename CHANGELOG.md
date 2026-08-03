@@ -1,8 +1,80 @@
 # Changelog
 
-## 1.12.1 — Solaris build fix
+## 1.12.1 — Solaris actually builds, and four targets instead of twenty
 
-### `sys_posix.c` would not compile with Sun Studio
+### Solaris: the real cause, and the real fix
+
+1.12.0 failed on UltraSPARC with `invalid cast expression`. The first
+attempt at a fix only moved the failure one line:
+
+```
+"src/sys_posix.c", line 59: argument #6 is incompatible with prototype:
+    prototype: union {double *d, array[2] of int* l} : "/usr/include/sys/mman.h", line 168
+    argument : long
+```
+
+That union is the whole story. In strict C90 mode `-Xc` undefines
+`_LONGLONG_TYPE`, because C90 has no `long long`, and Solaris's
+`<sys/types.h>` falls back to:
+
+```c
+typedef union { double _d; int32_t _l[2]; } longlong_t;
+```
+
+With `_FILE_OFFSET_BITS=64` on a **32-bit** build, `off_t` becomes that
+union. Nothing can be cast to it, assigned to it, or passed to
+`mmap()`. No amount of rewriting our own code helps.
+
+**The fix is to stop building 32-bit.** These are 64-bit machines —
+UltraSPARC IIi and later. In LP64 `off_t` is already a plain 64-bit
+`long`, large-file support is automatic, and the union never appears.
+The Solaris targets now pass `-m64` and no longer pass
+`_FILE_OFFSET_BITS=64`.
+
+`sys_posix.c` keeps the page-index arithmetic from the first attempt,
+which is correct on both models and names no 64-bit type.
+
+### Four build targets instead of twenty
+
+The target list had grown to `all i486 geode windows windows-mmx profile
+profile-i486 profile-geode profile-windows solaris solaris-gcc
+solaris-profile solaris-gcc-profile solaris-fast solaris-test test bench
+clean version checkversion` — most of them near-duplicates.
+
+Now, for x86:
+
+```
+make linux              make windows
+make linux-profile      make windows-profile
+make all
+```
+
+**Every one contains all three backends and uses an i486 baseline.**
+There is no longer a separate "MMX build" or "i486 build", because a
+single binary already covers both: MMX is selected at run time from
+CPUID, and nothing newer than a 486 is emitted for ordinary code. The
+only remaining axis is the profiler.
+
+Solaris/SPARC keeps its own section, deliberately isolated so neither
+set of flags constrains the other.
+
+`make help` prints the list. Old target names are gone rather than
+aliased, so a stale script fails loudly instead of building something
+unexpected.
+
+### For AI agents: an exact Windows XP recipe
+
+Several agents have failed to produce a working XP build. COMPILE.md
+section 2 is now a literal, verified, top-to-bottom sequence: install,
+confirm the `win32` (not `posix`) mingw variant, build, and the four
+static checks that prove it will load on XP. Plus a table of the
+mistakes that actually happen, including sandboxes discarding installed
+packages between turns and the wasted effort of trying to run the `.exe`
+under Wine.
+
+### Earlier in this release
+
+#### `sys_posix.c` would not compile with Sun Studio
 
 Reported from a real UltraSPARC:
 
@@ -32,7 +104,7 @@ Verified with `gcc -std=c89 -pedantic -Werror=long-long -m32
 -D_FILE_OFFSET_BITS=64`: clean. The only remaining occurrence of the
 phrase "long long" in the codebase is the comment explaining this.
 
-### Solaris flags updated from field use
+#### Solaris flags updated from field use
 
 `-xO5` and `-xunroll=16` adopted from a user's own flag set: the 4-issue
 in-order UltraSPARC pipeline benefits from unrolling and neither flag
@@ -49,7 +121,7 @@ Two flags from that set are deliberately **not** default:
 * **`-xvis`** enables VIS intrinsics. There is no VIS code in the
   project, so it has no effect. Harmless, just pointless.
 
-### CMOV: measured, not assumed
+#### CMOV: measured, not assumed
 
 1.12.0 moved the MMX builds to a 486 baseline, which removes CMOV.
 Measured cost of that on x86-64, MMX backend, identical work:

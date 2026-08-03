@@ -1,25 +1,60 @@
 # infer -- GGUF inference server, ANSI C (C89), no dependencies.
 #
-#   make                 native build
-#   make solaris         Solaris / SPARC with Sun Studio (adds -lsocket -lnsl)
-#   make solaris-gcc     Solaris / SPARC with GCC
-#   make i486            32-bit build tuned for i486 (needs gcc-multilib)
-#   make windows         Windows XP build (needs i686-w64-mingw32-gcc)
-#   make test            build the unit tests
-#   make clean
+# ---------------------------------------------------------------------
+# THE ONLY FOUR TARGETS YOU NORMALLY WANT
+# ---------------------------------------------------------------------
+#
+#   make linux                 Linux / x86        -> infer-1.12.1-linux
+#   make linux-profile         ...with profiler   -> infer-1.12.1-linux-profile
+#   make windows               Windows XP / x86   -> infer-1.12.1-windows.exe
+#   make windows-profile       ...with profiler   -> infer-1.12.1-windows-profile.exe
+#
+#   make all                   all four of the above
+#
+# Every one of those contains ALL THREE backends -- mmx, i8, ref -- and
+# picks the fastest the CPU supports at run time. Every one is built to
+# an i486 baseline, so the same binary runs on a 486 and accelerates on
+# anything with MMX. There is no reason to ship more than these.
+#
+# The -profile variants add per-stage timers, which cost about 2%. They
+# print nothing unless you pass --log-stages, so they are safe to use
+# as normal binaries, just slightly slower.
+#
+# ---------------------------------------------------------------------
+# SPARC / SOLARIS -- a separate world, see the section further down
+# ---------------------------------------------------------------------
+#
+#   make solaris               Sun Studio, 64-bit  (recommended)
+#   make solaris-profile       ...with profiler
+#   make solaris-gcc           GCC on Solaris, 64-bit
+#   make solaris-gcc-profile   ...with profiler
+#
+# These are NOT backwards compatible with anything x86. Different
+# compiler, different flags, no MMX, big-endian. Kept deliberately
+# apart from the x86 targets so neither set constrains the other.
+#
+# ---------------------------------------------------------------------
+# UTILITY
+# ---------------------------------------------------------------------
+#
+#   make test                  build the unit tests into build/
+#   make bench                 build just the throughput benchmark
+#   make version               print the version
+#   make checkversion          assert Makefile matches src/infer.h
+#   make clean                 remove every build product
 #
 # The only libraries linked are the C runtime, libm and the OS socket
 # library. Nothing else is required to build or to run.
 
 CC      ?= cc
-CFLAGS  ?= -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2
+WINCC   ?= i686-w64-mingw32-gcc
 LDLIBS  ?= -lm
 
-SRCDIR  := src
-BUILD   := build
+SRCDIR  = src
+BUILD   = build
 
 # Platform-independent sources.
-CORE := \
+CORE = \
 	$(SRCDIR)/main.c \
 	$(SRCDIR)/opts.c \
 	$(SRCDIR)/server.c \
@@ -38,243 +73,251 @@ CORE := \
 	$(SRCDIR)/util.c \
 	$(SRCDIR)/prof.c
 
-# Exactly one backend of each kind is linked in. Porting to a new OS
-# means writing these two files and nothing else.
-POSIX := $(SRCDIR)/net_posix.c $(SRCDIR)/sys_posix.c
-WIN32 := $(SRCDIR)/net_win32.c $(SRCDIR)/sys_win32.c
+# Exactly one of each is linked in. Porting to a new OS means writing
+# these two files and nothing else.
+POSIX = $(SRCDIR)/net_posix.c $(SRCDIR)/sys_posix.c
+WIN32 = $(SRCDIR)/net_win32.c $(SRCDIR)/sys_win32.c
 
-HDRS := $(SRCDIR)/infer.h $(SRCDIR)/prof.h $(SRCDIR)/jinja.h \
-        $(SRCDIR)/jinja_priv.h $(SRCDIR)/mcp.h $(SRCDIR)/chat.h \
-        $(SRCDIR)/opts.h $(SRCDIR)/agent.h $(SRCDIR)/net.h $(SRCDIR)/sys.h \
-        $(SRCDIR)/server.h $(SRCDIR)/json.h $(SRCDIR)/unicode_tbl.h
+# The MMX backend. x86 only, GNU inline asm, hence -std=gnu89.
+MMXSRC = $(SRCDIR)/backend_mmx.c
+
+HDRS = $(SRCDIR)/infer.h $(SRCDIR)/prof.h $(SRCDIR)/jinja.h \
+       $(SRCDIR)/jinja_priv.h $(SRCDIR)/mcp.h $(SRCDIR)/chat.h \
+       $(SRCDIR)/opts.h $(SRCDIR)/agent.h $(SRCDIR)/net.h $(SRCDIR)/sys.h \
+       $(SRCDIR)/server.h $(SRCDIR)/json.h $(SRCDIR)/unicode_tbl.h
 
 TARGET  = infer
 
 # Version stamped onto every executable, so several builds can sit in
-# one directory without being renamed by hand:
-#     infer-1.11.0, infer-1.11.0-i486, infer-1.11.0-geode, ...
+# one directory without being renamed by hand.
 #
 # Written out literally rather than extracted with $(shell ...): that is
-# a GNU make extension and this Makefile has to work with Solaris
-# /usr/ccs/bin/make and other POSIX makes too. `make checkversion`
-# asserts it still matches src/infer.h, and CI runs it.
+# a GNU make extension and this Makefile also has to work with Solaris
+# /usr/ccs/bin/make. `make checkversion` asserts it still matches
+# src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
 VERSION = 1.12.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
-.PHONY: all clean i486 geode windows windows-mmx test bench \
-        profile profile-geode profile-i486 profile-windows \
-        solaris solaris-gcc solaris-profile solaris-gcc-profile \
-        solaris-fast solaris-test
+.PHONY: all linux linux-profile windows windows-profile \
+        solaris solaris-profile solaris-gcc solaris-gcc-profile \
+        solaris-fast solaris-test \
+        test bench clean version checkversion help
 
-all: $(BIN)
+all: linux linux-profile windows windows-profile
 
-$(BIN): $(CORE) $(POSIX) $(HDRS)
-	$(CC) $(CFLAGS) -o $@ $(CORE) $(POSIX) $(LDLIBS)
+help:
+	@echo "make linux              Linux/x86, all backends, i486 baseline"
+	@echo "make linux-profile      ...plus per-stage timers (~2% slower)"
+	@echo "make windows            Windows XP/x86, all backends, i486 baseline"
+	@echo "make windows-profile    ...plus per-stage timers (~2% slower)"
+	@echo "make all                all four"
+	@echo ""
+	@echo "make solaris            Solaris/SPARC, Sun Studio, 64-bit"
+	@echo "make solaris-profile    ...plus per-stage timers"
+	@echo "make solaris-gcc        Solaris/SPARC, GCC, 64-bit"
+	@echo ""
+	@echo "make test / bench / clean / version / checkversion"
 
-# ---------------------------------------------------------------------
-# Solaris / SPARC, with Sun Studio (suncc) or GCC.
+# =====================================================================
+#  x86: Linux and Windows
+# =====================================================================
 #
-# Two things differ from Linux and neither is about the CPU:
+# One flag set, used by all four x86 targets. The reasoning:
 #
-#   1. Solaris keeps the socket API in libsocket/libnsl, not libc, so
-#      -lsocket -lnsl are required. Linux needs neither.
-#   2. Sun Studio spells its options differently: -Xc -xc99=none for
-#      strict C89, -xO3 for optimisation. GCC's -std=c89 -pedantic -O2
-#      are not recognised.
+#   -std=gnu89       backend_mmx.c uses GNU inline asm. It is the only
+#                    file in the project that is not strict C89.
+#   -march=i486      BASELINE. Nothing newer than a 486 is emitted for
+#                    ordinary code -- in particular no CMOV, which is a
+#                    Pentium Pro instruction and faults on a 486.
+#   -mtune=geode     SCHEDULING only. Reorders instructions for the
+#                    Geode pipeline; never changes the instruction set.
+#   -mmmx            lets the compiler use MMX *inside backend_mmx.c*,
+#                    which is guarded by a runtime CPUID check.
+#   -DINFER_HAVE_MMX compiles that backend in and registers it.
 #
-# So there is nothing to edit by hand:
-#
-#     make solaris          Sun Studio, SPARC (auto-tunes to the host)
-#     make solaris-gcc      GCC on Solaris
-#     make solaris-profile  Sun Studio + stage timers
-#
-# -xtarget=native tunes for the machine doing the build. Use
-# -xtarget=ultra2 / ultra3 to build on one box for another, e.g.
-#     make solaris SUNTARGET=ultra2
-#
-# The engine is portable C89: the i8 backend (integer kernels) is
-# selected automatically and is several times faster than ref. There is
-# no VIS backend yet; see docs/PORTING.md.
-# ---------------------------------------------------------------------
-SUNCC      = cc
-SUNTARGET  = native
+# The result: one binary with all three backends, running on a 486 and
+# accelerating on anything with MMX. Measured cost of the i486 baseline
+# versus letting the compiler use CMOV: 0.6%, in favour of the baseline.
 
-# -xO5 and -xunroll=16 come from a user's own flag set on an UltraSPARC
-# and are kept: the 4-issue in-order pipeline benefits from unrolling,
-# and neither changes results.
+X86FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+           -march=i486 -mtune=geode -mmmx -mno-sse -mno-sse2 -mfpmath=387 \
+           -DINFER_HAVE_MMX
+
+linux: $(CORE) $(POSIX) $(MMXSRC) $(HDRS)
+	$(CC) $(X86FLAGS) -m32 -D_FILE_OFFSET_BITS=64 \
+		-o $(BIN)-linux $(CORE) $(POSIX) $(MMXSRC) $(LDLIBS)
+
+linux-profile: $(CORE) $(POSIX) $(MMXSRC) $(HDRS)
+	$(CC) $(X86FLAGS) -m32 -D_FILE_OFFSET_BITS=64 -DINFER_PROFILE \
+		-o $(BIN)-linux-profile $(CORE) $(POSIX) $(MMXSRC) $(LDLIBS)
+
+# -D_WIN32_WINNT=0x0501 pins the Windows API surface to XP, so the
+# compiler refuses anything newer and the import table stays clean.
+windows: $(CORE) $(WIN32) $(MMXSRC) $(HDRS)
+	$(WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 \
+		-o $(BIN)-windows.exe $(CORE) $(WIN32) $(MMXSRC) -lws2_32
+
+windows-profile: $(CORE) $(WIN32) $(MMXSRC) $(HDRS)
+	$(WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 -DINFER_PROFILE \
+		-o $(BIN)-windows-profile.exe $(CORE) $(WIN32) $(MMXSRC) -lws2_32
+
+# =====================================================================
+#  SPARC / Solaris
+# =====================================================================
 #
-# Deliberately NOT included:
+# Deliberately separate from everything above. Different compiler,
+# different option spellings, big-endian, no MMX. Nothing here
+# constrains the x86 targets and nothing there constrains these.
 #
-#   -fast   A macro that turns on -fsimple=2 and -fns, i.e. non-IEEE
-#           float: reassociation, no gradual underflow, flush-to-zero.
+# THREE things differ from Linux, and none of them is about the CPU:
+#
+#  1. Solaris keeps the socket API in libsocket/libnsl, not libc.
+#     Without -lsocket -lnsl you get undefined socket/bind/gethostbyname
+#     at link time. This is the usual reason a hand-rolled GCC build
+#     fails on Solaris where Sun Studio succeeds.
+#
+#  2. Sun Studio spells its options differently: -Xc -xc99=none for
+#     strict C90, -xO5 for optimisation, -xtarget= for -march=.
+#     GCC's -std=c89 -pedantic -O2 are not recognised by cc at all.
+#
+#  3. BUILD 64-BIT, AND DO NOT PASS -D_FILE_OFFSET_BITS=64.
+#     This is subtle and it broke a real build. In strict C90 mode
+#     (-Xc) Sun Studio undefines _LONGLONG_TYPE, because C90 has no
+#     `long long`. Solaris's <sys/types.h> then falls back to
+#
+#         typedef union { double _d; int32_t _l[2]; } longlong_t;
+#
+#     and with _FILE_OFFSET_BITS=64 on a 32-bit build, off_t becomes
+#     that union. You cannot cast to it, assign to it, or do arithmetic
+#     on it -- mmap()'s offset argument becomes unusable and the
+#     compile fails with "argument #6 is incompatible with prototype".
+#
+#     In LP64 (-m64) off_t is already a 64-bit long, so large-file
+#     support is automatic and the union never appears. Every machine
+#     these targets are aimed at -- UltraSPARC IIi and later -- is
+#     64-bit, so -m64 is both correct and simpler.
+#
+# -xO5 and -xunroll=16 come from a user's own flag set on an
+# UltraSPARC; the 4-issue in-order pipeline benefits from unrolling and
+# neither flag changes results. Override with SUNOPT=.
+#
+# Deliberately NOT default:
+#
+#   -fast   A macro that enables -fsimple=2 and -fns, i.e. non-IEEE
+#           float: reassociation, flush-to-zero, no gradual underflow.
 #           The k-quant scales are fp16 values very close to zero and
 #           the DeltaNet recurrence accumulates over 128 steps, so
 #           flush-to-zero is a real correctness risk here, not a
-#           theoretical one. Use `make solaris-fast` to opt in and
-#           `./build/t_backend model.gguf` to check the error terms if
-#           you do.
+#           theoretical one. `make solaris-fast` opts in; check the
+#           result with ./build/t_backend model.gguf.
 #
-#   -xvis   Enables VIS *intrinsics*. There is no VIS code in the
-#           project, so it has no effect. It is not harmful.
-SUNOPT     = -xO5 -xunroll=16
-# -DINFER_BIG_ENDIAN=1 is explicit on purpose. Sun Studio does not define
-# __BYTE_ORDER__, and under -Xc it suppresses the unprefixed `sparc`, so
-# autodetection has less to work with than under GCC. SPARC is always
-# big-endian, so state it rather than infer it. (infer.h would now refuse
-# to compile rather than guess, but being explicit documents the intent.)
-SUNCFLAGS  = -Xc -xc99=none $(SUNOPT) -xtarget=$(SUNTARGET) \
-             -DINFER_BIG_ENDIAN=1 -D_FILE_OFFSET_BITS=64
-SOLLIBS    = -lm -lsocket -lnsl
+#   -xvis   Enables VIS *intrinsics*. There is no VIS code in this
+#           project, so it does nothing. Harmless, just pointless.
+
+SUNCC     = cc
+SUNTARGET = native
+SUNOPT    = -xO5 -xunroll=16
+SUNBITS   = -m64
+SUNFLAGS  = -Xc -xc99=none $(SUNOPT) $(SUNBITS) -xtarget=$(SUNTARGET) \
+            -DINFER_BIG_ENDIAN=1
+SOLLIBS   = -lm -lsocket -lnsl
 
 solaris: $(CORE) $(POSIX)
-	$(SUNCC) $(SUNCFLAGS) -o $(BIN) $(CORE) $(POSIX) $(SOLLIBS)
+	$(SUNCC) $(SUNFLAGS) -o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
 
 solaris-profile: $(CORE) $(POSIX)
-	$(SUNCC) $(SUNCFLAGS) -DINFER_PROFILE \
-		-o $(BIN)-profile $(CORE) $(POSIX) $(SOLLIBS)
+	$(SUNCC) $(SUNFLAGS) -DINFER_PROFILE \
+		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(SOLLIBS)
 
+# GCC on Solaris. -m64 for the same reason; GCC does define long long,
+# so _FILE_OFFSET_BITS would work here, but 64-bit makes it moot.
 solaris-gcc: $(CORE) $(POSIX)
 	$(CC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
-		-DINFER_BIG_ENDIAN=1 -D_FILE_OFFSET_BITS=64 \
-		-o $(BIN) $(CORE) $(POSIX) $(SOLLIBS)
+		-m64 -DINFER_BIG_ENDIAN=1 \
+		-o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
 
 solaris-gcc-profile: $(CORE) $(POSIX)
 	$(CC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
-		-DINFER_PROFILE -DINFER_BIG_ENDIAN=1 -D_FILE_OFFSET_BITS=64 \
-		-o $(BIN)-profile $(CORE) $(POSIX) $(SOLLIBS)
+		-m64 -DINFER_BIG_ENDIAN=1 -DINFER_PROFILE \
+		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(SOLLIBS)
 
-# Tests, built the same way. Solaris make has no pattern rules we can
-# rely on, so these are spelled out.
-# Opt-in: adds -fast. Verify with t_backend before trusting the output.
+# Opt-in, non-IEEE float. Verify with t_backend before trusting output.
 solaris-fast: $(CORE) $(POSIX)
-	$(SUNCC) -Xc -xc99=none $(SUNOPT) -fast -xtarget=$(SUNTARGET) \
-		-DINFER_BIG_ENDIAN=1 -D_FILE_OFFSET_BITS=64 \
-		-o $(BIN) $(CORE) $(POSIX) $(SOLLIBS)
+	$(SUNCC) $(SUNFLAGS) -fast \
+		-o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
 
+# Solaris make has no pattern rules we can rely on, so these are spelled
+# out rather than sharing the rules below.
 solaris-test: $(CORE) $(POSIX)
 	@mkdir -p $(BUILD)
-	$(SUNCC) $(SUNCFLAGS) -o $(BUILD)/t_endian tests/t_endian.c \
+	$(SUNCC) $(SUNFLAGS) -o $(BUILD)/t_endian tests/t_endian.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
-	$(SUNCC) $(SUNCFLAGS) -o $(BUILD)/t_backend tests/t_backend.c \
+	$(SUNCC) $(SUNFLAGS) -o $(BUILD)/t_backend tests/t_backend.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
-	$(SUNCC) $(SUNCFLAGS) -o $(BUILD)/t_tokenizer tests/t_tokenizer.c \
+	$(SUNCC) $(SUNFLAGS) -o $(BUILD)/t_tokenizer tests/t_tokenizer.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
 		$(SRCDIR)/sys_posix.c $(SOLLIBS)
 	@echo "run: ./$(BUILD)/t_endian [model.gguf]"
 
-# ---------------------------------------------------------------------
-# i486: 32-bit, nothing newer than the 486 instruction set, no SSE/MMX,
-# x87 for floating point. Requires 32-bit libc headers
-# (Debian/Ubuntu: apt install gcc-multilib libc6-dev-i386).
-# ---------------------------------------------------------------------
-i486: $(CORE) $(POSIX)
-	$(CC) -std=c89 -pedantic -Wall -O2 \
-		-m32 -march=i486 -mtune=i486 \
-		-mno-sse -mno-sse2 -mno-mmx -mfpmath=387 \
-		-D_FILE_OFFSET_BITS=64 \
-		-o $(BIN)-i486 $(CORE) $(POSIX) $(LDLIBS)
+# =====================================================================
+#  Tests
+# =====================================================================
 
-# ---------------------------------------------------------------------
-# Windows XP (32-bit). Only the two backend files change.
-# ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# Profiling builds. Identical to the targets above but with
-# -DINFER_PROFILE, which compiles in per-stage timers. Without that
-# define the timer macros expand to nothing, so the normal builds carry
-# no overhead whatsoever.
-#
-# Run with --log-file perf.txt to capture the report.
-# ---------------------------------------------------------------------
-profile: $(CORE) $(POSIX)
-	$(CC) $(CFLAGS) -DINFER_PROFILE \
-		-o $(BIN)-profile $(CORE) $(POSIX) $(LDLIBS)
+TESTFLAGS = -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2
 
-profile-i486: $(CORE) $(POSIX)
-	$(CC) -std=c89 -pedantic -Wall -O2 \
-		-m32 -march=i486 -mtune=i486 \
-		-mno-sse -mno-sse2 -mno-mmx -mfpmath=387 \
-		-DINFER_PROFILE -D_FILE_OFFSET_BITS=64 \
-		-o $(BIN)-i486-profile $(CORE) $(POSIX) $(LDLIBS)
-
-profile-geode: $(CORE) $(POSIX) $(SRCDIR)/backend_mmx.c
-	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m32 -march=i486 -mtune=geode \
-		-mmmx -mno-sse -mno-sse2 -mfpmath=387 \
-		-DINFER_HAVE_MMX -DINFER_PROFILE -D_FILE_OFFSET_BITS=64 \
-		-o $(BIN)-geode-profile $(CORE) $(POSIX) \
-		$(SRCDIR)/backend_mmx.c $(LDLIBS)
-
-profile-windows: $(CORE) $(WIN32) $(SRCDIR)/backend_mmx.c
-	$(WINCC) -std=gnu89 -Wall -O2 -march=i486 -mtune=geode -mmmx \
-		-DINFER_HAVE_MMX -DINFER_PROFILE -D_WIN32_WINNT=0x0501 \
-		-o $(BIN)-profile.exe $(CORE) $(WIN32) \
-		$(SRCDIR)/backend_mmx.c -lws2_32
-
-# ---------------------------------------------------------------------
-# Geode LX / Pentium-MMX class: 32-bit, MMX backend compiled in.
-# The binary still runs on a 486 if you drop -march (the MMX kernel is
-# gated behind a CPUID check at run time), but -march=geode lets GCC use
-# the full Geode instruction set for the scalar code too.
-# ---------------------------------------------------------------------
-geode: $(CORE) $(POSIX) $(SRCDIR)/backend_mmx.c
-	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m32 -march=i486 -mtune=geode \
-		-mmmx -mno-sse -mno-sse2 -mfpmath=387 \
-		-DINFER_HAVE_MMX -D_FILE_OFFSET_BITS=64 \
-		-o $(BIN)-geode $(CORE) $(POSIX) $(SRCDIR)/backend_mmx.c $(LDLIBS)
-
-WINCC ?= i686-w64-mingw32-gcc
-
-windows: $(CORE) $(WIN32)
-	$(WINCC) -std=c89 -Wall -O2 -march=i486 -mtune=i486 \
-		-D_WIN32_WINNT=0x0501 \
-		-o $(BIN).exe $(CORE) $(WIN32) -lws2_32
-
-# Windows build with the MMX backend (Pentium MMX / Geode and later).
-windows-mmx: $(CORE) $(WIN32) $(SRCDIR)/backend_mmx.c
-	$(WINCC) -std=gnu89 -Wall -O2 -march=i486 -mtune=geode -mmmx \
-		-DINFER_HAVE_MMX -D_WIN32_WINNT=0x0501 \
-		-o $(BIN)-mmx.exe $(CORE) $(WIN32) $(SRCDIR)/backend_mmx.c -lws2_32
-
-# ---------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------
-test: $(BUILD)/t_quant $(BUILD)/t_tokenizer $(BUILD)/t_engine $(BUILD)/t_backend \
-      $(BUILD)/t_align $(BUILD)/t_jinja $(BUILD)/t_agent $(BUILD)/t_endian
+test: $(BUILD)/t_quant $(BUILD)/t_tokenizer $(BUILD)/t_engine \
+      $(BUILD)/t_backend $(BUILD)/t_align $(BUILD)/t_jinja \
+      $(BUILD)/t_agent $(BUILD)/t_endian
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/t_quant: tests/t_quant.c $(CORE) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/t_quant.c \
+$(BUILD)/t_quant: tests/t_quant.c | $(BUILD)
+	$(CC) $(TESTFLAGS) -o $@ tests/t_quant.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c \
-	$(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
 
 $(BUILD)/t_tokenizer: tests/t_tokenizer.c | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/t_tokenizer.c \
+	$(CC) $(TESTFLAGS) -o $@ tests/t_tokenizer.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c \
-	$(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
+		$(SRCDIR)/sys_posix.c $(LDLIBS)
 
 $(BUILD)/t_engine: tests/t_engine.c | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/t_engine.c \
+	$(CC) $(TESTFLAGS) -o $@ tests/t_engine.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c \
-	$(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c $(SRCDIR)/qwen35.c \
-		$(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
+		$(SRCDIR)/qwen35.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+
+$(BUILD)/t_backend: tests/t_backend.c | $(BUILD)
+	$(CC) $(TESTFLAGS) -o $@ tests/t_backend.c \
+		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+
+# Built with the MMX backend so it inspects the real constants.
+$(BUILD)/t_align: tests/t_align.c $(MMXSRC) | $(BUILD)
+	$(CC) -std=gnu89 -Wall -O2 -mmmx -DINFER_HAVE_MMX \
+		-o $@ tests/t_align.c $(MMXSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/gguf.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+
+$(BUILD)/t_jinja: tests/t_jinja.c | $(BUILD)
+	$(CC) $(TESTFLAGS) -o $@ tests/t_jinja.c \
+		$(SRCDIR)/jinja.c $(SRCDIR)/jinja_eval.c \
+		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
+		$(SRCDIR)/util.c $(SRCDIR)/sys_posix.c $(SRCDIR)/prof.c $(LDLIBS)
 
 # Cross-mode option behaviour: proves chat, run and serve render the
 # same messages to the same prompt, and that the tool-call parser
-# handles every shape the model emits (see tests/t_agent.c).
-$(BUILD)/t_agent: tests/t_agent.c $(CORE) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/t_agent.c \
+# handles every shape the model emits.
+$(BUILD)/t_agent: tests/t_agent.c | $(BUILD)
+	$(CC) $(TESTFLAGS) -o $@ tests/t_agent.c \
 		$(SRCDIR)/agent.c $(SRCDIR)/opts.c $(SRCDIR)/sampler.c \
 		$(SRCDIR)/jinja.c $(SRCDIR)/jinja_eval.c \
 		$(SRCDIR)/mcp.c $(SRCDIR)/json.c $(SRCDIR)/util.c \
@@ -283,53 +326,19 @@ $(BUILD)/t_agent: tests/t_agent.c $(CORE) | $(BUILD)
 		$(SRCDIR)/prof.c $(LDLIBS)
 
 # Byte-order neutrality. Runs on any host; the point is that a
-# big-endian build prints exactly the same numbers (see docs/FINDINGS.md).
+# big-endian build prints exactly the same numbers.
 $(BUILD)/t_endian: tests/t_endian.c | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/t_endian.c \
+	$(CC) $(TESTFLAGS) -o $@ tests/t_endian.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
 
 bench: $(BUILD)/t_backend
 	@echo "run: ./$(BUILD)/t_backend <model.gguf>"
 
-$(BUILD)/t_backend: tests/t_backend.c | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/t_backend.c \
-		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c \
-	$(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+# =====================================================================
+#  Utility
+# =====================================================================
 
-# Alignment guard for the MMX constants. Built with the MMX backend so
-# it actually inspects the real constants (see tests/t_align.c).
-$(BUILD)/t_align: tests/t_align.c $(SRCDIR)/backend_mmx.c | $(BUILD)
-	$(CC) -std=gnu89 -Wall -O2 -mmmx -DINFER_HAVE_MMX \
-		-o $@ tests/t_align.c $(SRCDIR)/backend_mmx.c \
-		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/gguf.c \
-		$(SRCDIR)/util.c $(SRCDIR)/sys_posix.c $(SRCDIR)/prof.c $(LDLIBS)
-
-$(BUILD)/t_jinja: tests/t_jinja.c | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/t_jinja.c \
-		$(SRCDIR)/jinja.c $(SRCDIR)/jinja_eval.c \
-		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/sys_posix.c $(SRCDIR)/prof.c $(LDLIBS)
-
-# Removes this version's outputs, and the unversioned names older
-# releases used, so an upgrade does not leave stale binaries behind.
-VARIANTS = "" -i486 -geode -profile -i486-profile -geode-profile
-# Also removes binaries left by *other* versions, so bumping VERSION
-# does not silently accumulate old builds (one got swept into a release
-# tarball exactly that way).
-clean:
-	@rm -f $(TARGET)-[0-9]*.[0-9]*.[0-9]* $(TARGET)-[0-9]*.[0-9]*.[0-9]*.exe
-	@for v in $(VARIANTS); do \
-		[ "$$v" = '""' ] && v=""; \
-		rm -f "$(BIN)$$v" "$(TARGET)$$v"; \
-	done
-	rm -f $(BIN).exe $(BIN)-mmx.exe $(BIN)-profile.exe
-	rm -f $(TARGET).exe $(TARGET)-mmx.exe $(TARGET)-profile.exe
-	rm -rf $(BUILD)
-
-# Print the version the build will stamp onto its outputs.
-.PHONY: version checkversion
 version:
 	@echo $(VERSION)
 
@@ -339,3 +348,13 @@ checkversion:
 	if [ "$$h" != "$(VERSION)" ]; then \
 		echo "Makefile VERSION=$(VERSION) but infer.h says $$h" >&2; exit 1; \
 	fi; echo "version $(VERSION) ok"
+
+# Removes this version's outputs, any other version's outputs, and the
+# unversioned names older releases used.
+clean:
+	@rm -f $(TARGET)-[0-9]*.[0-9]*.[0-9]** 
+	@rm -f $(TARGET) $(TARGET).exe $(TARGET)-linux $(TARGET)-windows.exe
+	@rm -f $(BIN) $(BIN)-linux $(BIN)-linux-profile
+	@rm -f $(BIN)-windows.exe $(BIN)-windows-profile.exe
+	@rm -f $(BIN)-solaris $(BIN)-solaris-profile
+	@rm -rf $(BUILD)
