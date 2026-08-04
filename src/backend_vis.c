@@ -37,6 +37,37 @@
  * pmaddwd, rather than falling back to fmuld8ulx16 at two lanes.
  *
  * ---------------------------------------------------------------
+ * SIGNED WEIGHTS: the bias trick
+ * ---------------------------------------------------------------
+ *
+ * fmul8x16's first operand is *unsigned*. VIS 1 has no signed 8-bit
+ * multiply (fmul8sux16 is s8 x u16, which breaks for negative
+ * activations), so a format whose weights can go negative cannot be
+ * fed in directly.
+ *
+ * The fix is to add a constant to the weights and subtract its
+ * contribution from the result:
+ *
+ *     sum (w * x) = sum ((w + B) * x) - B * sum(x)
+ *
+ * The middle term is a plain u8 multiply and therefore exact. The
+ * correction uses the per-block sums of the quantised activations,
+ * which the shared backend already computes (xq->s for 32-element
+ * blocks, xq->s16 for 16-element blocks), so it costs one integer
+ * multiply per block -- and it is exactly the arithmetic the portable
+ * i8 kernel performs, so results stay bit-identical to it.
+ *
+ * Bias constants and their lane budgets:
+ *
+ *     Q6_K  w in -32..31  ->  w+32 in 0..63   4 lanes * 63*127  ok
+ *     Q8_0  q in -128..127 -> q+128 in 0..255 1 lane  * 255*127 ok
+ *     Q4_0  w in -8..7    ->  w+8  in 0..23   8 lanes * 23*127  ok
+ *
+ * Q6_K and Q8_0 accumulate straight into 32-bit lanes (fmuld8ulx16
+ * widening is exact), because their biased products are too large to
+ * stack in 16-bit lanes.
+ *
+ * ---------------------------------------------------------------
  * ACCUMULATOR WIDTH
  * ---------------------------------------------------------------
  *
@@ -45,13 +76,11 @@
  *
  *     Q4_K  w <= 15   ->  16 terms * 15 * 127 = 30480   ok
  *     Q5_K  w <= 31   ->   8 terms * 31 * 127 = 31496   ok
- *     Q6_K  |w| <= 32 ->   8 terms * 32 * 127 = 32512   ok
- *     Q8_0  |w| <= 127->   2 terms * 127 * 127 = 32258  ok
  *
- * So the kernels accumulate a bounded number of terms in 16-bit lanes
- * and then widen. Widening is done with fmuld8ulx16 against a constant
- * 1 byte, which is an exact 16 -> 32 bit expansion of two lanes and
- * avoids needing an unpack instruction VIS does not have.
+ * Q6_K / Q8_0 / Q4_0 widen to 32-bit lanes as they go (see above).
+ * Widening is done with fmuld8ulx16 against a constant 1 byte, which
+ * is an exact 16 -> 32 bit expansion of two lanes and avoids needing
+ * an unpack instruction VIS does not have.
  *
  * ---------------------------------------------------------------
  * WHY THIS SHOULD BEAT THE SCALAR PATH
@@ -131,6 +160,7 @@ typedef int bk_vis_translation_unit_not_empty;
 
 typedef float  vis_u8x4;
 typedef double vis_s16x4;
+typedef double vis_s32x2;
 
 #define VMUL8X16(a, b)   vis_fmul8x16((a), (b))
 #define VADD16(a, b)     vis_fpadd16((a), (b))
@@ -145,6 +175,30 @@ typedef unsigned char vis_u8x4  __attribute__((vector_size(4)));
 typedef short         vis_s16x4 __attribute__((vector_size(8)));
 typedef short         vis_s16x2 __attribute__((vector_size(4)));
 typedef int           vis_s32x2 __attribute__((vector_size(8)));
+
+/* Lane access goes through these unions, never through subscripts:
+ * GCC lowers v[0]/v[1] to stack round-trips on SPARC (~85 instructions
+ * of store/load noise for one fold). Memory-order halves are widened
+ * and summed, so the byte-order details cannot matter. */
+typedef union {
+    vis_s16x4     v;
+    unsigned long u;
+} vis_pun64;
+
+typedef union {
+    vis_u8x4     v;
+    unsigned int u;
+} vis_pun32;
+
+typedef union {
+    vis_s16x2     v;
+    unsigned int u;
+} vis_pun32s;
+
+typedef union {
+    vis_s32x2     v;
+    unsigned long u;
+} vis_pun64i;
 
 #define VMUL8X16(a, b)   __builtin_vis_fmul8x16((a), (b))
 #define VADD16(a, b)     __builtin_vis_fpadd16((a), (b))
@@ -260,28 +314,81 @@ static vis_s16x4 vis_zero16(void) {
     return vis_fzero();
 }
 
+/* Widen all four 16-bit lanes of v to two 32-bit lanes (exact). */
+static vis_s32x2 vis_widen2(vis_s16x4 v) {
+    vis_lane64 in;
+    vis_lane32 one;
+    vis_wide64 w;
+
+    one.u = 0x01010101U;
+    in.d  = v;
+    w.d   = VADD32(VWIDEN(one.f, in.f[0]), VWIDEN(one.f, in.f[1]));
+    return w.d;
+}
+
+/* Horizontal sum of two 32-bit lanes to int. */
+static int vis_hsum32(vis_s32x2 v) {
+    vis_wide64 w;
+    w.d = v;
+    return w.i[0] + w.i[1];
+}
+
+static vis_s32x2 vis_zero32(void) {
+    return vis_fzero();
+}
+
 #else
 
+static vis_u8x4 vis_one8(void) {
+    vis_pun32 p;
+    p.u = 0x01010101U;
+    return p.v;
+}
+
 static int vis_hsum16(vis_s16x4 v) {
-    vis_u8x4  one;
-    vis_s16x2 lo, hi;
+    vis_pun64 pu;
+    vis_pun32s lo, hi;
     vis_s32x2 wl, wh, s;
 
-    one[0] = 1; one[1] = 1; one[2] = 1; one[3] = 1;
+    pu.v = v;
+    lo.u = (unsigned int) pu.u;
+    hi.u = (unsigned int) (pu.u >> 32);
 
-    lo[0] = v[0]; lo[1] = v[1];
-    hi[0] = v[2]; hi[1] = v[3];
-
-    wl = VWIDEN(one, lo);
-    wh = VWIDEN(one, hi);
+    wl = VWIDEN(vis_one8(), lo.v);
+    wh = VWIDEN(vis_one8(), hi.v);
     s  = VADD32(wl, wh);
     return s[0] + s[1];
 }
 
 static vis_s16x4 vis_zero16(void) {
-    vis_s16x4 z;
-    z[0] = 0; z[1] = 0; z[2] = 0; z[3] = 0;
-    return z;
+    vis_pun64 p;
+    p.u = 0UL;
+    return p.v;
+}
+
+static vis_s32x2 vis_widen2(vis_s16x4 v) {
+    vis_pun64 pu;
+    vis_pun32s lo, hi;
+    vis_s32x2 w;
+
+    pu.v = v;
+    lo.u = (unsigned int) pu.u;
+    hi.u = (unsigned int) (pu.u >> 32);
+    w = VADD32(VWIDEN(vis_one8(), lo.v), VWIDEN(vis_one8(), hi.v));
+    return w;
+}
+
+static int vis_hsum32(vis_s32x2 v) {
+    vis_pun64i pu;
+    pu.v = v;
+    return (int) (unsigned int) pu.u +
+           (int) (unsigned int) (pu.u >> 32);
+}
+
+static vis_s32x2 vis_zero32(void) {
+    vis_pun64i p;
+    p.u = 0UL;
+    return p.v;
 }
 
 #endif
@@ -311,16 +418,6 @@ static vis_u8x4 vis_pack_u8x4(unsigned int u) {
 }
 #define PACK_U8X4(u)    vis_pack_u8x4((unsigned int) (u))
 #else
-typedef union {
-    vis_s16x4     v;
-    unsigned long u;
-} vis_pun64;
-
-typedef union {
-    vis_u8x4     v;
-    unsigned int u;
-} vis_pun32;
-
 #define XLOAD4(dst, p)                                                  \
     do { vis_pun64 pun_; pun_.u = *(const unsigned long *) (const void *) (p); \
          (dst) = pun_.v; } while (0)
@@ -331,6 +428,57 @@ static vis_u8x4 vis_pack_u8x4(unsigned int u) {
     return p.v;
 }
 #define PACK_U8X4(u)    vis_pack_u8x4((unsigned int) (u))
+#endif
+
+/* Four weight bytes into a u8x4 in memory order.
+ *
+ * Q6_K rows are 210*nb bytes and Q4_0/Q8_0 rows 18*nb / 34*nb, none of
+ * which is a multiple of four in general, so a block can start at
+ * offset 2 mod 4 and a plain lduw would fault on SPARC. A 4-byte
+ * memcpy is the compiler's job to lower: a single lduw where it can
+ * prove alignment, a safe sequence where it cannot, and the same byte
+ * order on both hosts either way. */
+/* Tell GCC a pointer is aligned so loads compile to single lduw/lduh
+ * instead of byte-wise sequences; Sun Studio has no equivalent and
+ * emits safe code. Only used where alignment is guaranteed by
+ * construction: Q6_K normalises super-blocks to 4 bytes, and the
+ * 32-block formats' weight bytes sit at +2 inside even-strided rows,
+ * so they are 2-byte aligned. */
+#if defined(__GNUC__)
+#define VIS_ALIGN4_(p, a) \
+    ((const unsigned char *) __builtin_assume_aligned((const void *) (p), (a)))
+#define VIS_ALIGN4(p) VIS_ALIGN4_(p, 4)
+#else
+#define VIS_ALIGN4_(p, a) ((const unsigned char *) (p))
+#define VIS_ALIGN4(p) ((const unsigned char *) (p))
+#endif
+
+static unsigned int vis_ld_u32e(const unsigned char *p) {
+    unsigned int u;
+    memcpy(&u, p, 4);
+    return u;
+}
+
+/* Four bytes at any 2-byte-aligned address, assembled into a word in
+ * native byte order. Q8_0 and Q4_0 store their weight bytes at offset
+ * +2 inside 34-/18-byte blocks, so they are never 4-aligned; a memcpy
+ * here would make GCC emit four ldub plus four stb. Two lduh are
+ * legal (the stride is even) and compile to shift+or. */
+static unsigned int vis_ld_u32a(const unsigned char *p) {
+    const unsigned char *q = VIS_ALIGN4_(p, 2);
+    return (unsigned int) (q[0] | (q[1] << 8)) |
+           ((unsigned int) (q[2] | (q[3] << 8)) << 16);
+}
+
+/* The five dot kernels are called once per matrix row from the
+ * dispatcher; keep them as real functions (per-row call overhead is a
+ * few instructions against hundreds per row) and let GCC count them as
+ * such. Sun Studio has no equivalent and may inline at -xO5, which is
+ * equally fine. */
+#if defined(__GNUC__)
+#define VIS_NOINLINE __attribute__((noinline))
+#else
+#define VIS_NOINLINE
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -346,7 +494,7 @@ static vis_u8x4 vis_pack_u8x4(unsigned int u) {
 /* latency; 16 terms fit in 16-bit lanes (16*15*127 = 30480).           */
 /* ------------------------------------------------------------------ */
 
-static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
+VIS_NOINLINE static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
                           long ncols) {
     float sum = 0.0f;
     long c;
@@ -375,7 +523,11 @@ static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
 
             /* 32 weights, four at a time, two accumulators each for the
              * low and high nibble streams. Eight iterations, so each
-             * accumulator sees 16 terms -- inside the 16-bit bound. */
+             * accumulator sees 16 terms -- inside the 16-bit bound.
+             * Two 16-term chains cannot be merged in 16-bit lanes
+             * (32 * 15 * 127 overflows), but their widened 32-bit
+             * lanes can: one widen+add pair per chain, then a single
+             * horizontal sum per stream. */
             for (l = 0; l < 32; l += 8) {
                 vis_u8x4 pl, ph;
                 vis_s16x4 xv;
@@ -407,8 +559,8 @@ static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
                 b1 = VADD16(b1, VMUL8X16(ph, xv));
             }
 
-            acc1 = vis_hsum16(a0) + vis_hsum16(a1);
-            acc2 = vis_hsum16(b0) + vis_hsum16(b1);
+            acc1 = vis_hsum32(VADD32(vis_widen2(a0), vis_widen2(a1)));
+            acc2 = vis_hsum32(VADD32(vis_widen2(b0), vis_widen2(b1)));
 
             sum += xq->d[blk] *
                    ((float) acc1 * d * (float) s1 -
@@ -425,15 +577,85 @@ static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
     return sum;
 }
 
+/* Fold four 8-term s16 chains of one stream into a single int: widen
+ * each chain to a 32-bit lane pair (fmuld8ulx16, exact) and add.
+ * Defined before vis_dot_q5_K so both compilers can inline it. */
+#if defined(VIS_SUNPRO)
+static int vis_fold4(vis_s16x4 c0, vis_s16x4 c1,
+                     vis_s16x4 c2, vis_s16x4 c3) {
+    vis_lane64 in;
+    vis_lane32 one;
+    vis_wide64 s;
+
+    one.u = 0x01010101U;
+    in.d = c0;
+    s.d  = VADD32(VWIDEN(one.f, in.f[0]), VWIDEN(one.f, in.f[1]));
+    in.d = c1;
+    s.d  = VADD32(s.d, VADD32(VWIDEN(one.f, in.f[0]), VWIDEN(one.f, in.f[1])));
+    in.d = c2;
+    s.d  = VADD32(s.d, VADD32(VWIDEN(one.f, in.f[0]), VWIDEN(one.f, in.f[1])));
+    in.d = c3;
+    s.d  = VADD32(s.d, VADD32(VWIDEN(one.f, in.f[0]), VWIDEN(one.f, in.f[1])));
+    return s.i[0] + s.i[1];
+}
+#else
+static int vis_fold4(vis_s16x4 c0, vis_s16x4 c1,
+                     vis_s16x4 c2, vis_s16x4 c3) {
+    vis_pun64 pu;
+    vis_pun32s lo, hi;
+    vis_s32x2 s;
+    unsigned long u0, u1, u2, u3;
+
+    pu.v = c0; u0 = pu.u;
+    pu.v = c1; u1 = pu.u;
+    pu.v = c2; u2 = pu.u;
+    pu.v = c3; u3 = pu.u;
+
+    lo.u = (unsigned int) u0; hi.u = (unsigned int) (u0 >> 32);
+    s = VADD32(VWIDEN(vis_one8(), lo.v), VWIDEN(vis_one8(), hi.v));
+    lo.u = (unsigned int) u1; hi.u = (unsigned int) (u1 >> 32);
+    s = VADD32(s, VADD32(VWIDEN(vis_one8(), lo.v), VWIDEN(vis_one8(), hi.v)));
+    lo.u = (unsigned int) u2; hi.u = (unsigned int) (u2 >> 32);
+    s = VADD32(s, VADD32(VWIDEN(vis_one8(), lo.v), VWIDEN(vis_one8(), hi.v)));
+    lo.u = (unsigned int) u3; hi.u = (unsigned int) (u3 >> 32);
+    s = VADD32(s, VADD32(VWIDEN(vis_one8(), lo.v), VWIDEN(vis_one8(), hi.v)));
+    return s[0] + s[1];
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Q5_K                                                                */
 /*                                                                     */
 /* Like Q4_K plus a qh plane supplying a fifth bit per weight, so       */
 /* w is 0..31 and only 8 terms fit in a 16-bit lane                     */
-/* (8 * 31 * 127 = 31496). Four accumulators, four terms each.          */
+/* (8 * 31 * 127 = 31496).                                              */
+/*                                                                     */
+/* Eight chains of eight terms (a0..a3 for the low-nibble stream,       */
+/* b0..b3 for the high) run the whole sub-block without folding: each   */
+/* chain collects exactly eight terms over the four loop iterations     */
+/* and is widened once at the end. An earlier version folded to 32-bit  */
+/* every iteration (four hsums plus four fzeros per eight weights),     */
+/* which cost more than the multiply it guarded.                        */
 /* ------------------------------------------------------------------ */
 
-static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
+#define Q5K_GROUP(DSTL, DSTH, OFF)                                       \
+    do {                                                                 \
+        unsigned int qw_, hw_, b4l_, b4h_;                               \
+        vis_u8x4 pl_, ph_;                                               \
+        vis_s16x4 xv_;                                                   \
+        qw_ = *(const unsigned int *) (const void *) (qs + (OFF));       \
+        hw_ = *(const unsigned int *) (const void *) (qh + (OFF));       \
+        b4l_ = ((hw_ >> sh1) & 0x01010101U) << 4;                        \
+        b4h_ = ((hw_ >> sh2) & 0x01010101U) << 4;                        \
+        pl_ = PACK_U8X4((qw_ & 0x0F0F0F0FU) | b4l_);                     \
+        ph_ = PACK_U8X4(((qw_ >> 4) & 0x0F0F0F0FU) | b4h_);              \
+        XLOAD4(xv_, x1 + (OFF));                                         \
+        DSTL = VADD16(DSTL, VMUL8X16(pl_, xv_));                         \
+        XLOAD4(xv_, x2 + (OFF));                                         \
+        DSTH = VADD16(DSTH, VMUL8X16(ph_, xv_));                         \
+    } while (0)
+
+VIS_NOINLINE static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
                           long ncols) {
     float sum = 0.0f;
     long c;
@@ -452,63 +674,32 @@ static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
             const short *x1 = xs_buf + c + j * 64;
             const short *x2 = x1 + 32;
             int sh1 = j * 2, sh2 = j * 2 + 1;
-            vis_s16x4 a0, a1, b0, b1;
-            int acc1, acc2, acc32_1 = 0, acc32_2 = 0;
+            vis_s16x4 a0, a1, a2, a3, b0, b1, b2, b3;
+            int acc1, acc2, acc32_1, acc32_2;
             int l;
 
             vis_scale_min_k4(j * 2,     sc, &s1, &m1);
             vis_scale_min_k4(j * 2 + 1, sc, &s2, &m2);
 
             a0 = vis_zero16(); a1 = vis_zero16();
+            a2 = vis_zero16(); a3 = vis_zero16();
             b0 = vis_zero16(); b1 = vis_zero16();
+            b2 = vis_zero16(); b3 = vis_zero16();
 
-            for (l = 0; l < 32; l += 8) {
-                vis_u8x4 pl, ph;
-                vis_s16x4 xv;
-                unsigned int qw, hw, b4l, b4h;
-
-                /* Same one-load split as Q4_K, plus the fifth bit from
-                 * the qh plane. qh holds one bit per weight per
-                 * sub-block, so the bits for four consecutive weights
-                 * are scattered one byte apart; gather them with shifts
-                 * and mask to 0x10 to place the bit at value 16. */
-                qw = *(const unsigned int *) (const void *) (qs + l);
-                hw = *(const unsigned int *) (const void *) (qh + l);
-
-                b4l = ((hw >> sh1) & 0x01010101U) << 4;
-                b4h = ((hw >> sh2) & 0x01010101U) << 4;
-
-                pl = PACK_U8X4((qw & 0x0F0F0F0FU) | b4l);
-                ph = PACK_U8X4(((qw >> 4) & 0x0F0F0F0FU) | b4h);
-
-                XLOAD4(xv, x1 + l);
-                a0 = VADD16(a0, VMUL8X16(pl, xv));
-                XLOAD4(xv, x2 + l);
-                b0 = VADD16(b0, VMUL8X16(ph, xv));
-
-                qw = *(const unsigned int *) (const void *) (qs + l + 4);
-                hw = *(const unsigned int *) (const void *) (qh + l + 4);
-
-                b4l = ((hw >> sh1) & 0x01010101U) << 4;
-                b4h = ((hw >> sh2) & 0x01010101U) << 4;
-
-                pl = PACK_U8X4((qw & 0x0F0F0F0FU) | b4l);
-                ph = PACK_U8X4(((qw >> 4) & 0x0F0F0F0FU) | b4h);
-
-                XLOAD4(xv, x1 + l + 4);
-                a1 = VADD16(a1, VMUL8X16(pl, xv));
-                XLOAD4(xv, x2 + l + 4);
-                b1 = VADD16(b1, VMUL8X16(ph, xv));
-
-                /* w can reach 31 here, so a 16-bit lane holds only 8
-                 * terms (8 * 31 * 127 = 31496). Fold to 32 bits every
-                 * other iteration and restart the lanes. */
-                acc32_1 += vis_hsum16(a0) + vis_hsum16(a1);
-                acc32_2 += vis_hsum16(b0) + vis_hsum16(b1);
-                a0 = vis_zero16(); a1 = vis_zero16();
-                b0 = vis_zero16(); b1 = vis_zero16();
+            for (l = 0; l < 32; l += 16) {
+                /* First half: chains 0 and 1. */
+                Q5K_GROUP(a0, b0, l);
+                Q5K_GROUP(a1, b1, l + 4);
+                /* Second half: chains 2 and 3, so each chain sees two
+                 * 4-weight groups = 8 terms. */
+                Q5K_GROUP(a2, b2, l + 8);
+                Q5K_GROUP(a3, b3, l + 12);
             }
 
+            /* Fold each stream's four 8-term chains straight to one
+             * 32-bit pair; no 16-bit merge (8+8 would overflow). */
+            acc32_1 = vis_fold4(a0, a1, a2, a3);
+            acc32_2 = vis_fold4(b0, b1, b2, b3);
             acc1 = acc32_1;
             acc2 = acc32_2;
 
@@ -528,6 +719,253 @@ static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
 }
 
 /* ------------------------------------------------------------------ */
+/* Q6_K                                                                */
+/*                                                                     */
+/* 256 weights per super-block in 210 bytes:                           */
+/*   [ql:128 nibble bytes][qh:64 hi-bit bytes][sc:16 int8][d:fp16]     */
+/*                                                                     */
+/* Four 32-weight rows share the ql bytes in pairs (rows 0/2 read      */
+/* ql[l], rows 1/3 read ql[l+32]) and each qh byte carries two hi bits */
+/* per row, at bit positions 2r and 2r+1. The true weight is           */
+/* (nibble | hi2 << 4) - 32, i.e. signed. Biased by +32 it becomes     */
+/* the u8 byte the multiply needs; the -32 * sum(x) correction is      */
+/* applied per 16-weight scale group from xq->s16, exactly like the    */
+/* portable i8 kernel. Biased products are at most 63*127 = 8001, so   */
+/* two of them fit a 16-bit lane; they are paired, then widened        */
+/* straight into a 32-bit lane pair per row.                           */
+/* ------------------------------------------------------------------ */
+
+VIS_NOINLINE static float vis_dot_q6_K(const unsigned char *b, const bk_qx *xq,
+                          long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += QK_K) {
+        long qbuf_l[192 / (long) sizeof(long)];   /* 8-aligned by C */
+        const unsigned char *ql = b;
+        const unsigned char *qh;
+        const signed char   *sc = (const signed char *) (b + 192);
+        const float d = vis_rd_f16p(b + 208);
+        int n;
+
+        /* Super-blocks advance by 210 bytes, so their base alternates
+         * between aligned and 2-mod-4; a plain lduw on the ql/qh plane
+         * would fault on the odd ones. Normalise a misaligned block
+         * into a stack copy once, keeping the inner loop aligned. */
+        if ((((unsigned long) b) & 3UL) != 0UL) {
+            memcpy(qbuf_l, b, 192);
+            ql = (const unsigned char *) qbuf_l;
+        }
+        ql = VIS_ALIGN4(ql);
+        qh = VIS_ALIGN4(ql + 128);
+
+        for (n = 0; n < 2; n++) {
+            const unsigned char *qlp = VIS_ALIGN4(ql + n * 64);
+            const unsigned char *qhp = VIS_ALIGN4(qh + n * 32);
+            const signed char *scn = sc + n * 8;
+            long off = c + n * 128;
+            int accs[4][2];
+            int g, r;
+
+            for (g = 0; g < 2; g++) {
+                const short *xr0 = xs_buf + off + g * 16;
+                const short *xr1 = xr0 + 32;
+                const short *xr2 = xr0 + 64;
+                const short *xr3 = xr0 + 96;
+                vis_s32x2 a0, b0, c0, d0;
+                int l;
+                a0 = vis_zero32(); b0 = vis_zero32();
+                c0 = vis_zero32(); d0 = vis_zero32();
+
+                for (l = 0; l < 16; l += 8) {
+                    /* Two 4-weight groups; the products of each row are
+                     * paired in 16-bit lanes (2 * 8001 fits) before the
+                     * widen, halving the widen/add traffic. */
+                    unsigned int l0w, l1w, hw;
+                    vis_u8x4 w00, w01, w02, w03, w10, w11, w12, w13;
+                    vis_s16x4 p00, p01, p02, p03, p10, p11, p12, p13;
+                    vis_s16x4 xv;
+
+                    l0w = vis_ld_u32e(qlp + g * 16 + l);
+                    l1w = vis_ld_u32e(qlp + g * 16 + 32 + l);
+                    hw  = vis_ld_u32e(qhp + g * 16 + l);
+
+                    /* row 0: low nibble of ql, hi bits 0-1 of qh */
+                    w00 = PACK_U8X4((l0w & 0x0F0F0F0FU) |
+                                    ((hw & 0x03030303U) << 4));
+                    /* row 1: low nibble of ql+32, hi bits 2-3 */
+                    w01 = PACK_U8X4((l1w & 0x0F0F0F0FU) |
+                                    (((hw >> 2) & 0x03030303U) << 4));
+                    /* row 2: high nibble of ql, hi bits 4-5 */
+                    w02 = PACK_U8X4(((l0w >> 4) & 0x0F0F0F0FU) |
+                                    (((hw >> 4) & 0x03030303U) << 4));
+                    /* row 3: high nibble of ql+32, hi bits 6-7 */
+                    w03 = PACK_U8X4(((l1w >> 4) & 0x0F0F0F0FU) |
+                                    (((hw >> 6) & 0x03030303U) << 4));
+
+                    XLOAD4(xv, xr0 + l);
+                    p00 = VMUL8X16(w00, xv);
+                    XLOAD4(xv, xr1 + l);
+                    p01 = VMUL8X16(w01, xv);
+                    XLOAD4(xv, xr2 + l);
+                    p02 = VMUL8X16(w02, xv);
+                    XLOAD4(xv, xr3 + l);
+                    p03 = VMUL8X16(w03, xv);
+
+                    l0w = vis_ld_u32e(qlp + g * 16 + l + 4);
+                    l1w = vis_ld_u32e(qlp + g * 16 + 32 + l + 4);
+                    hw  = vis_ld_u32e(qhp + g * 16 + l + 4);
+
+                    w10 = PACK_U8X4((l0w & 0x0F0F0F0FU) |
+                                    ((hw & 0x03030303U) << 4));
+                    w11 = PACK_U8X4((l1w & 0x0F0F0F0FU) |
+                                    (((hw >> 2) & 0x03030303U) << 4));
+                    w12 = PACK_U8X4(((l0w >> 4) & 0x0F0F0F0FU) |
+                                    (((hw >> 4) & 0x03030303U) << 4));
+                    w13 = PACK_U8X4(((l1w >> 4) & 0x0F0F0F0FU) |
+                                    (((hw >> 6) & 0x03030303U) << 4));
+
+                    XLOAD4(xv, xr0 + l + 4);
+                    p10 = VMUL8X16(w10, xv);
+                    XLOAD4(xv, xr1 + l + 4);
+                    p11 = VMUL8X16(w11, xv);
+                    XLOAD4(xv, xr2 + l + 4);
+                    p12 = VMUL8X16(w12, xv);
+                    XLOAD4(xv, xr3 + l + 4);
+                    p13 = VMUL8X16(w13, xv);
+
+                    a0 = VADD32(a0, vis_widen2(VADD16(p00, p10)));
+                    b0 = VADD32(b0, vis_widen2(VADD16(p01, p11)));
+                    c0 = VADD32(c0, vis_widen2(VADD16(p02, p12)));
+                    d0 = VADD32(d0, vis_widen2(VADD16(p03, p13)));
+                }
+
+                /* Store the per-row 32-bit accumulators, then fold both
+                 * scale groups per row in the same order as the i8
+                 * kernel, so the float arithmetic is bit-identical. */
+                accs[0][g] = vis_hsum32(a0);
+                accs[1][g] = vis_hsum32(b0);
+                accs[2][g] = vis_hsum32(c0);
+                accs[3][g] = vis_hsum32(d0);
+            }
+
+            for (r = 0; r < 4; r++) {
+                long blk = (off + r * 32) / 32;
+                long si  = (off + r * 32) / 16;
+                sum += d * xq->d[blk] *
+                       ((float) scn[2 * r] * (float) (accs[r][0] - 32 * xq->s16[si]) +
+                        (float) scn[2 * r + 1] * (float) (accs[r][1] - 32 * xq->s16[si + 1]));
+            }
+        }
+        b += 210;
+    }
+    return sum;
+}
+
+/* ------------------------------------------------------------------ */
+/* Q8_0                                                                */
+/*                                                                     */
+/* 32 signed bytes per 34-byte block. Biased by +128 they are the u8   */
+/* bytes the multiply wants, and the -128 * sum(x) correction uses the */
+/* 32-element block sum. A biased product can be 255*127 = 32385, so   */
+/* one term at a time is widened straight into 32-bit lanes.           */
+/* ------------------------------------------------------------------ */
+
+VIS_NOINLINE static float vis_dot_q8_0(const unsigned char *b, const bk_qx *xq,
+                          long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += 32) {
+        const float d = vis_rd_f16p(b);
+        const unsigned char *q = b + 2;
+        const short *xp = xs_buf + c;
+        vis_s32x2 acc;
+        int l;
+
+        acc = vis_zero32();
+
+        for (l = 0; l < 32; l += 4) {
+            vis_u8x4 qv;
+            vis_s16x4 xv, p;
+
+            /* Flip the sign bit: the raw byte of a signed q is q+256 as
+             * u8, but the bias needs q+128. XOR is exact and costs one
+             * integer op; the pack is the price of the integer domain. */
+            qv = PACK_U8X4(vis_ld_u32a(q + l) ^ 0x80808080U);
+            XLOAD4(xv, xp + l);
+            p = VMUL8X16(qv, xv);
+            acc = VADD32(acc, vis_widen2(p));
+        }
+
+        sum += d * xq->d[c / 32] *
+               (float) (vis_hsum32(acc) - 128 * xq->s[c / 32]);
+        b += 34;
+    }
+    return sum;
+}
+
+/* ------------------------------------------------------------------ */
+/* Q4_0                                                                */
+/*                                                                     */
+/* 16 nibble bytes per 18-byte block; w = nibble - 8. The raw nibble    */
+/* is already a legal u8 operand (the -8 is folded into the per-block   */
+/* correction 8 * sum(x), exactly as the i8 kernel folds it), and eight */
+/* terms fit a 16-bit lane (8 * 15 * 127 = 15240).                      */
+/* ------------------------------------------------------------------ */
+
+VIS_NOINLINE static float vis_dot_q4_0(const unsigned char *b, const bk_qx *xq,
+                          long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    for (c = 0; c < ncols; c += 32) {
+        const float d = vis_rd_f16p(b);
+        const unsigned char *q = b + 2;
+        const short *x1 = xs_buf + c;
+        const short *x2 = x1 + 16;
+        vis_s16x4 a0, a1, b0, b1;
+        int l;
+
+        a0 = vis_zero16(); a1 = vis_zero16();
+        b0 = vis_zero16(); b1 = vis_zero16();
+
+        for (l = 0; l < 16; l += 8) {
+            unsigned int qw;
+            vis_u8x4 pl, ph;
+            vis_s16x4 xv;
+
+            qw = vis_ld_u32a(q + l);
+            pl = PACK_U8X4(qw & 0x0F0F0F0FU);
+            ph = PACK_U8X4((qw >> 4) & 0x0F0F0F0FU);
+
+            XLOAD4(xv, x1 + l);
+            a0 = VADD16(a0, VMUL8X16(pl, xv));
+            XLOAD4(xv, x2 + l);
+            b0 = VADD16(b0, VMUL8X16(ph, xv));
+
+            qw = vis_ld_u32a(q + l + 4);
+            pl = PACK_U8X4(qw & 0x0F0F0F0FU);
+            ph = PACK_U8X4((qw >> 4) & 0x0F0F0F0FU);
+
+            XLOAD4(xv, x1 + l + 4);
+            a1 = VADD16(a1, VMUL8X16(pl, xv));
+            XLOAD4(xv, x2 + l + 4);
+            b1 = VADD16(b1, VMUL8X16(ph, xv));
+        }
+
+        /* One combined term, exactly as i8_dot_q4_0 folds it, so the
+         * float arithmetic is bit-identical. */
+        sum += d * xq->d[c / 32] *
+               (float) (vis_hsum16(a0) + vis_hsum16(a1) +
+                        vis_hsum16(b0) + vis_hsum16(b1) -
+                        8 * xq->s[c / 32]);
+        b += 18;
+    }
+    return sum;
+}
+
+/* ------------------------------------------------------------------ */
 /* Dispatch                                                            */
 /*                                                                     */
 /* Formats without a VIS kernel fall through to the portable integer    */
@@ -540,7 +978,22 @@ void bk_qmv_vis(int type, const unsigned char *w, const float *x,
     const bk_qx *xq;
     long rowbytes, r;
 
-    if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K) {
+    if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
+        type != GGML_TYPE_Q6_K && type != GGML_TYPE_Q8_0 &&
+        type != GGML_TYPE_Q4_0) {
+        qmv_i8(type, w, x, y, ncols, nrows);
+        return;
+    }
+
+    /* The k-quant kernels iterate whole 256-weight super-blocks; the
+     * 32-block kernels need a full block. Anything else is not ours. */
+    if ((type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K ||
+         type == GGML_TYPE_Q5_K) && (ncols % QK_K) != 0) {
+        qmv_i8(type, w, x, y, ncols, nrows);
+        return;
+    }
+    if ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) &&
+        (ncols % 32) != 0) {
         qmv_i8(type, w, x, y, ncols, nrows);
         return;
     }
@@ -549,14 +1002,34 @@ void bk_qmv_vis(int type, const unsigned char *w, const float *x,
     xs_prepare(xq);
     rowbytes = gg_type_size(type, ncols);
 
-    if (type == GGML_TYPE_Q4_K) {
-        for (r = 0; r < nrows; r++) {
-            y[r] = vis_dot_q4_K(w + r * rowbytes, xq, ncols);
-        }
-    } else {
-        for (r = 0; r < nrows; r++) {
-            y[r] = vis_dot_q5_K(w + r * rowbytes, xq, ncols);
-        }
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+            for (r = 0; r < nrows; r++) {
+                y[r] = vis_dot_q4_K(w + r * rowbytes, xq, ncols);
+            }
+            return;
+        case GGML_TYPE_Q5_K:
+            for (r = 0; r < nrows; r++) {
+                y[r] = vis_dot_q5_K(w + r * rowbytes, xq, ncols);
+            }
+            return;
+        case GGML_TYPE_Q6_K:
+            for (r = 0; r < nrows; r++) {
+                y[r] = vis_dot_q6_K(w + r * rowbytes, xq, ncols);
+            }
+            return;
+        case GGML_TYPE_Q8_0:
+            for (r = 0; r < nrows; r++) {
+                y[r] = vis_dot_q8_0(w + r * rowbytes, xq, ncols);
+            }
+            return;
+        case GGML_TYPE_Q4_0:
+            for (r = 0; r < nrows; r++) {
+                y[r] = vis_dot_q4_0(w + r * rowbytes, xq, ncols);
+            }
+            return;
+        default:
+            return;
     }
 }
 

@@ -104,6 +104,7 @@ BIN     = $(TARGET)$(SUFFIX)
 .PHONY: all linux linux-profile windows windows-profile \
         solaris solaris-profile solaris-gcc solaris-gcc-profile \
         solaris-fast solaris-test \
+        vis-shim-test \
         test bench clean version checkversion help
 
 all: linux linux-profile windows windows-profile
@@ -122,6 +123,7 @@ help:
 	@echo "make solaris-gcc-vis    Solaris/SPARC + VIS kernels (GCC)"
 	@echo ""
 	@echo "make test / bench / clean / version / checkversion"
+	@echo "make vis-shim-test     VIS kernels vs i8 on any host, both compiler paths"
 
 # =====================================================================
 #  x86: Linux and Windows
@@ -306,6 +308,30 @@ solaris-test: $(CORE) $(POSIX)
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
 		$(SRCDIR)/sys_posix.c $(SOLLIBS)
 	@echo "run: ./$(BUILD)/t_endian [model.gguf]"
+
+# Run the VIS kernels against the i8 reference ON ANY HOST, for both
+# compiler paths, via the shims in tests/vis_shim/. The Sun Studio path
+# is emulated by vis_proto.h; the GCC path by gcc_shim.h (which
+# replaces the SPARC-only __builtin_vis_* with C). Catches type and
+# lane-order errors in the compiler-specific code without a SPARC box.
+vis-shim-test: tests/t_viskern.c $(VISSRC)
+	@mkdir -p $(BUILD)
+	$(CC) -std=gnu89 -O2 -m64 -D__SUNPRO_C=0x5150 -Itests/vis_shim \
+		-DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -I$(SRCDIR) \
+		-o $(BUILD)/t_viskern_sun tests/t_viskern.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+	$(CC) -std=gnu89 -O2 -m64 \
+		-D__builtin_vis_fmul8x16=shim_fmul8x16 \
+		-D__builtin_vis_fpadd16=shim_fpadd16 \
+		-D__builtin_vis_fpadd32=shim_fpadd32 \
+		-D__builtin_vis_fmuld8ulx16=shim_fmuld8ulx16 \
+		-include tests/vis_shim/gcc_shim.h \
+		-DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -I$(SRCDIR) \
+		-o $(BUILD)/t_viskern_gcc tests/t_viskern.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+	@echo "run: ./$(BUILD)/t_viskern_sun   then   ./$(BUILD)/t_viskern_gcc"
 
 # VIS assumptions. Run this FIRST on any new SPARC box: it proves the
 # exactness trick the kernels depend on, and needs no model.

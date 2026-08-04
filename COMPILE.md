@@ -685,12 +685,28 @@ synthetic blocks and compares against the scalar `i8` kernel:
 ```
 Q4_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
 Q5_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q6_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q8_0     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q4_0     ncols=3584 rows=4    worst rel err 0.000e+00  ok
 
 kernels agree with the reference
 ```
 
 Anything other than `0.000e+00` is a bug. The exactness identity above
-means VIS and `i8` must agree *bit for bit*, not merely closely.
+means VIS and `i8` must agree *bit for bit*, not merely closely. The
+256-column cases deliberately misalign Q6_K/Q8_0/Q4_0 rows, forcing
+the alignment-safe load paths.
+
+Both compiler paths of `backend_vis.c` can be checked on *any* host,
+with no SPARC box:
+
+```sh
+make vis-shim-test
+./build/t_viskern_sun    # Sun Studio branch, emulated via vis_proto.h
+./build/t_viskern_gcc    # GCC branch, emulated via gcc_shim.h
+```
+
+Both must print `kernels agree with the reference`.
 
 The comparison is deliberately against `qmv_i8` rather than `qmv_ref`.
 Against the exact F32 reference the VIS kernels differ by 1–12%, but

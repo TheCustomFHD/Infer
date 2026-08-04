@@ -1,5 +1,94 @@
 # Changelog
 
+## 1.15.0 — the VIS backend covers the whole model
+
+The VIS backend shipped in 1.14.0 with kernels for Q4_K and Q5_K only.
+The other 45% of the model's matvec work — Q6_K and Q8_0 — fell
+through to the portable integer path, which on an in-order SPARC is
+several times more instructions per MAC than any SIMD. That gap is now
+closed, and the two original kernels were slimmed down.
+
+### New kernels
+
+* **Q6_K** — 27%+ of runtime (including `token_embd` and the LM head
+  in a Q4_K_M build). Its weights are *signed* (−32..31), which the
+  unsigned `fmul8x16` cannot take directly. The fix is the bias trick:
+  add 32 to each weight byte, multiply exactly, and subtract
+  `32 * sum(x)` per 16-weight scale group using the block sums the
+  shared backend already keeps — the same arithmetic the i8 kernel
+  performs, so results stay bit-identical. The four rows that share a
+  ql byte are processed together, and the two hi bits per weight are
+  extracted from qh in the integer domain before the single multiply.
+* **Q8_0** — signed bytes biased by +128 via an XOR of the sign bit,
+  with 32-bit lane accumulation (a biased product can be 255×127, one
+  term per 16-bit lane).
+* **Q4_0** — the raw nibble is already a legal u8 operand; the −8 bias
+  is folded into the per-block correction exactly as i8 does.
+
+Q6_K and Q8_0 rows are 210- and 34-byte strided, so a super-block can
+start at offset 2 mod 4 and a plain `lduw` would fault on SPARC. The
+Q6_K kernel normalises a misaligned super-block into an 8-aligned
+stack copy once (the copy is skipped on the aligned half of blocks),
+and the 32-block formats load their weight bytes via two `lduh` —
+legal because every stride is even.
+
+### Rewrites of the original kernels
+
+* **Q5_K** previously folded four accumulators to 32 bits *every
+  iteration* (four hsums and four fzeros per eight weights). It now
+  runs eight 8-term chains across the whole sub-block and widens once
+  at the end — the folding cost dropped from ~16 hsums per 64 weights
+  to two.
+* **Q4_K** merges the two 16-term chains in the 32-bit domain before a
+  single horizontal sum per stream (they cannot be merged in 16-bit
+  lanes: 32×15×127 overflows).
+* The GCC branch of every helper now goes through the same union puns
+  as the Sun Studio branch. GCC lowers vector subscripts to stack
+  round-trips on SPARC — one fold measured ~85 instructions of
+  store/load noise — while `std`/`ldd`-style puns stay in registers.
+
+### Instruction counts (real SPARC64 cross-GCC, fully unrolled)
+
+| kernel | ops/MAC (was) | vs the format's old path |
+|---|---|---|
+| Q4_K | 3.45 (3.58) | ~1.8x vs i8 |
+| Q5_K | 5.11 (~6.4) | ~1.3x vs the old VIS kernel |
+| Q6_K | 5.44 (scalar i8) | ~3x vs i8 |
+| Q8_0 | 8.27 (scalar i8) | ~4x vs i8 |
+| Q4_0 | 5.93 (scalar i8) | ~5x vs i8 |
+
+Weighted by a Q4_K_M model's format mix, the matvec work drops from
+~13 to ~5 ops/MAC — roughly 2.5x fewer instructions on the ~95% of
+runtime that is matvec. Sun Studio's code generation differs from
+GCC's, but the kernel structure is identical under both compilers.
+
+### Verification
+
+* `t_viskern` now checks all five formats at 256/1024/3584 columns;
+  the 256-column cases misalign Q6_K/Q8_0/Q4_0 rows on purpose. All
+  15 comparisons are **bit-identical** to `i8` on both compiler paths.
+* New `tests/vis_shim/gcc_shim.h` lets the GCC branch run on x86 too
+  (`-D__builtin_vis_*=` mappings), so `make vis-shim-test` exercises
+  both compiler paths of `backend_vis.c` on any host, not just a SPARC
+  box.
+* `tools/cross-count.sh` builds `backend_vis.c` for sparc64-linux-gnu
+  with `-mcpu=ultrasparc -mvis` and reports per-kernel dynamic
+  instruction counts (the numbers above).
+
+No speedup is claimed on real hardware — every figure above is an
+instruction count, and this project has a documented history of
+isolated measurements being wrong by 2-3x. The number that matters is
+a profile from the target machine:
+
+```sh
+gmake solaris-vis-profile
+./infer-1.15.0-solaris-profile run model.gguf \
+    -p "The capital of France is" -n 10 -t 0 --seed 1 -c 512 \
+    --backend vis --log-perf --log-stages --log-file sparc-vis.txt
+```
+
+---
+
 ## 1.14.2 — the GCC targets actually call GCC
 
 `gmake solaris-gcc-vis-profile` invoked **Sun Studio**, not GCC:

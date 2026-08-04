@@ -74,13 +74,16 @@ introduced by 4-bit weights. `ref` is 0 by definition.
 ## `t_viskern` — VIS kernels against `i8`, without a model
 
 `t_vis` proves the *identity* the kernels rest on. `t_viskern` proves
-the **kernels** themselves, on synthetic Q4_K and Q5_K blocks at three
-sizes each, so it runs in seconds on a 440 MHz Ultra 10 and needs no
-download:
+the **kernels** themselves, on synthetic blocks of all five formats at
+three sizes each, so it runs in seconds on a 440 MHz Ultra 10 and
+needs no download:
 
 ```
 Q4_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
 Q5_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q6_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q8_0     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q4_0     ncols=3584 rows=4    worst rel err 0.000e+00  ok
 ```
 
 Zero, not "small". The exactness trick means VIS and `i8` perform the
@@ -91,25 +94,40 @@ kernels show 1–12% relative error — that is int8 activation
 quantisation, visible in `i8` too, not a kernel fault. Using the wrong
 reference sends you debugging correct code.
 
-### Testing the Sun Studio path without a Sun Studio
+The 256-column cases are not just smaller: Q6_K rows are `210*nb`
+bytes and Q8_0 rows `34*nb`, neither a multiple of four, so at 256
+columns every row is misaligned and the alignment-safe load paths are
+exercised. Misaligned and aligned rows must agree bit for bit.
 
-`tests/vis_shim/vis_proto.h` reimplements Sun's prototypes in plain C.
-Compiling with `-D__SUNPRO_C -Itests/vis_shim` takes the Studio branch
-of `backend_vis.c` under GCC, which catches the type errors that make
-up most of the risk in maintaining two compiler paths:
+### Testing both compiler paths without a SPARC box
+
+`make vis-shim-test` builds `t_viskern` twice on any host — once per
+compiler branch of `backend_vis.c` — and both must report
+`kernels agree with the reference`:
 
 ```sh
-gcc -std=gnu89 -O2 -m64 -mcpu=ultrasparc \
-    -D__SUNPRO_C=0x5150 -Itests/vis_shim \
-    -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -Isrc \
-    -o /tmp/t_viskern_sun tests/t_viskern.c src/backend_vis.c \
-    src/backend.c src/quant.c src/util.c src/prof.c \
-    src/gguf.c src/sys_posix.c -lm
+make vis-shim-test
+./build/t_viskern_sun   # the Sun Studio branch, via vis_proto.h
+./build/t_viskern_gcc   # the GCC branch, via gcc_shim.h
 ```
 
-It proves types and arithmetic only. GCC inlines the shim's C instead
-of emitting VIS instructions, so instruction counts taken this way are
-meaningless — Studio's code generation can only be judged by Studio.
+`tests/vis_shim/vis_proto.h` reimplements Sun's prototypes in plain C;
+compiling with `-D__SUNPRO_C -Itests/vis_shim` takes the Studio branch
+under GCC, which catches the type errors that make up most of the risk
+in maintaining two compiler paths.
+
+`tests/vis_shim/gcc_shim.h` does the same for the other side: the GCC
+branch calls `__builtin_vis_*`, which exist only on SPARC targets.
+`-D__builtin_vis_fmul8x16=shim_fmul8x16` (and the other three) replace
+them with C functions that emulate the instruction semantics, so the
+GCC branch — including the union-pun lane handling — is executed and
+checked against `i8` on x86.
+
+Both shims prove types, arithmetic and lane order only. GCC inlines
+the shim's C instead of emitting VIS instructions, so instruction
+counts taken this way are meaningless — each compiler's code
+generation can only be judged by that compiler (see
+`tools/cross-count.sh` for a real SPARC64 cross-GCC count).
 
 ## Beyond the suite
 

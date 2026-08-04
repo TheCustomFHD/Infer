@@ -229,3 +229,71 @@ Nothing in the kernels. What remains changes the workload:
 3. **Requantising `token_embd`** from Q6_K to Q4_K. The LM head is
    **18.1%** of runtime in only 11 calls, and that one tensor is 199 MB
    (40% of the file). Saves 63 MB of RAM as well.
+
+---
+
+## SPARC/VIS: what the kernels cost, by instruction count
+
+The Geode analysis above is anchored to hardware measurements. The
+SPARC story cannot be — no UltraSPARC is available to this project's
+CI — so the numbers here are **dynamic instruction counts**, taken
+from a real sparc64-linux-gnu cross-GCC with `-mcpu=ultrasparc -mvis`
+on the exact kernel sources, with every fixed-trip loop fully unrolled
+(`tools/cross-count.sh` reproduces them). Instruction counts are not
+cycles; they are the *lower bound* every other cost must sit on top
+of, and the honest claim is "at least this much leaner".
+
+### What the i8 fallback cost
+
+Before 1.15.0, Q6_K, Q8_0 and Q4_0 ran the portable integer kernels
+on SPARC. GCC's scalar codegen on an in-order machine is brutal:
+
+| kernel | i8 ops/MAC | VIS ops/MAC (1.15.0) |
+|---|---|---|
+| Q4_K | ~6 | 3.45 |
+| Q5_K | ~6 | 5.11 |
+| Q6_K | ~17 | 5.44 |
+| Q8_0 | ~35 | 8.27 |
+| Q4_0 | ~11 | 5.93 |
+
+### Where the VIS instructions go (per MAC, GCC)
+
+| kernel | VIS | integer | memory |
+|---|---|---|---|
+| Q4_K | 0.56 | 0.70 | 1.53 |
+| Q5_K | 0.91 | 1.30 | 2.21 |
+| Q6_K | 0.69 | 1.55 | 2.49 |
+| Q8_0 | 1.22 | 2.28 | 4.14 |
+
+Two facts fall out:
+
+**Memory ops dominate every kernel.** The 16-bit lanes are loaded as
+`ldd` (unavoidable: 2 bytes per activation), the weight bytes arrive
+packed (4 bits per byte for Q4_K/Q5_K, 6 for Q6_K) so a fraction of a
+load per weight, and the rest is the int→FP "pack" (`st`+`ld` — VIS 1
+has no move between the integer and FP register files) and GCC's
+address arithmetic. The packs are 2 ops per 4 bytes and cannot be
+avoided in C; Sun Studio may schedule them differently but cannot
+remove them.
+
+**The integer domain is the extraction tax.** Q5_K and Q6_K spend
+1.3-1.5 ops/MAC splitting nibbles and hi bits out of packed bytes in
+the integer unit, because VIS 1 has no byte-wise logical ops
+(`fpand`/`fpor` are VIS 2). A VIS 2 target (UltraSPARC III and later)
+could cut most of that, but the kernels deliberately stay VIS 1 so
+`-xarch=sparcvis` works on every UltraSPARC.
+
+### What is NOT in these numbers
+
+* Sun Studio code generation. The kernel structure is identical under
+  both compilers (both paths are tested bit-identical against i8), but
+  the op counts are GCC's.
+* Pipeline effects: dual-issue, the 3-cycle VIS latency, the
+  direct-mapped 16 KB D-cache, store-to-load forwarding for the packs.
+  An in-order machine can only be judged by the machine.
+* The `xs_prepare` pass (~0.1% of matvec work) and the Q6_K
+  misalignment normalisation (a 192-byte copy on the half of
+  super-blocks that start at offset 2 mod 4, ~0.2 ops/MAC).
+
+The one number that settles all of this is the profile command in the
+1.15.0 changelog entry, run on the target machine.
