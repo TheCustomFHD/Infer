@@ -1,24 +1,109 @@
 name: build
 
+# Runs on every push and pull request. Builds all four x86 targets,
+# runs the test suite, and asserts the platform guarantees that are
+# easy to break silently: the i486 baseline, the three-DLL Windows
+# import table, byte-order neutrality, and the option matrix.
+#
+# The version is read from `make version` rather than hardcoded, so
+# bumping VERSION in the Makefile does not break CI.
+
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
-  linux:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: dependencies
+
+      - name: install toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential gcc-multilib \
-                                  gcc-mingw-w64-i686-win32
+          sudo apt-get install -y \
+            build-essential \
+            gcc-multilib \
+            gcc-mingw-w64-i686-win32 \
+            binutils-mingw-w64-i686
+
+      # Everything below refers to $LINUX / $WIN instead of a literal
+      # version, so a VERSION bump cannot break the workflow.
+      - name: resolve version and binary names
+        id: v
+        run: |
+          V=$(make version)
+          echo "version=$V"                             >> "$GITHUB_OUTPUT"
+          echo "LINUX=infer-$V-linux"                   >> "$GITHUB_ENV"
+          echo "LINUX_P=infer-$V-linux-profile"         >> "$GITHUB_ENV"
+          echo "WIN=infer-$V-windows.exe"               >> "$GITHUB_ENV"
+          echo "WIN_P=infer-$V-windows-profile.exe"     >> "$GITHUB_ENV"
+
+      - name: Makefile VERSION matches src/infer.h
+        run: make checkversion
+
+      - name: confirm the win32 (not posix) mingw variant
+        run: |
+          i686-w64-mingw32-gcc --version | head -1
+          # Do not grep for "thread-model=": some Debian builds do not
+          # print it at all, and the check would abort the whole run
+          # under `set -e`. Test the property we actually care about
+          # instead -- the posix variant links libwinpthread-1.dll,
+          # which would break the three-DLL guarantee.
+          echo 'int main(void){return 0;}' > /tmp/probe.c
+          i686-w64-mingw32-gcc -o /tmp/probe.exe /tmp/probe.c
+          n=$(i686-w64-mingw32-objdump -p /tmp/probe.exe \
+              | grep -ci 'libwinpthread' || true)
+          echo "libwinpthread imports: $n (want 0)"
+          test "$n" -eq 0
       - name: build all four x86 targets
-        run: make all && ./infer-1.12.1-linux --version
-      - name: tests
+        run: |
+          make all
+          ls -l "$LINUX" "$LINUX_P" "$WIN" "$WIN_P"
+          ./"$LINUX" --version
+
+      - name: unit tests
         run: |
           make test
-          ./build/t_align && ./build/t_jinja && ./build/t_agent
+          ./build/t_align
+          ./build/t_agent
           ./build/t_endian
+          ./build/t_jinja
+
+      - name: i486 baseline -- no CMOV emitted for ordinary code
+        run: |
+          # MMX is expected: backend_mmx.c is runtime-gated on CPUID.
+          # CMOV is not -- it is a Pentium Pro instruction that would
+          # fault on a 486.
+          n=$(objdump -d "$LINUX" --no-show-raw-insn \
+              | grep -cE '^[[:space:]]+[0-9a-f]+:[[:space:]]+cmov[a-z]+' || true)
+          echo "cmov instructions: $n"
+          test "$n" -eq 0
+
+      - name: MMX kernels really are compiled in
+        run: |
+          n=$(objdump -d "$LINUX" | grep -cE 'pmaddwd|punpcklbw' || true)
+          echo "mmx instructions: $n"
+          test "$n" -gt 100
+
+      - name: all three backends are present
+        run: |
+          ./"$LINUX" --backend list
+          ./"$LINUX" --backend list | grep -q '^  mmx'
+          ./"$LINUX" --backend list | grep -q '^  i8'
+          ./"$LINUX" --backend list | grep -q '^  ref'
+
+      - name: windows exe imports only XP-safe DLLs
+        run: |
+          i686-w64-mingw32-objdump -p "$WIN" | grep 'DLL Name'
+          test "$(i686-w64-mingw32-objdump -p "$WIN" | grep -c 'DLL Name')" -eq 3
+          # no post-XP API may be imported
+          n=$(i686-w64-mingw32-objdump -p "$WIN" \
+              | grep -coE '\b(GetTickCount64|InitializeCriticalSectionEx|CreateFile2|InetPton|GetAddrInfoW|SetThreadStackGuarantee)\b' || true)
+          test "$n" -eq 0
+          file "$WIN" | grep -q 'PE32 executable'
+
       - name: big-endian build and test (s390x under qemu)
         run: |
           sudo apt-get install -y gcc-s390x-linux-gnu qemu-user-static
@@ -34,45 +119,61 @@ jobs:
             src/tokenizer.c src/sampler.c src/quant.c src/backend.c \
             src/gguf.c src/json.c src/util.c src/prof.c \
             src/net_posix.c src/sys_posix.c -lm
-      - name: i486 baseline -- no CMOV emitted for ordinary code
+
+      - name: strict C90, no long long, with large-file support
         run: |
-          # MMX is expected (backend_mmx.c, runtime-gated). CMOV is not:
-          # it is a Pentium Pro instruction and would fault on a 486.
-          n=$(objdump -d infer-1.12.1-linux --no-show-raw-insn \
-              | grep -cE '^[[:space:]]+[0-9a-f]+:[[:space:]]+cmov[a-z]+' || true)
-          echo "cmov instructions: $n"
-          test "$n" -eq 0
-      - name: MMX kernels really are compiled in
-        run: |
-          n=$(objdump -d infer-1.12.1-linux | grep -cE 'pmaddwd|punpcklbw' || true)
-          echo "mmx instructions: $n"
-          test "$n" -gt 100
+          # This combination is what broke the Solaris build: off_t
+          # becomes a 64-bit type and C90 has no name for one.
+          gcc -std=c89 -pedantic -Werror=long-long -Wall -Wextra \
+              -Wno-unused-parameter -m32 -D_FILE_OFFSET_BITS=64 \
+              -c src/sys_posix.c -o /tmp/sys_posix.o
+
       - name: every toggle is accepted in every mode that documents it
         run: |
           for m in serve chat run; do
             for f in "--system S" "--think" "--think off" "--raw" \
                      "--tool-rounds 2" "--quiet-tools" "--temp 0.5" \
                      "--mcp http://127.0.0.1:1/mcp" "--template /dev/null"; do
-              if ./infer-1.12.1-linux $m /nonexistent.gguf $f 2>&1 \
+              if ./"$LINUX" $m /nonexistent.gguf $f 2>&1 \
                    | grep -q 'has no effect'; then
                 echo "REGRESSION: $m rejects $f"; exit 1
               fi
             done
           done
-      - name: logging is opt-in, even in a -DINFER_PROFILE build
-        run: |
-          # --log-stages on a build without the timers must explain itself
-          ./infer-1.12.1-linux run /nonexistent.gguf --log-stages 2>&1 \
-            | grep -q 'INFER_PROFILE'
-      - name: --think is one switch and does not eat the next option
-        run: |
-          ./infer-1.12.1-linux chat /nonexistent.gguf --no-think 2>&1 | grep -q 'unknown option'
-          ./infer-1.12.1-linux chat /nonexistent.gguf --think banana 2>&1 | grep -q 'expects on or off'
+
       - name: options that do not apply are reported, not ignored
         run: |
-          ./infer-1.12.1-linux run x.gguf --port 9 2>&1 | grep -q 'has no effect'
-          ./infer-1.12.1-linux serve x.gguf -p hi 2>&1 | grep -q 'has no effect'
-      - name: windows exe imports only XP-safe DLLs
+          ./"$LINUX" run x.gguf --port 9 2>&1 | grep -q 'has no effect'
+          ./"$LINUX" serve x.gguf -p hi 2>&1 | grep -q 'has no effect'
+
+      - name: --think is one switch and does not eat the next option
         run: |
-          i686-w64-mingw32-objdump -p infer-1.12.1-windows.exe | grep 'DLL Name'
-          test "$(i686-w64-mingw32-objdump -p infer-1.12.1-windows.exe | grep -c 'DLL Name')" -eq 3
+          ./"$LINUX" chat /nonexistent.gguf --no-think 2>&1 \
+            | grep -q 'unknown option'
+          ./"$LINUX" chat /nonexistent.gguf --think banana 2>&1 \
+            | grep -q 'expects on or off'
+
+      - name: logging is opt-in, and says so when it cannot comply
+        run: |
+          # --log-stages on a build without timers must explain itself,
+          # and must do so before touching the model.
+          ./"$LINUX" run /nonexistent.gguf --log-stages 2>&1 \
+            | grep -q 'INFER_PROFILE'
+          # the profile build must stay silent unless asked
+          ! ./"$LINUX_P" run /nonexistent.gguf 2>&1 | grep -q 'STAGE PROFILE'
+
+      - name: no bundled chat template (third-party work is not vendored)
+        run: |
+          test ! -f templates/qwen-fixed-v21.3.jinja
+          ls templates/
+
+      - name: upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: infer-${{ steps.v.outputs.version }}-binaries
+          if-no-files-found: error
+          path: |
+            infer-*-linux
+            infer-*-linux-profile
+            infer-*-windows.exe
+            infer-*-windows-profile.exe

@@ -1,0 +1,151 @@
+name: release
+
+# Builds the four shipped binaries and attaches them to a GitHub
+# Release, with a checksum file.
+#
+# ---------------------------------------------------------------------
+# HOW TO CUT A RELEASE
+# ---------------------------------------------------------------------
+#
+#   1. Bump the version in BOTH places:
+#        src/infer.h   #define INFER_VERSION "1.12.2"
+#        Makefile      VERSION = 1.12.2
+#      `make checkversion` asserts they agree, and this workflow runs it.
+#
+#   2. Commit, then tag and push:
+#        git commit -am "1.12.2"
+#        git tag v1.12.2
+#        git push && git push --tags
+#
+#   3. That is all. The release appears with the binaries attached.
+#
+# The tag must match the version, e.g. tag `v1.12.2` for VERSION 1.12.2.
+# The workflow checks this and fails loudly if they disagree, because a
+# release whose tag and binaries disagree is worse than no release.
+#
+# You can also run it by hand from the Actions tab (workflow_dispatch),
+# which produces a draft release you can inspect before publishing.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-multilib \
+            gcc-mingw-w64-i686-win32 \
+            binutils-mingw-w64-i686
+
+      - name: resolve version
+        id: v
+        run: |
+          V=$(make version)
+          echo "version=$V"                         >> "$GITHUB_OUTPUT"
+          echo "VER=$V"                             >> "$GITHUB_ENV"
+          echo "LINUX=infer-$V-linux"               >> "$GITHUB_ENV"
+          echo "LINUX_P=infer-$V-linux-profile"     >> "$GITHUB_ENV"
+          echo "WIN=infer-$V-windows.exe"           >> "$GITHUB_ENV"
+          echo "WIN_P=infer-$V-windows-profile.exe" >> "$GITHUB_ENV"
+
+      - name: version consistency
+        run: |
+          make checkversion
+          # If this run was triggered by a tag, it must match VERSION.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            echo "tag=$TAG  makefile=$VER"
+            if [ "$TAG" != "$VER" ]; then
+              echo "::error::tag v$TAG does not match VERSION $VER"
+              exit 1
+            fi
+          fi
+
+      - name: build the four shipped binaries
+        run: |
+          make all
+          ls -l "$LINUX" "$LINUX_P" "$WIN" "$WIN_P"
+
+      - name: verify before shipping
+        run: |
+          # A release must not go out with these broken.
+          ./"$LINUX" --version
+          test "$(objdump -d "$LINUX" --no-show-raw-insn \
+                  | grep -cE '^[[:space:]]+[0-9a-f]+:[[:space:]]+cmov[a-z]+' || true)" -eq 0
+          test "$(objdump -d "$LINUX" | grep -cE 'pmaddwd|punpcklbw' || true)" -gt 100
+          test "$(i686-w64-mingw32-objdump -p "$WIN" | grep -c 'DLL Name')" -eq 3
+          file "$WIN" | grep -q 'PE32 executable'
+          make test
+          ./build/t_align && ./build/t_agent && ./build/t_endian
+
+      - name: assemble the release directory
+        run: |
+          mkdir -p "release/infer-$VER"
+          cp "$LINUX" "$LINUX_P" "$WIN" "$WIN_P" "release/infer-$VER/"
+          cp CHANGELOG.md LICENSE "release/infer-$VER/"
+          cp .github/RELEASE-README.txt "release/infer-$VER/README-BINARIES.txt"
+          cd "release/infer-$VER"
+          sha256sum * > SHA256SUMS
+          cd ..
+          zip -9 -rX "../infer-$VER-binaries.zip" "infer-$VER"
+          cd ..
+          ls -l "infer-$VER-binaries.zip"
+
+      - name: source archive
+        run: |
+          git archive --format=zip --prefix="infer-$VER/" \
+            -o "infer-$VER-source.zip" HEAD
+          ls -l "infer-$VER-source.zip"
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: infer ${{ steps.v.outputs.version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.v.outputs.version) }}
+          draft: ${{ github.ref_type != 'tag' }}
+          generate_release_notes: true
+          files: |
+            infer-${{ steps.v.outputs.version }}-binaries.zip
+            infer-${{ steps.v.outputs.version }}-source.zip
+          body: |
+            ## infer ${{ steps.v.outputs.version }}
+
+            Four binaries. Two platforms, two options each: with or
+            without the profiler.
+
+            | file | notes |
+            |---|---|
+            | `infer-${{ steps.v.outputs.version }}-windows.exe` | Windows XP and later |
+            | `infer-${{ steps.v.outputs.version }}-windows-profile.exe` | ...with per-stage timers |
+            | `infer-${{ steps.v.outputs.version }}-linux` | Linux, 32-bit x86 |
+            | `infer-${{ steps.v.outputs.version }}-linux-profile` | ...with per-stage timers |
+
+            **All four contain all three backends** (`mmx`, `i8`, `ref`)
+            and pick the fastest the CPU supports at run time. **All four
+            use an i486 baseline**, so one binary runs on a 486 and
+            accelerates on anything with MMX.
+
+            The Windows binaries import exactly three DLLs — KERNEL32,
+            msvcrt, WS2_32 — all present on a stock XP install.
+
+            `SHA256SUMS` is inside the zip. No model weights and no
+            third-party chat templates are bundled; see
+            `README-BINARIES.txt`.
+
+            SPARC/Solaris is not shipped as a binary — build it with
+            `gmake solaris`. See `COMPILE.md`.
+
+            See `CHANGELOG.md` for what changed.

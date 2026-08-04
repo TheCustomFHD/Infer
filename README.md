@@ -64,6 +64,7 @@ Nothing to `pip install`, no CMake, no submodules.
 | document | what it covers |
 |---|---|
 | **[USER-GUIDE.md](USER-GUIDE.md)** | every command and flag, with examples |
+| **[AGENTS.md](AGENTS.md)** | guidance for AI coding agents; `.agents/` has the detail |
 | **[COMPILE.md](COMPILE.md)** | atomic build steps for every target and toggle |
 | **[CHAT.md](CHAT.md)** | the chat REPL and MCP tools |
 | **[PROFILING.md](PROFILING.md)** | `--log-perf`, `--log-stages`, and reading the output |
@@ -111,10 +112,10 @@ $ infer run model.gguf --port 9090
 ## Build targets
 
 ```sh
-make linux              # Linux/x86        -> infer-1.12.1-linux
-make linux-profile      # ...with profiler -> infer-1.12.1-linux-profile
-make windows            # Windows XP/x86   -> infer-1.12.1-windows.exe
-make windows-profile    # ...with profiler -> infer-1.12.1-windows-profile.exe
+make linux              # Linux/x86        -> infer-1.12.2-linux
+make linux-profile      # ...with profiler -> infer-1.12.2-linux-profile
+make windows            # Windows XP/x86   -> infer-1.12.2-windows.exe
+make windows-profile    # ...with profiler -> infer-1.12.2-windows-profile.exe
 make all                # all four
 
 make solaris            # Solaris/SPARC, Sun Studio, 64-bit

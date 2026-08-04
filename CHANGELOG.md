@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.12.2 — working CI, automatic release builds, agent guidance
+
+### CI was broken in two ways
+
+**Missing package.** The workflow installed `gcc-mingw-w64-i686-win32`
+but not `binutils-mingw-w64-i686`, which is what provides
+`i686-w64-mingw32-objdump`. Every Windows verification step would have
+failed with "command not found".
+
+**Hardcoded version.** Eleven literal `1.12.1` strings referred to
+binaries by name. Bumping `VERSION` broke the whole workflow. The
+version is now read once from `make version` into `$GITHUB_ENV`, so a
+bump cannot break CI.
+
+A third problem was found while testing the fix: the "confirm the win32
+mingw variant" step grepped for `thread-model=`, which **this Debian
+mingw does not print at all** — the check would have aborted every run
+under `set -e`. Replaced with a test of the property that actually
+matters: compile a trivial program and confirm it does not import
+`libwinpthread-1.dll`.
+
+Every step was then executed locally, verbatim, before committing.
+
+### Automatic release builds
+
+`.github/workflows/release.yml` builds the four shipped binaries and
+attaches them to a GitHub Release:
+
+```sh
+git commit -am "1.12.2"
+git tag v1.12.2
+git push && git push --tags
+```
+
+That is the whole procedure. The workflow:
+
+* asserts the tag matches `VERSION` (a release whose tag and binaries
+  disagree is worse than no release),
+* runs `make checkversion`, the test suite, and the platform guarantees
+  — 0 CMOV, MMX present, exactly 3 DLLs, PE32 — **before** publishing,
+* ships `infer-<version>-binaries.zip` with `SHA256SUMS`, plus a source
+  archive from `git archive`,
+* can be run by hand from the Actions tab, which produces a **draft**
+  release you can inspect first.
+
+`build.yml` also uploads the four binaries as artifacts on every push,
+so you can grab a build without cutting a release.
+
+### Agent guidance
+
+`AGENTS.md` at the repository root, plus `.agents/` with the detail:
+
+| file | contents |
+|---|---|
+| `AGENTS.md` | build, verify, and a "never do these" list |
+| `.agents/BUILDING.md` | the exact Windows XP recipe with expected output, and a failure table |
+| `.agents/CONVENTIONS.md` | C89 rules, the no-64-bit-type rule, naming, ownership |
+| `.agents/PITFALLS.md` | ten bugs that actually happened here, and how each was found |
+
+The theme, which is what agents most often get wrong here: **the
+expensive bugs in this project do not crash.** They build cleanly, load
+the model, print correct metadata, run at full speed and return
+confident nonsense. Compiling is not evidence of working.
+
+---
+
 ## 1.12.1 — Solaris actually builds, and four targets instead of twenty
 
 ### Solaris: the real cause, and the real fix
