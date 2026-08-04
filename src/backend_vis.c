@@ -113,8 +113,13 @@ typedef int bk_vis_translation_unit_not_empty;
 /*                                                                     */
 /*   GCC/Clang  __attribute__((vector_size)) + __builtin_vis_*         */
 /*              built with -mcpu=ultrasparc -mvis                      */
-/*   Sun Studio <vis_proto.h> + vis_d64/vis_f32 types + vis_* calls    */
-/*              built with -xarch=v9a                                  */
+/*   Sun Studio <vis_proto.h> + plain float/double + vis_* calls       */
+/*              built with -xarch=sparcvis -xvis                       */
+/*                                                                     */
+/* Sun's header declares no vector types at all: a VIS register IS an  */
+/* FP register, so a u8x4 is a `float` and an s16x4 is a `double` that */
+/* you simply never do float arithmetic on. Lanes are reached with a   */
+/* union, not with subscripts. (Finding 25.)                            */
 /*                                                                     */
 /* Both are wrapped behind the same four macros so the kernels below    */
 /* are written once.                                                    */
@@ -124,10 +129,8 @@ typedef int bk_vis_translation_unit_not_empty;
 
 #include <vis_proto.h>
 
-typedef vis_f32 vis_u8x4;
-typedef vis_d64 vis_s16x4;
-typedef vis_f32 vis_s16x2;
-typedef vis_d64 vis_s32x2;
+typedef float  vis_u8x4;
+typedef double vis_s16x4;
 
 #define VMUL8X16(a, b)   vis_fmul8x16((a), (b))
 #define VADD16(a, b)     vis_fpadd16((a), (b))
@@ -231,6 +234,34 @@ void bk_vis_free_scratch(void) {
  *
  * fmuld8ulx16(ones, v) computes u8(1) * s16(v) into 32-bit lanes with
  * no rounding, which is an exact widen of two lanes at a time. */
+#if defined(VIS_SUNPRO)
+
+/* No subscripting a double: lanes come out through a union. The 32-bit
+ * halves of the accumulator feed fmuld8ulx16 directly as floats. */
+typedef union { double d; short  s[4]; float f[2]; } vis_lane64;
+typedef union { double d; int    i[2];             } vis_wide64;
+typedef union { float  f; unsigned int u;          } vis_lane32;
+
+static int vis_hsum16(vis_s16x4 v) {
+    vis_lane64 in;
+    vis_lane32 one;
+    vis_wide64 wl, wh, s;
+
+    one.u = 0x01010101U;   /* four u8 lanes of 1 */
+    in.d  = v;
+
+    wl.d = VWIDEN(one.f, in.f[0]);
+    wh.d = VWIDEN(one.f, in.f[1]);
+    s.d  = VADD32(wl.d, wh.d);
+    return s.i[0] + s.i[1];
+}
+
+static vis_s16x4 vis_zero16(void) {
+    return vis_fzero();
+}
+
+#else
+
 static int vis_hsum16(vis_s16x4 v) {
     vis_u8x4  one;
     vis_s16x2 lo, hi;
@@ -253,6 +284,8 @@ static vis_s16x4 vis_zero16(void) {
     return z;
 }
 
+#endif
+
 /* Load four pre-shifted activations as ONE 64-bit vector load.
  *
  * Assigning element by element looks equivalent but is not: GCC lowers
@@ -265,10 +298,18 @@ static vis_s16x4 vis_zero16(void) {
  * xs_buf is allocated by xrealloc and indexed in multiples of 4 shorts,
  * so the 8-byte alignment ldd needs is satisfied. */
 #if defined(VIS_SUNPRO)
-/* Sun Studio models a VIS register as a double, and provides explicit
- * reinterpretation helpers, so no union punning is needed. */
-#define XLOAD4(dst, p)  ((dst) = *(const vis_d64 *) (const void *) (p))
-#define PACK_U8X4(u)    vis_to_float((unsigned int) (u))
+/* A VIS register is an FP register, so a 64-bit vector load is just a
+ * double load (ldd) and a u8x4 is a float bit-pattern. Done with a
+ * union rather than vis_to_float(): that helper is part of mediaLib's
+ * copy of the header and may not be in Studio's. */
+#define XLOAD4(dst, p)  ((dst) = *(const double *) (const void *) (p))
+
+static vis_u8x4 vis_pack_u8x4(unsigned int u) {
+    vis_lane32 p;
+    p.u = u;
+    return p.f;
+}
+#define PACK_U8X4(u)    vis_pack_u8x4((unsigned int) (u))
 #else
 typedef union {
     vis_s16x4     v;

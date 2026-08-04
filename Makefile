@@ -97,7 +97,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.14.0
+VERSION = 1.14.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -234,6 +234,8 @@ SOLLIBS   = -lm -lsocket -lnsl
 
 solaris: $(CORE) $(POSIX)
 	$(SUNCC) $(SUNFLAGS) -o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
+	@echo "note: scalar build, i8 backend only."
+	@echo "      backend_vis.c is NOT compiled in -- use 'make solaris-vis' for that."
 
 solaris-profile: $(CORE) $(POSIX)
 	$(SUNCC) $(SUNFLAGS) -DINFER_PROFILE \
@@ -259,15 +261,15 @@ solaris-fast: $(CORE) $(POSIX)
 # Solaris make has no pattern rules we can rely on, so these are spelled
 # out rather than sharing the rules below.
 # ---------------------------------------------------------------------
-# VIS builds. -xarch=v9a (Sun Studio) / -mcpu=ultrasparc -mvis (GCC)
+# VIS builds. -xarch=sparcvis -xvis (Sun Studio) / -mcpu=ultrasparc -mvis (GCC)
 # select the VIS 1 instruction set, present on every UltraSPARC.
 # ---------------------------------------------------------------------
 solaris-vis: $(CORE) $(POSIX) $(VISSRC)
-	$(SUNCC) $(SUNFLAGS) -xarch=v9a -DINFER_HAVE_VIS \
+	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS \
 		-o $(BIN)-solaris $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
 
 solaris-vis-profile: $(CORE) $(POSIX) $(VISSRC)
-	$(SUNCC) $(SUNFLAGS) -xarch=v9a -DINFER_HAVE_VIS -DINFER_PROFILE \
+	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS -DINFER_PROFILE \
 		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
 
 solaris-gcc-vis: $(CORE) $(POSIX) $(VISSRC)
@@ -297,16 +299,31 @@ solaris-test: $(CORE) $(POSIX)
 
 # VIS assumptions. Run this FIRST on any new SPARC box: it proves the
 # exactness trick the kernels depend on, and needs no model.
+solaris-gcc-vis-test: tests/t_vis.c
+	@mkdir -p $(BUILD)
+	$(CC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
+		-DINFER_HAVE_VIS -o $(BUILD)/t_vis tests/t_vis.c
+	$(CC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
+		-DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -I$(SRCDIR) \
+		-o $(BUILD)/t_viskern tests/t_viskern.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern"
+
 solaris-vis-test: tests/t_vis.c
 	@mkdir -p $(BUILD)
-	$(SUNCC) -Xc -xc99=none -xO3 -m64 -xarch=v9a -DINFER_HAVE_VIS \
+	$(SUNCC) -Xc -xc99=none -xO3 -m64 -xarch=sparcvis -xvis -DINFER_HAVE_VIS \
 		-o $(BUILD)/t_vis tests/t_vis.c
-	$(SUNCC) $(SUNFLAGS) -xarch=v9a -DINFER_HAVE_VIS \
+	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS -I$(SRCDIR) \
+		-o $(BUILD)/t_viskern tests/t_viskern.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
+	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS \
 		-o $(BUILD)/t_backend tests/t_backend.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(VISSRC) $(SRCDIR)/util.c $(SRCDIR)/prof.c \
 		$(SRCDIR)/sys_posix.c $(SOLLIBS)
-	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_backend model.gguf"
+	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern   then   ./$(BUILD)/t_backend model.gguf"
 
 # =====================================================================
 #  Tests

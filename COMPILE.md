@@ -648,16 +648,23 @@ gmake solaris-gcc-vis        # GCC
 gmake solaris-vis-profile    # with stage timers
 ```
 
-`solaris-vis` adds `-xarch=v9a -DINFER_HAVE_VIS`; the GCC target uses
-`-mcpu=ultrasparc -mvis`. The file supports both compilers: Sun Studio
-via `<vis_proto.h>`, GCC via `__builtin_vis_*`.
+`solaris-vis` adds `-xarch=sparcvis -xvis -DINFER_HAVE_VIS`; the GCC
+target uses `-mcpu=ultrasparc -mvis`. The file supports both compilers:
+Sun Studio via `<vis_proto.h>`, GCC via `__builtin_vis_*`.
+
+The two spellings are genuinely different languages. Sun declares the
+intrinsics over plain `float` and `double` — a VIS register *is* an FP
+register, and there are no vector types — while GCC uses
+`__attribute__((vector_size))` with subscriptable lanes. Only the type
+layer differs; the kernels are written once against four macros.
 
 **Check the assumptions before trusting it.** The kernels rely on an
 identity — `fmul8x16(w, x << 8) == w * x` exactly — that cancels the
 graphics scaling built into the instruction. Prove it on your machine:
 
 ```sh
-gmake solaris-vis-test
+gmake solaris-vis-test       # Sun Studio
+gmake solaris-gcc-vis-test   # GCC
 ./build/t_vis
 ```
 
@@ -668,7 +675,30 @@ fmul8x16(w, x << 8) == w * x, exactly                    ok
 all VIS assumptions hold
 ```
 
-Then check the kernels against the reference:
+Then check the kernels themselves. This one needs no model — it builds
+synthetic blocks and compares against the scalar `i8` kernel:
+
+```sh
+./build/t_viskern
+```
+
+```
+Q4_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q5_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+
+kernels agree with the reference
+```
+
+Anything other than `0.000e+00` is a bug. The exactness identity above
+means VIS and `i8` must agree *bit for bit*, not merely closely.
+
+The comparison is deliberately against `qmv_i8` rather than `qmv_ref`.
+Against the exact F32 reference the VIS kernels differ by 1–12%, but
+that is the cost of quantising activations to int8 and the `i8` backend
+shows the same spread. Comparing against `qmv_ref` will make a correct
+kernel look broken.
+
+Finally, with a model:
 
 ```sh
 ./build/t_backend model.gguf

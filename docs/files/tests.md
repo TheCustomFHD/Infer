@@ -1,6 +1,7 @@
 # `tests/` — the test suite
 
-`make test` builds all nine into `build/`, plus `t_vis` on SPARC.
+`make test` builds all nine into `build/`, plus `t_vis` and `t_viskern`
+on SPARC.
 
 | test | needs a model? | what it proves |
 |---|---|---|
@@ -69,6 +70,46 @@ blk.0.ffn_gate.weight    Q4_K  512x1024
 `rel-l2 ≈ 3.6e-3` is expected: that is the cost of int8 activation
 quantisation, the same precision GGML uses, far below the error already
 introduced by 4-bit weights. `ref` is 0 by definition.
+
+## `t_viskern` — VIS kernels against `i8`, without a model
+
+`t_vis` proves the *identity* the kernels rest on. `t_viskern` proves
+the **kernels** themselves, on synthetic Q4_K and Q5_K blocks at three
+sizes each, so it runs in seconds on a 440 MHz Ultra 10 and needs no
+download:
+
+```
+Q4_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+Q5_K     ncols=3584 rows=4    worst rel err 0.000e+00  ok
+```
+
+Zero, not "small". The exactness trick means VIS and `i8` perform the
+same integer arithmetic, so any nonzero result is a bug.
+
+The reference is `qmv_i8`, deliberately. Against `qmv_ref` the VIS
+kernels show 1–12% relative error — that is int8 activation
+quantisation, visible in `i8` too, not a kernel fault. Using the wrong
+reference sends you debugging correct code.
+
+### Testing the Sun Studio path without a Sun Studio
+
+`tests/vis_shim/vis_proto.h` reimplements Sun's prototypes in plain C.
+Compiling with `-D__SUNPRO_C -Itests/vis_shim` takes the Studio branch
+of `backend_vis.c` under GCC, which catches the type errors that make
+up most of the risk in maintaining two compiler paths:
+
+```sh
+gcc -std=gnu89 -O2 -m64 -mcpu=ultrasparc \
+    -D__SUNPRO_C=0x5150 -Itests/vis_shim \
+    -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -Isrc \
+    -o /tmp/t_viskern_sun tests/t_viskern.c src/backend_vis.c \
+    src/backend.c src/quant.c src/util.c src/prof.c \
+    src/gguf.c src/sys_posix.c -lm
+```
+
+It proves types and arithmetic only. GCC inlines the shim's C instead
+of emitting VIS instructions, so instruction counts taken this way are
+meaningless — Studio's code generation can only be judged by Studio.
 
 ## Beyond the suite
 

@@ -498,6 +498,78 @@ Two things worth keeping:
 
 ---
 
+## 25. Two compilers, two type systems, and a test that never ran
+
+The VIS backend shipped in 1.14.0 claiming "dual compiler support". The
+Sun Studio half had never been compiled by a Sun Studio. It was written
+from memory against an imagined API:
+
+```c
+typedef vis_f32 vis_u8x4;      /* no such type */
+typedef vis_d64 vis_s16x4;     /* no such type */
+```
+
+Sun's `<vis_proto.h>` declares no vector types whatsoever. A VIS
+register *is* an FP register, and the intrinsics are declared over the
+plain FP types:
+
+```c
+double vis_fmul8x16   (float  /*frs1*/, double /*frs2*/);
+double vis_fpadd16    (double /*frs1*/, double /*frs2*/);
+double vis_fmuld8ulx16(float  /*frs1*/, float  /*frs2*/);
+```
+
+A `u8x4` is a `float` you never do float arithmetic on; an `s16x4` is a
+`double`. GCC's `vector_size` + `__builtin_vis_*` spelling is a GCC
+extension and does not carry over.
+
+The consequence went past the typedefs. `vis_hsum16()` reached lanes
+with `v[0]`, `v[1]` — you cannot subscript a `double`, so the helper
+needed a separate implementation per compiler, using a union. The
+kernels themselves were fine, because they only ever touch the four
+`VMUL8X16`/`VADD16`/`VADD32`/`VWIDEN` macros. Keeping the compiler
+divergence confined to the type layer is what limited the damage.
+
+Two smaller traps in the same area:
+
+- `vis_to_float()` / `vis_to_double()` / `vis_read_hi()`, which the test
+  used, are mediaLib helpers. They may not exist in Studio's copy of the
+  header. Unions are C89, work under `-Xc`, and cannot be wrong.
+- The Studio branch of the lane-ordering test was stubbed out with the
+  comment "the ordering guarantee is architectural, so a single-lane
+  check suffices". Once lane access goes through a union, ordering is a
+  property of *our code*, not the architecture. It is now checked.
+
+**Why it went unnoticed:** the plain `make solaris` target does not list
+`backend_vis.c` and does not define `INFER_HAVE_VIS`, and the file
+collapses to a dummy typedef when that macro is absent. So `make
+solaris` succeeds whether or not the VIS code is valid — it never sees
+it. A successful scalar build says nothing about the VIS build. The
+target now prints that it is scalar-only.
+
+**How it is prevented now:** `tests/vis_shim/vis_proto.h` reimplements
+Sun's exact signatures in plain C, so the Studio code path can be
+compiled and *run* under GCC with `-D__SUNPRO_C`. Both paths are now
+checked against the i8 kernel by `tests/t_viskern.c` on synthetic
+blocks, needing no model:
+
+```
+Q4_K  ncols=3584 rows=4   worst rel err 0.000e+00  ok
+Q5_K  ncols=3584 rows=4   worst rel err 0.000e+00  ok
+```
+
+Bit-identical, both compilers. Note the reference has to be `qmv_i8`,
+not `qmv_ref`: against the exact F32 reference the VIS kernels show
+1–12% relative error, which is the cost of int8 activation
+quantisation and is present in the i8 backend too. Comparing against
+the wrong reference would have sent us debugging a kernel that was
+already correct.
+
+What the shim does **not** tell us is anything about Studio's code
+generation — GCC inlines the shim's C rather than emitting VIS
+instructions. Instruction counts from it are meaningless. Only the real
+compiler on the real machine can answer that.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

@@ -37,8 +37,13 @@ int main(void) {
 
 #if defined(__SUNPRO_C)
 #include <vis_proto.h>
-typedef vis_f32 u8x4;
-typedef vis_d64 s16x4;
+/* Sun declares the intrinsics over plain float/double -- a VIS register
+ * is an FP register. No vector types, no subscripting; lanes come out
+ * through a union. */
+typedef float  u8x4;
+typedef double s16x4;
+typedef union { double d; short s[4]; } lane64;
+typedef union { float  f; unsigned int u; } lane32;
 #define VMUL8X16(a, b) vis_fmul8x16((a), (b))
 #define VADD16(a, b)   vis_fpadd16((a), (b))
 #else
@@ -81,10 +86,20 @@ int main(void) {
                 int got, want;
 
 #if defined(__SUNPRO_C)
-                a = vis_to_float((unsigned int) w << 24);
-                b = vis_to_double(((unsigned int) ((short) (x << 8))) << 16, 0);
-                r = VMUL8X16(a, b);
-                got = (int) (short) (vis_read_hi(r) >> 16);
+                {
+                    lane32 pa; lane64 pb, pr;
+                    /* byte lane 0 is the most significant byte of the
+                     * float; short lane 0 the most significant half of
+                     * the double. Big-endian SPARC, so index 0 either
+                     * way -- and test 4 below proves it. */
+                    pa.u = (unsigned int) w << 24;
+                    pb.s[0] = (short) (x << 8);
+                    pb.s[1] = 0; pb.s[2] = 0; pb.s[3] = 0;
+                    a = pa.f; b = pb.d;
+                    r = VMUL8X16(a, b);
+                    pr.d = r;
+                    got = pr.s[0];
+                }
 #else
                 a[0] = (unsigned char) w; a[1] = 0; a[2] = 0; a[3] = 0;
                 b[0] = (short) (x << 8);  b[1] = 0; b[2] = 0; b[3] = 0;
@@ -134,10 +149,33 @@ int main(void) {
         int i, ok = 1;
 
 #if defined(__SUNPRO_C)
-        /* Sun Studio path checked lane 0 above; the ordering guarantee
-         * is architectural, so a single-lane check suffices there. */
-        (void) a; (void) b; (void) r; (void) i;
-        printf("%-56s %s\n", "lane ordering (checked via lane 0 above)", "ok");
+        {
+            lane32 pa; lane64 pb, pr, pp, pq, ps;
+
+            pa.u = 0;
+            for (i = 0; i < 4; i++) {
+                pa.u |= ((unsigned int) (i + 1)) << (24 - 8 * i);
+                pb.s[i] = (short) ((i + 1) << 8);
+            }
+            r = VMUL8X16(pa.f, pb.d);
+            pr.d = r;
+            for (i = 0; i < 4; i++) {
+                if (pr.s[i] != (short) ((i + 1) * (i + 1))) ok = 0;
+            }
+            ck("four lanes multiply independently, in order", ok);
+
+            for (i = 0; i < 4; i++) {
+                pp.s[i] = (short) (i + 1);
+                pq.s[i] = (short) (10 * (i + 1));
+            }
+            ps.d = VADD16(pp.d, pq.d);
+            ok = 1;
+            for (i = 0; i < 4; i++) {
+                if (ps.s[i] != (short) (11 * (i + 1))) ok = 0;
+            }
+            ck("fpadd16 adds matching lanes", ok);
+            (void) a; (void) b;
+        }
 #else
         for (i = 0; i < 4; i++) {
             a[i] = (unsigned char) (i + 1);

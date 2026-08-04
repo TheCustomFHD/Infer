@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.14.1 — the Sun Studio path actually compiles
+
+1.14.0 claimed dual compiler support for the VIS backend. The Sun Studio
+half had never been compiled by a Sun Studio, and did not compile. It
+was written against an API that does not exist:
+
+```c
+typedef vis_f32 vis_u8x4;    /* no such type in <vis_proto.h> */
+typedef vis_d64 vis_s16x4;   /* nor this one */
+```
+
+Sun declares the VIS intrinsics over plain `float` and `double` — a VIS
+register is an FP register, and there are no vector types at all. Fixed
+in both `src/backend_vis.c` and `tests/t_vis.c`:
+
+- `vis_u8x4` is `float`, `vis_s16x4` is `double` on the Studio path
+- `vis_hsum16()` and `vis_zero16()` gained a Studio implementation;
+  lanes come out of a union rather than `v[0]`, which a `double` does
+  not support
+- dropped `vis_to_float()` / `vis_read_hi()`, which are mediaLib
+  helpers and may not be in Studio's header, in favour of unions
+- the Studio branch of the lane-ordering check was a stub that always
+  printed `ok`; it now runs
+
+The GCC path is unchanged and re-verified.
+
+**Why `make solaris` succeeded anyway:** it does not compile
+`backend_vis.c` and does not define `INFER_HAVE_VIS`. It builds a
+scalar i8 binary and never sees the VIS code. It now says so.
+
+### New
+
+- `tests/t_viskern.c` — checks both VIS kernels against `qmv_i8` on
+  synthetic blocks, no model required. Currently bit-identical
+  (`0.000e+00`) for Q4_K and Q5_K at three sizes each.
+- `tests/vis_shim/vis_proto.h` — reimplements Sun's exact prototypes in
+  plain C so the Studio code path can be compiled *and run* under GCC
+  with `-D__SUNPRO_C`. Catches type errors without a Sun Studio. It
+  says nothing about Studio's code generation.
+- `make solaris-gcc-vis-test`, matching the Sun Studio target.
+
+### Changed
+
+- `-xarch=v9a` → `-xarch=sparcvis -xvis` (Studio deprecated the former;
+  `SUNFLAGS` already carries `-m64`).
+
+### Note on the reference
+
+`t_viskern` compares against `qmv_i8`, not `qmv_ref`. Against the exact
+F32 reference the VIS kernels differ by 1–12%, which is int8 activation
+quantisation, not a kernel bug — the i8 backend shows the same.
+
 ## 1.14.0 — VIS backend for UltraSPARC
 
 A fourth compute backend, `vis`, using the UltraSPARC Visual Instruction
