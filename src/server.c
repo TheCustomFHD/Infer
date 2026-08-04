@@ -270,6 +270,7 @@ typedef struct {
     const server_config *cfg;
     const infer_opts *o;
     mcp_client    *mcp;      /* from --mcp, or NULL */
+    strbuf         last_prompt;  /* text of the prompt last ingested */
 } engine;
 
 /* Convert the OpenAI `messages` array into the jj_val form the chat
@@ -504,7 +505,7 @@ static int generate(engine *e, net_conn *conn, js_val *req,
     tokenizer *tok = e->tok;
     int *toks;
     int n_prompt, n_max, n_ctx;
-    int i, pos = 0, n_gen = 0;
+    int i, pos = 0, n_gen = 0, reused = 0;
     float *logits = NULL;
     sampler *smp;
     sampler_params sp;
@@ -522,7 +523,12 @@ static int generate(engine *e, net_conn *conn, js_val *req,
 
     n_ctx = qwen35_n_ctx(e->ctx);
     toks = (int *) xmalloc(sizeof(int) * MAX_TOKENS_IN);
-    n_prompt = tok_encode(tok, prompt, 1, toks, MAX_TOKENS_IN);
+    /* Keep the shared prefix's token IDs stable across requests --
+     * see agent_tokenize_incremental(). */
+    n_prompt = agent_tokenize_incremental(tok, prompt,
+                                          e->last_prompt.data,
+                                          e->last_prompt.len,
+                                          toks, MAX_TOKENS_IN, NULL);
 
     if (n_prompt >= n_ctx) {
         free(toks);
@@ -550,20 +556,30 @@ static int generate(engine *e, net_conn *conn, js_val *req,
     sb_init(&piece_acc);
     sb_init(&json);
 
-    /* ---- fresh sequence ---- */
     perf_begin(&pr);
-    qwen35_reset(e->ctx);
+
+    /* Reuse whatever this request shares with the last one. A client
+     * that keeps appending to the same conversation -- which is what
+     * every chat UI does -- then pays only for the new tokens. A
+     * different conversation simply shares nothing and resets. */
+    reused = qwen35_reuse_prefix(e->ctx, toks, n_prompt);
 
     if (inf_verbose) {
-        inf_log("generate: %d prompt tokens, up to %d new", n_prompt, n_max);
+        inf_log("generate: %d prompt tokens (%d reused), up to %d new",
+                n_prompt, reused, n_max);
     }
 
     /* ---- prompt ingestion ---- */
-    for (i = 0; i < n_prompt; i++) {
+    /* The sampler needs the full sequence even where the engine does
+     * not: repetition penalty is computed over everything. */
+    for (i = 0; i < reused; i++) sampler_accept(smp, toks[i]);
+
+    pos = reused;
+    for (i = reused; i < n_prompt; i++) {
         logits = qwen35_decode(e->ctx, toks[i], pos++, i == n_prompt - 1);
         sampler_accept(smp, toks[i]);
     }
-    perf_mark_prompt_done(&pr, n_prompt);
+    perf_mark_prompt_done(&pr, n_prompt - reused);
 
     /* ---- streaming preamble ---- */
     if (stream) {
@@ -658,6 +674,12 @@ static int generate(engine *e, net_conn *conn, js_val *req,
     }
 
     if (n_gen >= n_max) finish = "length";
+
+    /* Record what was ingested, prompt plus reply, so the next request
+     * can extend it rather than starting over. */
+    sb_clear(&e->last_prompt);
+    sb_puts(&e->last_prompt, prompt);
+    sb_add(&e->last_prompt, text.data, text.len);
 
     perf_end(&pr, n_gen);
     perf_report(&pr, chat ? "chat.completion" : "text_completion");
@@ -878,8 +900,13 @@ static void handle_request(engine *e, net_conn *c, http_req *r) {
                     sb_free(&prompt);
 
                     if (!agent_parse_tool_call(reply.data, &tname, &targs)) {
+                        /* A normal answer: fall through and emit it
+                         * below. The final render is re-generated, but
+                         * the prompt-prefix cache makes that second
+                         * pass nearly free -- it is the same prompt, so
+                         * every token but the last is reused. */
                         sb_free(&reply);
-                        break;             /* a normal answer: emit it below */
+                        break;
                     }
 
                     if (inf_verbose) {
@@ -967,6 +994,7 @@ int server_run(qwen35_model *model, const server_config *cfg) {
     e.tok   = qwen35_tokenizer(model);
     e.ctx   = qwen35_ctx_create(model, &qp);
     e.mcp   = agent_connect_mcp(cfg->opts->mcp_url, 0);
+    sb_init(&e.last_prompt);
 
     inf_log("listening on http://%s:%d",
             (cfg->opts->host && cfg->opts->host[0]) ? cfg->opts->host
@@ -1013,6 +1041,7 @@ int server_run(qwen35_model *model, const server_config *cfg) {
     }
 
     inf_log("shutting down");
+    sb_free(&e.last_prompt);
     if (e.mcp) mcp_free(e.mcp);
     qwen35_ctx_free(e.ctx);
     net_listener_close(l);

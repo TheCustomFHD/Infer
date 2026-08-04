@@ -70,6 +70,9 @@ int main(int argc, char **argv) {
 #ifdef INFER_HAVE_MMX
         names[nb++] = "mmx";
 #endif
+#ifdef INFER_HAVE_VIS
+        names[nb++] = "vis";
+#endif
 
         for (bi = 0; bi < nb; bi++) {
             clock_t t0, t1;

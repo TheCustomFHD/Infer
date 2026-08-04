@@ -69,10 +69,10 @@ make all
 ls -1 infer-*
 ```
 ```
-infer-1.12.2-linux
-infer-1.12.2-linux-profile
-infer-1.12.2-windows-profile.exe
-infer-1.12.2-windows.exe
+infer-1.14.0-linux
+infer-1.14.0-linux-profile
+infer-1.14.0-windows-profile.exe
+infer-1.14.0-windows.exe
 ```
 
 Four binaries, no more. There is no separate MMX or i486 build: all four

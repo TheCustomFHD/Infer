@@ -57,6 +57,28 @@ int agent_parse_tool_call(const char *text, char **name, strbuf *args_json);
 int agent_run_tool(const agent_config *cfg, const char *name,
                    const char *args_json, strbuf *out);
 
+/* Tokenise `prompt` so that any prefix shared with `prev` produces
+ * exactly the tokens `prev` produced last time.
+ *
+ * Re-tokenising a whole prompt does not do this. Byte-level BPE merges
+ * greedily, so text the model *generated* as several tokens can merge
+ * into one when it reappears inside a longer string -- "\n" (198)
+ * becomes part of "\n\n\n\n" (14200). The token IDs then differ even
+ * though the text is identical, and a prefix cache never hits.
+ *
+ * Splitting at the boundary and tokenising the two parts separately
+ * keeps the prefix stable, which is what makes the cache useful in
+ * chat. The cost is that the boundary token may differ from what a
+ * single tokenise would produce; that is a real tradeoff and is why
+ * this is only used where a cache hit is possible.
+ *
+ * Returns the token count, writes into `out` (capacity `max`).
+ * `prev`/`prev_len` may be NULL/0 for the first call. */
+int agent_tokenize_incremental(tokenizer *tok,
+                               const char *prompt,
+                               const char *prev, size_t prev_len,
+                               int *out, int max, int *n_shared_out);
+
 /* Connect to an MCP server and print what it offers. Returns NULL on
  * failure, having already explained why -- callers continue without
  * tools rather than aborting. */

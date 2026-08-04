@@ -151,6 +151,12 @@ struct qwen35_ctx {
     float *ssm_state;      /* [slots][n_v_heads][hd][hd]        */
 
     int pos_max;
+
+    /* Tokens already ingested, in order. Lets a later prompt that
+     * extends this one skip re-processing the shared prefix; see
+     * qwen35_reuse_prefix(). */
+    int   *hist;
+    int    n_hist;
 };
 
 /* ------------------------------------------------------------------ */
@@ -450,6 +456,9 @@ qwen35_ctx *qwen35_ctx_create(qwen35_model *m, const qwen35_params *p) {
     }
 
     /* recurrent state */
+    c->hist = (int *) xcalloc((size_t) p->n_ctx, sizeof(int));
+    c->n_hist = 0;
+
     c->conv_state = (float *) xcalloc(
         (size_t) c->n_recr_layers * (size_t) conv_dim *
         (size_t) (hp->ssm_conv - 1), sizeof(float));
@@ -471,6 +480,7 @@ void qwen35_ctx_free(qwen35_ctx *c) {
     free(c->betav); free(c->alphav); free(c->kv_delta);
     free(c->attn_slot); free(c->recr_slot);
     free(c->kcache); free(c->vcache);
+    free(c->hist);
     free(c->conv_state); free(c->ssm_state);
     free(c);
 }
@@ -489,6 +499,7 @@ void qwen35_reset(qwen35_ctx *c) {
            (size_t) c->n_recr_layers * (size_t) hp->ssm_dt_rank *
            (size_t) hd * (size_t) hd * sizeof(float));
     c->pos_max = 0;
+    c->n_hist  = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -768,6 +779,67 @@ static void layer_ffn(qwen35_ctx *c, layer *L) {
 /* One decode step                                                     */
 /* ------------------------------------------------------------------ */
 
+/* How much of `toks` is already in the context, and can be skipped?
+ *
+ * This is what makes multi-turn chat affordable: turn N+1's prompt is
+ * usually turn N's prompt plus the reply plus a new message, so almost
+ * all of it has been through the network already.
+ *
+ * The catch is the architecture. Only 6 of the 24 layers are attention
+ * layers with a position-indexed KV cache that could be truncated at
+ * will. The other 18 are Gated DeltaNet: a recurrent state that has
+ * absorbed every token ever fed in, in order, and **cannot be rewound**.
+ * Snapshotting it per token is not an option either -- at
+ * n_v_heads * 128 * 128 floats per layer it is about 18 MB per token.
+ *
+ * So the rule is all-or-nothing: a prefix is reusable only if the
+ * entire history is a prefix of the new prompt. That covers the
+ * append-only case, which is the one that matters, and anything else
+ * (an edited message, /forget, a different conversation) resets and
+ * re-ingests, which is exactly what happened before this existed.
+ *
+ * Returns the number of leading tokens the caller may skip. The caller
+ * must still decode from that index onward, and must still feed the
+ * skipped tokens to the sampler so repetition penalty stays correct. */
+int qwen35_reuse_prefix(qwen35_ctx *c, const int *toks, int n) {
+    int i, common = 0, limit;
+
+    if (!toks || n <= 0) { qwen35_reset(c); return 0; }
+
+    /* Compare against the whole history first: the recurrent state is
+     * only valid if every token it absorbed is still a prefix here. */
+    limit = c->n_hist < n ? c->n_hist : n;
+    for (i = 0; i < limit && toks[i] == c->hist[i]; i++) common++;
+
+    if (common != c->n_hist) {
+        if (inf_verbose) {
+            inf_log("prompt cache: miss at token %d of %d "
+                    "(had %d, got %d) -- reprocessing",
+                    common, n,
+                    common < c->n_hist ? c->hist[common] : -1,
+                    common < n ? toks[common] : -1);
+        }
+        /* Diverged, or the history is longer than this prompt. Either
+         * way the DeltaNet state has absorbed tokens that are not in
+         * the new sequence and cannot be rewound. */
+        qwen35_reset(c);
+        return 0;
+    }
+
+    /* Leave at least one token to decode: the caller needs a forward
+     * pass to obtain logits. Trimming by one here is safe -- the KV
+     * cache is position-indexed so re-decoding a position overwrites
+     * it, and the DeltaNet state simply absorbs that token again,
+     * which is exactly what a fresh run would do at this point.
+     *
+     * The trimmed token is the only one that gets fed twice, and
+     * because it is re-fed at the same position with the same
+     * predecessors, the result is identical -- asserted by
+     * tests/t_cache.c. */
+    if (common >= n) common = n - 1;
+    return common;
+}
+
 float *qwen35_decode(qwen35_ctx *c, int token, int pos, int want_logits) {
     qwen35_model *m = c->m;
     hparams *hp = &m->hp;
@@ -815,6 +887,12 @@ float *qwen35_decode(qwen35_ctx *c, int token, int pos, int want_logits) {
     }
 
     if (pos + 1 > c->pos_max) c->pos_max = pos + 1;
+
+    /* Remember what was fed in, so a later prompt can reuse the prefix. */
+    if (pos >= 0 && pos < c->n_ctx) {
+        c->hist[pos] = token;
+        if (pos + 1 > c->n_hist) c->n_hist = pos + 1;
+    }
 
     if (!want_logits) {
         PROF_STOP(ptot, PF_TOTAL, 0);

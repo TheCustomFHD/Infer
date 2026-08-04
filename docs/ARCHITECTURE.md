@@ -179,6 +179,29 @@ Two rules are load-bearing, and both were bugs first:
 The only reliable test for a template engine is byte-comparison against
 Python. See [TEMPLATES.md](TEMPLATES.md).
 
+### Prompt-prefix reuse
+
+`qwen35_reuse_prefix()` lets `chat` and `serve` skip re-decoding a
+prompt they have already seen the start of.
+
+The hybrid architecture constrains this hard. The 6 attention layers
+have a position-indexed KV cache that could be truncated anywhere; the
+18 DeltaNet layers have a recurrent state that absorbed every token in
+order and **cannot be rewound**, and snapshotting it costs ~18 MB per
+token. So reuse is all-or-nothing: the whole history must be a prefix of
+the new prompt, or the context resets.
+
+Two things make it work in practice:
+
+* the sampler is still fed every token, because repetition penalty is
+  computed over the full sequence;
+* `agent_tokenize_incremental()` tokenises the shared prefix separately,
+  because byte-level BPE would otherwise assign different IDs to
+  identical text (see finding 21).
+
+`tests/t_cache.c` asserts that an incremental decode produces
+bit-identical logits to a fresh one.
+
 ### Interfaces (`opts.c`, `agent.c`, `main.c`, `server.c`, `chat.c`)
 
 The front ends are thin because two modules hold what they share:

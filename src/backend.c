@@ -522,6 +522,10 @@ static int mmx_ok(void) { return bk_cpu_has_mmx(); }
 #endif
 
 static const bk_backend backends[] = {
+#ifdef INFER_HAVE_VIS
+    { "vis", "integer kernels with VIS 1 inner loop (UltraSPARC)",
+      bk_vis_available, bk_qmv_vis },
+#endif
 #ifdef INFER_HAVE_MMX
     { "mmx", "integer kernels with MMX inner loop (Pentium MMX / K6 / Geode+)",
       mmx_ok, qmv_mmx },
@@ -591,9 +595,9 @@ void bk_print_list(FILE *f) {
                 backends[i].desc,
                 &backends[i] == cur ? "   <- selected" : "");
     }
-#ifndef INFER_HAVE_MMX
-    fprintf(f, "\n  (this binary was built without the MMX backend;\n"
-               "   rebuild with `make geode` or -DINFER_HAVE_MMX to include it)\n");
+#if !defined(INFER_HAVE_MMX) && !defined(INFER_HAVE_VIS)
+    fprintf(f, "\n  (this binary has no SIMD backend compiled in;\n"
+               "   rebuild with `make linux` (MMX) or `make solaris-vis`)\n");
 #endif
 }
 

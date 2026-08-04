@@ -28,7 +28,7 @@
 typedef double gg_off;
 
 #ifndef INFER_VERSION
-#define INFER_VERSION "1.12.2"
+#define INFER_VERSION "1.14.0"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -275,6 +275,14 @@ void          qwen35_reset(qwen35_ctx *c);
 /* Run one token through the network at absolute position `pos`.
  * Returns a pointer to the logits array (n_vocab floats), owned by ctx.
  * Pass want_logits=0 during prompt ingestion to skip the LM head. */
+/* Length of the leading run of `toks` already present in the context,
+ * which the caller may skip re-decoding. Resets the context and returns
+ * 0 when the prompt is not an extension of what was ingested before.
+ *
+ * The skipped tokens still have to be handed to the sampler; only the
+ * forward passes are avoided. */
+int           qwen35_reuse_prefix(qwen35_ctx *c, const int *toks, int n);
+
 float        *qwen35_decode(qwen35_ctx *c, int token, int pos, int want_logits);
 int           qwen35_n_ctx(qwen35_ctx *c);
 

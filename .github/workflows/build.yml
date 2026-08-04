@@ -1,14 +1,46 @@
 name: build
 
-# Runs on every push and pull request. Builds all four x86 targets,
-# runs the test suite, and asserts the platform guarantees that are
-# easy to break silently: the i486 baseline, the three-DLL Windows
-# import table, byte-order neutrality, and the option matrix.
+# One workflow, two jobs.
 #
-# The version is read from `make version` rather than hardcoded, so
-# bumping VERSION in the Makefile does not break CI.
+#   build     runs on every push and pull request. Builds all four x86
+#             targets, runs the tests, asserts the platform guarantees,
+#             and uploads the binaries as an artifact you can download
+#             from the Actions tab.
+#
+#   release   runs ONLY for a tag like v1.14.0. It does not rebuild --
+#             it downloads the artifact the `build` job just verified,
+#             packages it with checksums, and publishes a GitHub
+#             Release.
+#
+# Keeping them in one file with `needs: build` means the build and
+# verification logic exists exactly once, and a release can only ever
+# contain binaries that passed CI. Two separate workflows would have
+# duplicated the verify block, and the two copies would drift.
+#
+# ---------------------------------------------------------------------
+# TO CUT A RELEASE
+# ---------------------------------------------------------------------
+#
+#   1. Bump the version in BOTH places (make checkversion asserts this):
+#        src/infer.h   #define INFER_VERSION "1.14.0"
+#        Makefile      VERSION = 1.14.0
+#
+#   2. git commit -am "1.14.0"
+#      git tag v1.14.0
+#      git push && git push --tags
+#
+# The tag must match VERSION. The workflow fails loudly if it does not,
+# because a release whose tag and binaries disagree is worse than none.
+#
+# The version is read from `make version`, never hardcoded, so bumping
+# it cannot break this file.
 
-on: [push, pull_request]
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,6 +48,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,14 +68,25 @@ jobs:
         id: v
         run: |
           V=$(make version)
-          echo "version=$V"                             >> "$GITHUB_OUTPUT"
-          echo "LINUX=infer-$V-linux"                   >> "$GITHUB_ENV"
-          echo "LINUX_P=infer-$V-linux-profile"         >> "$GITHUB_ENV"
-          echo "WIN=infer-$V-windows.exe"               >> "$GITHUB_ENV"
-          echo "WIN_P=infer-$V-windows-profile.exe"     >> "$GITHUB_ENV"
+          echo "version=$V"                         >> "$GITHUB_OUTPUT"
+          echo "LINUX=infer-$V-linux"               >> "$GITHUB_ENV"
+          echo "LINUX_P=infer-$V-linux-profile"     >> "$GITHUB_ENV"
+          echo "WIN=infer-$V-windows.exe"           >> "$GITHUB_ENV"
+          echo "WIN_P=infer-$V-windows-profile.exe" >> "$GITHUB_ENV"
 
       - name: Makefile VERSION matches src/infer.h
         run: make checkversion
+
+      - name: tag matches VERSION (tagged builds only)
+        if: github.ref_type == 'tag'
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          V=$(make version)
+          echo "tag=$TAG  makefile=$V"
+          if [ "$TAG" != "$V" ]; then
+            echo "::error::tag v$TAG does not match VERSION $V"
+            exit 1
+          fi
 
       - name: confirm the win32 (not posix) mingw variant
         run: |
@@ -57,6 +102,7 @@ jobs:
               | grep -ci 'libwinpthread' || true)
           echo "libwinpthread imports: $n (want 0)"
           test "$n" -eq 0
+
       - name: build all four x86 targets
         run: |
           make all
@@ -119,6 +165,7 @@ jobs:
             src/tokenizer.c src/sampler.c src/quant.c src/backend.c \
             src/gguf.c src/json.c src/util.c src/prof.c \
             src/net_posix.c src/sys_posix.c -lm
+          rm -f t_endian_be infer_be
 
       - name: strict C90, no long long, with large-file support
         run: |
@@ -167,7 +214,7 @@ jobs:
           test ! -f templates/qwen-fixed-v21.3.jinja
           ls templates/
 
-      - name: upload build artifacts
+      - name: upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: infer-${{ steps.v.outputs.version }}-binaries
@@ -177,3 +224,93 @@ jobs:
             infer-*-linux-profile
             infer-*-windows.exe
             infer-*-windows-profile.exe
+
+  # -------------------------------------------------------------------
+  # Only for tags. Publishes what `build` already verified -- it does
+  # not rebuild, so the released binaries are byte-for-byte the ones
+  # that passed every check above.
+  # -------------------------------------------------------------------
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download the verified binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: infer-${{ needs.build.outputs.version }}-binaries
+          path: bin
+
+      - name: assemble the release
+        env:
+          VER: ${{ needs.build.outputs.version }}
+        run: |
+          mkdir -p "release/infer-$VER"
+          cp bin/* "release/infer-$VER/"
+          chmod +x "release/infer-$VER"/infer-*-linux*
+          cp CHANGELOG.md LICENSE "release/infer-$VER/"
+          cp .github/RELEASE-README.txt "release/infer-$VER/README-BINARIES.txt"
+          ( cd "release/infer-$VER" && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+          ( cd release && zip -9 -rX "../infer-$VER-binaries.zip" "infer-$VER" )
+
+          # git archive packages the tagged COMMIT. Confirm that commit
+          # really carries this version -- tagging before committing a
+          # version bump would otherwise ship a source zip whose
+          # infer.h disagrees with the binaries beside it.
+          git archive --format=zip --prefix="infer-$VER/" \
+            -o "infer-$VER-source.zip" HEAD
+          ARCHV=$(git show HEAD:src/infer.h \
+                  | sed -n 's/^#define INFER_VERSION "\(.*\)"/\1/p')
+          echo "version in the tagged commit: $ARCHV"
+          if [ "$ARCHV" != "$VER" ]; then
+            echo "::error::tagged commit has INFER_VERSION=$ARCHV, expected $VER."
+            echo "::error::Commit the version bump before tagging."
+            exit 1
+          fi
+          ls -l "infer-$VER-binaries.zip" "infer-$VER-source.zip"
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: infer ${{ needs.build.outputs.version }}
+          generate_release_notes: true
+          files: |
+            infer-${{ needs.build.outputs.version }}-binaries.zip
+            infer-${{ needs.build.outputs.version }}-source.zip
+          body: |
+            ## infer ${{ needs.build.outputs.version }}
+
+            Four binaries. Two platforms, two options each: with or
+            without the profiler.
+
+            | file | notes |
+            |---|---|
+            | `infer-${{ needs.build.outputs.version }}-windows.exe` | Windows XP and later |
+            | `infer-${{ needs.build.outputs.version }}-windows-profile.exe` | ...with per-stage timers |
+            | `infer-${{ needs.build.outputs.version }}-linux` | Linux, 32-bit x86 |
+            | `infer-${{ needs.build.outputs.version }}-linux-profile` | ...with per-stage timers |
+
+            **All four contain all three backends** (`mmx`, `i8`, `ref`)
+            and pick the fastest the CPU supports at run time. **All four
+            use an i486 baseline**, so one binary runs on a 486 and
+            accelerates on anything with MMX.
+
+            The Windows binaries import exactly three DLLs — KERNEL32,
+            msvcrt, WS2_32 — all present on a stock XP install.
+
+            These are the exact binaries the CI job verified: 0 CMOV in
+            our code, MMX kernels present, three DLLs, all backends
+            agreeing under greedy decoding. `SHA256SUMS` is inside the
+            zip.
+
+            No model weights and no third-party chat templates are
+            bundled; see `README-BINARIES.txt`.
+
+            SPARC/Solaris is not shipped as a binary — build it with
+            `gmake solaris`. See `COMPILE.md`.
+
+            See `CHANGELOG.md` for what changed.

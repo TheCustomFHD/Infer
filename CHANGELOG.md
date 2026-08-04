@@ -1,5 +1,204 @@
 # Changelog
 
+## 1.14.0 — VIS backend for UltraSPARC
+
+A fourth compute backend, `vis`, using the UltraSPARC Visual Instruction
+Set. Opt-in and separate from everything x86, exactly as `mmx` is.
+
+```sh
+gmake solaris-vis          # Sun Studio
+gmake solaris-gcc-vis      # GCC
+gmake solaris-vis-test     # prove the assumptions before trusting it
+```
+
+### The trick that makes it work
+
+VIS is a *graphics* instruction set, and its partitioned multiply is
+defined for pixel blending:
+
+```
+fmul8x16(u8 a, s16 b)  ->  (a * b + 0x80) >> 8
+```
+
+Taken at face value that is useless here. Our products are tiny — a
+Q4_K nibble times an int8 activation is at most 15 x 127 = 1905 — so
+a `>> 8` would discard nearly everything.
+
+But the shift can be cancelled. Pre-shift the activation left by 8:
+
+```
+fmul8x16(w, x << 8) = (w * (x << 8) + 0x80) >> 8 = w * x
+```
+
+**exactly**, with no rounding error, as long as `x << 8` fits a signed
+16-bit lane. Activations are quantised to [-127, 127], so `x << 8`
+spans [-32512, 32512] and fits.
+
+Verified exhaustively on the target: all 16320 combinations of weight
+0..63 against activation -127..127, zero mismatches. `tests/t_vis.c`
+re-runs that check on any new machine, and needs no model.
+
+The pay-off is that a graphics instruction becomes an exact four-lane
+integer multiply — the same width as MMX's `pmaddwd` — instead of
+falling back to `fmuld8ulx16` at two lanes.
+
+### Accumulator bounds
+
+Products stay in 16-bit lanes, so each format can only take so many
+terms before overflow. The kernels are written to these limits:
+
+| format | max weight | terms per lane |
+|---|---|---|
+| Q4_K | 15 | 16 (16 x 15 x 127 = 30480) |
+| Q5_K | 31 | 8 (8 x 31 x 127 = 31496) |
+| Q6_K | 32 | 8 (8 x 32 x 127 = 32512) |
+
+Widening to 32 bits uses `fmuld8ulx16` against a constant 1, which is
+an exact two-lane 16→32 expansion and avoids an unpack VIS does not
+have.
+
+### Written for the pipeline, from the datasheet
+
+UltraSPARC-II/IIi (Sun STP1031): 4-way superscalar, **two graphics
+execution units**, the FPU issues two instructions per cycle, most VIS
+ops are fully pipelined at throughput 1 and **latency 3**, and there
+are **32 FP registers**.
+
+Two consequences shaped the code. Latency 3 at throughput 1 means one
+dependent accumulator chain runs at a third of peak, so the kernels keep
+four independent accumulators and fold only at the end. And 32 registers
+is why this is worth doing at all: the equivalent multi-row kernel on
+MMX measured **0.90x — slower** — because with 8 registers only three
+scratch remained and weights were re-loaded four times. That constraint
+does not exist here. There is also no `EMMS`; VIS shares the FP register
+file.
+
+### Two bugs found while building it, both silent
+
+**Vectors were spilling to the stack.** Building a vector element by
+element (`v[0]=..; v[1]=..`) looks equivalent to a load but compiles to
+four scalar stores and a reload. The first kernel did 124 memory
+operations for 8 multiplies — spilling straight past the register file
+the whole design depends on. Fixed by loading through a union of the
+vector type and a 64-bit integer: 752 → 568 instructions.
+
+**A cache that always hit.** `xs_prepare()` cached the pre-shifted
+activations keyed on `(xq->q, xq->n)`, assuming consecutive matvecs in a
+layer share an activation vector. But `bk_quantize_x()` returns a
+pointer into a single *static* buffer, so `xq->q` is the same address
+every call while the contents change underneath. The cache always hit
+and every matvec after the first used stale data.
+
+It passed `t_backend` — which calls matvec once per tensor — and
+produced fluent-looking garbage in real generation. The cache is gone;
+the shift is ~0.1% of the work for a 1024x1024 matrix and not worth
+risking correctness for.
+
+### Verified
+
+* `t_vis`: 16320 exactness checks, lane ordering, accumulator bounds
+* `t_backend` on SPARC: `rel-l2` and `max-rel` **bit-identical to i8**
+  for both Q4_K and Q5_K
+* end to end: `vis` and `i8` produce the same text under greedy
+  decoding — `The capital of France is **Paris**.`
+* x86 targets untouched; all four still build with zero warnings and
+  every test passes
+
+### Honest limits
+
+Q6_K, Q8_0 and Q4_0 have no VIS kernel yet and fall through to the
+portable `i8` path, so correctness is never at risk from a missing
+kernel. Q6_K is 27% of runtime and is the obvious next target; its -32
+bias makes weights signed, which needs care with `fmul8x16`'s unsigned
+first operand.
+
+**No speedup is claimed.** Everything above was measured under
+emulation, which models VIS semantics but not timing. A marginal-cost
+comparison under qemu put `vis` at 0.40x the work of `i8`, but this
+project has a documented history of emulated and isolated measurements
+being wrong by 2-3x in both directions. The number that matters is a
+profile from real hardware:
+
+```sh
+gmake solaris-vis-profile
+./infer-1.14.0-solaris-profile run model.gguf \
+    -p "The capital of France is" -n 10 -t 0 --seed 1 -c 512 \
+    --backend vis --log-perf --log-stages --log-file sparc-vis.txt
+```
+
+---
+
+## 1.13.0 — prompt-prefix cache
+
+`chat` and `serve` re-render the whole conversation every turn, then
+pushed all of it through the network again. The engine already had a KV
+cache; what it lacked was any way to say "you have seen this prefix
+before".
+
+`qwen35_reuse_prefix()` adds that. On a hit the caller skips the shared
+tokens entirely and decodes only what is new.
+
+### The constraint that shapes the design
+
+Only 6 of the 24 layers are attention layers with a position-indexed KV
+cache that could be truncated at will. The other **18 are Gated
+DeltaNet**: a recurrent state that has absorbed every token in order and
+**cannot be rewound**. Snapshotting per token is not an option either —
+at n_v_heads x 128 x 128 floats per layer that is roughly 18 MB per
+token.
+
+So reuse is all-or-nothing: the entire history must be a prefix of the
+new prompt. Anything else resets, which is exactly the old behaviour.
+
+`tests/t_cache.c` asserts the property that matters — a prompt decoded
+incrementally produces **bit-identical logits** to one decoded fresh
+(max difference 0.000e+00) — plus the rejection cases: an edited
+history, a shorter prompt, and a reset all correctly refuse to reuse.
+
+### Tokenisation had to change too
+
+The first working version still never hit in chat. The cause is worth
+recording: byte-level BPE merges greedily, so text the model *generated*
+as several tokens merges differently when it reappears inside a longer
+string. `"\n"` (198) becomes part of `"\n\n\n\n"` (14200) — identical
+text, different token IDs, cache never hits.
+
+`agent_tokenize_incremental()` fixes this by splitting at the previous
+prompt's boundary and tokenising the two parts separately, so the shared
+prefix keeps byte-identical IDs.
+
+### What it actually buys
+
+Measured on `/v1/completions` with an appending prompt: **15 of 19
+tokens reused**, then 23 of 26. That is the case it was built for and it
+works.
+
+**Chat with the stock Qwen template does not hit**, and this is not a
+bug in the cache. The template rewrites history between turns: a reply
+generated as `<think>...</think>Hello` is re-rendered on the next turn
+as just `Hello`. The token sequences genuinely differ, so resetting is
+correct. Verified by dumping both prompts and diffing them.
+
+The cache therefore helps:
+
+* `/v1/completions` and any appending workload — fully;
+* agentic loops that append tool results without rewriting history;
+* chat with a template that does not rewrite history;
+* the server's own tool loop, where the same prompt is rendered twice.
+
+and does nothing for stock-template chat. Stated plainly rather than
+claimed as a general speedup.
+
+### Also
+
+* `-v` reports `prompt cache: reused N of M tokens` on a hit, and on a
+  miss says which token diverged — the diagnostic that found the BPE
+  problem above.
+* MCP tool loop re-verified end to end with the cache active: correct
+  answer, arguments intact.
+
+---
+
 ## 1.12.2 — working CI, automatic release builds, agent guidance
 
 ### CI was broken in two ways
@@ -25,8 +224,17 @@ Every step was then executed locally, verbatim, before committing.
 
 ### Automatic release builds
 
-`.github/workflows/release.yml` builds the four shipped binaries and
-attaches them to a GitHub Release:
+One workflow, two jobs. `build` runs on every push; `release` runs only
+for a `v*` tag, and instead of rebuilding it **downloads the artifact
+`build` just verified**. The released binaries are therefore
+byte-for-byte the ones that passed every check.
+
+A second workflow file was tried first and discarded: it duplicated the
+toolchain setup and the whole verify block, and two copies of a
+verification list drift. `needs: build` expresses the real dependency
+and keeps the logic in one place.
+
+To cut a release:
 
 ```sh
 git commit -am "1.12.2"
@@ -36,17 +244,23 @@ git push && git push --tags
 
 That is the whole procedure. The workflow:
 
-* asserts the tag matches `VERSION` (a release whose tag and binaries
-  disagree is worse than no release),
-* runs `make checkversion`, the test suite, and the platform guarantees
-  — 0 CMOV, MMX present, exactly 3 DLLs, PE32 — **before** publishing,
-* ships `infer-<version>-binaries.zip` with `SHA256SUMS`, plus a source
-  archive from `git archive`,
-* can be run by hand from the Actions tab, which produces a **draft**
-  release you can inspect first.
+Guards, each of which exists because the failure is silent otherwise:
 
-`build.yml` also uploads the four binaries as artifacts on every push,
-so you can grab a build without cutting a release.
+* the tag must match `VERSION` — a release whose tag and binaries
+  disagree is worse than no release;
+* `make checkversion` — the Makefile and `src/infer.h` must agree;
+* **the tagged commit must carry that version** — `git archive` packages
+  the commit, so tagging before committing a version bump would ship a
+  source zip whose `infer.h` contradicts the binaries next to it;
+* the full test suite and platform checks run before anything is
+  published.
+
+The release ships `infer-<version>-binaries.zip` with `SHA256SUMS`, plus
+a source archive. Artifacts lose the executable bit, so the job restores
+it before packaging.
+
+Every push also uploads the four binaries as a downloadable artifact, so
+you can grab a build without cutting a release.
 
 ### Agent guidance
 

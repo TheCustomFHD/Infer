@@ -97,7 +97,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.12.2
+VERSION = 1.14.0
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -118,6 +118,8 @@ help:
 	@echo "make solaris            Solaris/SPARC, Sun Studio, 64-bit"
 	@echo "make solaris-profile    ...plus per-stage timers"
 	@echo "make solaris-gcc        Solaris/SPARC, GCC, 64-bit"
+	@echo "make solaris-vis        Solaris/SPARC + VIS kernels (Sun Studio)"
+	@echo "make solaris-gcc-vis    Solaris/SPARC + VIS kernels (GCC)"
 	@echo ""
 	@echo "make test / bench / clean / version / checkversion"
 
@@ -217,6 +219,11 @@ windows-profile: $(CORE) $(WIN32) $(MMXSRC) $(HDRS)
 #   -xvis   Enables VIS *intrinsics*. There is no VIS code in this
 #           project, so it does nothing. Harmless, just pointless.
 
+# VIS backend. Opt-in until measured on real hardware, exactly as the
+# MMX backend is on x86. Correctness is never at risk: formats without
+# a VIS kernel fall through to the portable i8 path.
+VISSRC    = $(SRCDIR)/backend_vis.c
+
 SUNCC     = cc
 SUNTARGET = native
 SUNOPT    = -xO5 -xunroll=16
@@ -251,6 +258,29 @@ solaris-fast: $(CORE) $(POSIX)
 
 # Solaris make has no pattern rules we can rely on, so these are spelled
 # out rather than sharing the rules below.
+# ---------------------------------------------------------------------
+# VIS builds. -xarch=v9a (Sun Studio) / -mcpu=ultrasparc -mvis (GCC)
+# select the VIS 1 instruction set, present on every UltraSPARC.
+# ---------------------------------------------------------------------
+solaris-vis: $(CORE) $(POSIX) $(VISSRC)
+	$(SUNCC) $(SUNFLAGS) -xarch=v9a -DINFER_HAVE_VIS \
+		-o $(BIN)-solaris $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
+
+solaris-vis-profile: $(CORE) $(POSIX) $(VISSRC)
+	$(SUNCC) $(SUNFLAGS) -xarch=v9a -DINFER_HAVE_VIS -DINFER_PROFILE \
+		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
+
+solaris-gcc-vis: $(CORE) $(POSIX) $(VISSRC)
+	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+		-m64 -mcpu=ultrasparc -mvis -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 \
+		-o $(BIN)-solaris $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
+
+solaris-gcc-vis-profile: $(CORE) $(POSIX) $(VISSRC)
+	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+		-m64 -mcpu=ultrasparc -mvis -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 \
+		-DINFER_PROFILE \
+		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
+
 solaris-test: $(CORE) $(POSIX)
 	@mkdir -p $(BUILD)
 	$(SUNCC) $(SUNFLAGS) -o $(BUILD)/t_endian tests/t_endian.c \
@@ -265,6 +295,19 @@ solaris-test: $(CORE) $(POSIX)
 		$(SRCDIR)/sys_posix.c $(SOLLIBS)
 	@echo "run: ./$(BUILD)/t_endian [model.gguf]"
 
+# VIS assumptions. Run this FIRST on any new SPARC box: it proves the
+# exactness trick the kernels depend on, and needs no model.
+solaris-vis-test: tests/t_vis.c
+	@mkdir -p $(BUILD)
+	$(SUNCC) -Xc -xc99=none -xO3 -m64 -xarch=v9a -DINFER_HAVE_VIS \
+		-o $(BUILD)/t_vis tests/t_vis.c
+	$(SUNCC) $(SUNFLAGS) -xarch=v9a -DINFER_HAVE_VIS \
+		-o $(BUILD)/t_backend tests/t_backend.c \
+		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
+		$(VISSRC) $(SRCDIR)/util.c $(SRCDIR)/prof.c \
+		$(SRCDIR)/sys_posix.c $(SOLLIBS)
+	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_backend model.gguf"
+
 # =====================================================================
 #  Tests
 # =====================================================================
@@ -273,7 +316,7 @@ TESTFLAGS = -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2
 
 test: $(BUILD)/t_quant $(BUILD)/t_tokenizer $(BUILD)/t_engine \
       $(BUILD)/t_backend $(BUILD)/t_align $(BUILD)/t_jinja \
-      $(BUILD)/t_agent $(BUILD)/t_endian
+      $(BUILD)/t_agent $(BUILD)/t_endian $(BUILD)/t_cache
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -331,6 +374,13 @@ $(BUILD)/t_endian: tests/t_endian.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_endian.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+
+# Prompt-prefix reuse must be exactly equivalent to recomputing.
+$(BUILD)/t_cache: tests/t_cache.c | $(BUILD)
+	$(CC) $(TESTFLAGS) -o $@ tests/t_cache.c \
+		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
+		$(SRCDIR)/qwen35.c $(SRCDIR)/sys_posix.c $(LDLIBS)
 
 bench: $(BUILD)/t_backend
 	@echo "run: ./$(BUILD)/t_backend <model.gguf>"

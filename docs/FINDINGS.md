@@ -392,6 +392,112 @@ should say so.
 
 ---
 
+## 21. A prompt cache that can never hit, because BPE re-merges
+
+The prefix cache worked in unit tests and on `/v1/completions`, and
+never once hit in chat. The diagnostic said it diverged at token 9:
+history had `198`, the new prompt had `14200`.
+
+Both decode to the same text. `198` is `"\n"`; `14200` is `"\n\n\n\n"`.
+
+The model *generated* four newlines as four separate tokens, because it
+emits one token at a time. When that same text is re-tokenised as part
+of the next prompt, byte-level BPE merges it greedily into one. Identical
+characters, different token IDs, no cache hit — ever.
+
+The fix is to tokenise the known-shared prefix separately from the new
+remainder, so the prefix reproduces exactly the IDs it had last time.
+
+The general shape: **a cache keyed on tokens is keyed on a lossy
+encoding of the text.** Anything that re-encodes can silently break it,
+and it fails as a permanent miss rather than a wrong answer, so nothing
+draws attention to it.
+
+## 22. The cache still cannot help stock-template chat
+
+Even with tokenisation fixed, chat misses — and correctly so. The Qwen
+chat template rewrites history between turns: a reply generated as
+
+```
+<think>...</think>Hello! How can I help
+```
+
+is re-rendered on the *next* turn as
+
+```
+Hello! How can I help
+```
+
+with the think block stripped. The token sequence for turn N is
+therefore not a prefix of turn N+1's, and the recurrent state that
+absorbed the think tokens cannot be rewound.
+
+This is a property of the template, not of the cache, and it means the
+cache helps `/v1/completions`, agentic append-only loops, and templates
+that preserve history — but not stock-template chat. Worth stating
+plainly instead of quoting an average speedup that would not
+materialise.
+
+---
+
+## 23. A graphics instruction made exact
+
+VIS has no integer multiply-accumulate. Its partitioned multiply is
+built for pixel blending and scales the result:
+
+```
+fmul8x16(u8 a, s16 b) -> (a * b + 0x80) >> 8
+```
+
+Our products are at most 15 x 127 = 1905, so `>> 8` would leave almost
+nothing. The instruction looks unusable.
+
+It is not, because the shift can be cancelled on the way in. Pre-shift
+the activation by 8 and the scaling exactly undoes itself:
+
+```
+fmul8x16(w, x << 8) = (w * (x << 8) + 0x80) >> 8 = w * x
+```
+
+with no rounding error at all, provided `x << 8` fits a signed 16-bit
+lane — and quantised activations span only [-127, 127], so it does.
+
+Verified exhaustively on the target hardware semantics: 16320
+combinations, zero mismatches.
+
+The lesson generalises: an instruction whose *documented* behaviour is
+wrong for your problem may still be exactly right after an algebraic
+change of variables. Read the definition, not the name.
+
+## 24. A cache that could only ever hit
+
+The VIS backend pre-shifts activations once per matvec. An obvious
+optimisation is to skip that when the activation vector has not
+changed, keyed on its pointer and length:
+
+```c
+if (xs_src == xq->q && xs_n == xq->n) return;
+```
+
+`bk_quantize_x()` returns a pointer into a single **static** buffer. So
+`xq->q` is the same address on every call while the contents change
+underneath. The condition was true every time after the first, and
+every matvec but the first used stale activations.
+
+It passed `t_backend`, which calls matvec once per tensor with one
+activation vector, and produced fluent-looking nonsense in real
+generation.
+
+Two things worth keeping:
+
+* **Caching on a pointer identity requires that the pointer identifies
+  the contents.** For a reused scratch buffer it identifies nothing.
+* A test that exercises a function *once* cannot detect state that goes
+  stale between calls. The bug lived in the gap between a unit test and
+  an end-to-end run, which is exactly where caching bugs live.
+
+---
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

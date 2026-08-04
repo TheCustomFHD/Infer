@@ -1,6 +1,6 @@
 # `tests/` — the test suite
 
-`make test` builds all eight into `build/`.
+`make test` builds all nine into `build/`, plus `t_vis` on SPARC.
 
 | test | needs a model? | what it proves |
 |---|---|---|
@@ -12,6 +12,7 @@
 | `t_backend` | yes | every backend vs `ref`, accuracy **and** throughput |
 | `t_agent` | no | chat/run/serve render identical prompts; every tool-call shape parses |
 | `t_endian` | optional | byte-order neutrality; same numbers on a big-endian host |
+| `t_cache` | yes | prompt-prefix reuse gives bit-identical logits to a fresh decode |
 
 ## `t_agent` — the one that guards cross-mode consistency
 

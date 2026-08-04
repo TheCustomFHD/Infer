@@ -385,6 +385,44 @@ int agent_run_tool(const agent_config *cfg, const char *name,
     return rc;
 }
 
+int agent_tokenize_incremental(tokenizer *tok,
+                               const char *prompt,
+                               const char *prev, size_t prev_len,
+                               int *out, int max, int *n_shared_out) {
+    size_t plen = strlen(prompt);
+    int n_shared = 0;
+
+    if (n_shared_out) *n_shared_out = 0;
+
+    /* No usable history, or the new prompt does not extend the old one:
+     * tokenise normally. */
+    if (!prev || prev_len == 0 || prev_len > plen ||
+        memcmp(prompt, prev, prev_len) != 0) {
+        return tok_encode(tok, prompt, 1, out, max);
+    }
+
+    /* Identical prompt: nothing new to add. */
+    if (prev_len == plen) {
+        return tok_encode(tok, prompt, 1, out, max);
+    }
+
+    /* Tokenise the shared prefix and the remainder separately, so the
+     * prefix yields byte-identical IDs to last time. */
+    {
+        char *head = (char *) xmalloc(prev_len + 1);
+        memcpy(head, prompt, prev_len);
+        head[prev_len] = '\0';
+        n_shared = tok_encode(tok, head, 1, out, max);
+        free(head);
+    }
+
+    if (n_shared >= max) return n_shared;
+
+    if (n_shared_out) *n_shared_out = n_shared;
+    return n_shared + tok_encode(tok, prompt + prev_len, 1,
+                                 out + n_shared, max - n_shared);
+}
+
 mcp_client *agent_connect_mcp(const char *url, int announce) {
     char err[256];
     mcp_client *m;

@@ -70,7 +70,7 @@ Nothing to `pip install`, no CMake, no submodules.
 | **[PROFILING.md](PROFILING.md)** | `--log-perf`, `--log-stages`, and reading the output |
 | **[CHANGELOG.md](CHANGELOG.md)** | what changed, and why |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | how the pieces fit; data flow |
-| **[docs/FINDINGS.md](docs/FINDINGS.md)** | 20 surprises, each with measurements |
+| **[docs/FINDINGS.md](docs/FINDINGS.md)** | 24 surprises, each with measurements |
 | **[docs/PERFORMANCE-ANALYSIS.md](docs/PERFORMANCE-ANALYSIS.md)** | why the kernels are at their hardware floor |
 | **[docs/TEMPLATES.md](docs/TEMPLATES.md)** | custom Jinja templates |
 | **[docs/files/](docs/files/)** | one document per source file |
@@ -112,10 +112,10 @@ $ infer run model.gguf --port 9090
 ## Build targets
 
 ```sh
-make linux              # Linux/x86        -> infer-1.12.2-linux
-make linux-profile      # ...with profiler -> infer-1.12.2-linux-profile
-make windows            # Windows XP/x86   -> infer-1.12.2-windows.exe
-make windows-profile    # ...with profiler -> infer-1.12.2-windows-profile.exe
+make linux              # Linux/x86        -> infer-1.14.0-linux
+make linux-profile      # ...with profiler -> infer-1.14.0-linux-profile
+make windows            # Windows XP/x86   -> infer-1.14.0-windows.exe
+make windows-profile    # ...with profiler -> infer-1.14.0-windows-profile.exe
 make all                # all four
 
 make solaris            # Solaris/SPARC, Sun Studio, 64-bit

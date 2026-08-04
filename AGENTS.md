@@ -159,6 +159,27 @@ change. It has a full request walkthrough.
 
 ---
 
+## Releases
+
+CI builds and verifies on every push. A `v*` tag additionally publishes
+a GitHub Release using the binaries that build already verified.
+
+```sh
+# bump BOTH, they must agree
+#   src/infer.h   #define INFER_VERSION "1.12.2"
+#   Makefile      VERSION = 1.12.2
+make checkversion
+
+git commit -am "1.12.2"     # commit BEFORE tagging: git archive packages the commit
+git tag v1.12.2
+git push && git push --tags
+```
+
+Do not tag before committing the version bump — the workflow checks for
+it and fails, but it wastes a run.
+
+---
+
 ## Before you say you are done
 
 ```sh

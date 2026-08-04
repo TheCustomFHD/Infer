@@ -41,6 +41,7 @@ typedef struct {
     int          *toks;
     int           max_toks;
     perf_total    totals;      /* across the whole session */
+    strbuf        last_prompt; /* text of the prompt last ingested */
 } chat_state;
 
 static int build_prompt(chat_state *s, strbuf *out, char *err, size_t errlen) {
@@ -55,7 +56,7 @@ static int build_prompt(chat_state *s, strbuf *out, char *err, size_t errlen) {
  * Returns the reply text in `reply` (caller sb_frees). */
 static int generate_reply(chat_state *s, const char *prompt, strbuf *reply,
                           int quiet) {
-    int n, i, pos = 0, gen = 0;
+    int n, i, pos = 0, gen = 0, reused = 0;
     float *logits = NULL;
     int eos = tok_eos(s->tok);
     int im_end = tok_id(s->tok, "<|im_end|>");
@@ -65,21 +66,41 @@ static int generate_reply(chat_state *s, const char *prompt, strbuf *reply,
     sb_init(reply);
     sb_init(&pending);
 
-    n = tok_encode(s->tok, prompt, 1, s->toks, s->max_toks);
+    /* Tokenise so the shared prefix keeps last turn's exact IDs --
+     * see agent_tokenize_incremental() for why re-tokenising the whole
+     * string would defeat the cache. */
+    n = agent_tokenize_incremental(s->tok, prompt,
+                                   s->last_prompt.data, s->last_prompt.len,
+                                   s->toks, s->max_toks, NULL);
     if (n >= s->o->n_ctx) {
         sb_free(&pending);
         return -2;                     /* context overflow */
     }
 
     perf_begin(&pr);
-    qwen35_reset(s->ctx);
+
+    /* Every turn re-renders the whole conversation, so this prompt is
+     * normally the previous one plus the reply plus the new message.
+     * Skip the shared prefix rather than pushing it through 24 layers
+     * again -- on slow hardware that re-ingestion dominates. */
+    reused = qwen35_reuse_prefix(s->ctx, s->toks, n);
     sampler_reset(s->smp);
 
-    for (i = 0; i < n; i++) {
+    /* The sampler still needs every token: repetition penalty looks at
+     * the whole sequence, not just the part we recomputed. */
+    for (i = 0; i < reused; i++) sampler_accept(s->smp, s->toks[i]);
+
+    pos = reused;
+    for (i = reused; i < n; i++) {
         logits = qwen35_decode(s->ctx, s->toks[i], pos++, i == n - 1);
         sampler_accept(s->smp, s->toks[i]);
     }
-    perf_mark_prompt_done(&pr, n);
+    perf_mark_prompt_done(&pr, n - reused);
+
+    if (inf_verbose && reused > 0) {
+        inf_log("prompt cache: reused %d of %d tokens, processed %d",
+                reused, n, n - reused);
+    }
 
     while (gen < s->o->n_predict && pos < s->o->n_ctx - 1) {
         int next = sampler_pick(s->smp, logits);
@@ -130,6 +151,12 @@ static int generate_reply(chat_state *s, const char *prompt, strbuf *reply,
         fflush(stdout);
     }
     sb_free(&pending);
+
+    /* Remember the text actually ingested, including the reply, so the
+     * next turn can extend it. */
+    sb_clear(&s->last_prompt);
+    sb_puts(&s->last_prompt, prompt);
+    sb_add(&s->last_prompt, reply->data, reply->len);
 
     perf_end(&pr, gen);
     perf_report(&pr, "chat turn");
@@ -295,6 +322,7 @@ int chat_run(qwen35_model *m, const infer_opts *o, const char *tmpl) {
     s.toks = (int *) xmalloc(sizeof(int) * (size_t) s.max_toks);
     s.messages = agent_messages();
     perf_total_init(&s.totals);
+    sb_init(&s.last_prompt);
 
     if (o->system && o->system[0]) {
         agent_add_msg(s.messages, "system", o->system);
@@ -429,6 +457,7 @@ int chat_run(qwen35_model *m, const infer_opts *o, const char *tmpl) {
      * whole conversation rather than only per-turn figures. */
     perf_total_report(&s.totals, "chat session");
 
+    sb_free(&s.last_prompt);
     free(s.toks);
     jj_free(s.messages);
     sampler_free(s.smp);

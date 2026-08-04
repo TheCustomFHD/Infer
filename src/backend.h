@@ -77,6 +77,14 @@ void qmv_mmx(int type, const unsigned char *w, const float *x, float *y,
              long ncols, long nrows);
 #endif
 
+#ifdef INFER_HAVE_VIS
+/* VIS 1 kernels for UltraSPARC. See backend_vis.c. */
+void bk_qmv_vis(int type, const unsigned char *w, const float *x, float *y,
+                long ncols, long nrows);
+int  bk_vis_available(void);
+void bk_vis_free_scratch(void);
+#endif
+
 /* Shared by the i8 and mmx backends: quantise the activation vector
  * into 32-element blocks of int8 plus a per-block scale and sum. */
 /* Shared by the i8 and mmx backends: the activation vector quantised
