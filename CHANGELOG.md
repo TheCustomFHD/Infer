@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.14.2 — the GCC targets actually call GCC
+
+`gmake solaris-gcc-vis-profile` invoked **Sun Studio**, not GCC:
+
+```
+cc: Warning: Option -d=gnu89 passed to ld, if ld is invoked, ignored otherwise
+cc: -W option with unknown program all
+```
+
+The Makefile had `CC ?= cc`, but make sets `CC = cc` as a built-in
+default before the Makefile is read, so `?=` never fired. On Linux `cc`
+is GCC and nothing looked wrong; on Solaris `cc` is Studio, and every
+`solaris-gcc-*` target has been feeding GCC flags to the wrong compiler
+since those targets were added.
+
+- new `GNUCC = gcc`, used only by the five `solaris-gcc-*` targets
+- `$(CC)` still drives x86 and generic tests; `$(SUNCC)` still Studio
+- override for a GCC that is not on `PATH`:
+  `gmake solaris-gcc-vis GNUCC=/usr/sfw/bin/gcc`
+
+Also fixed: `--help` hardcoded `matvec kernel: auto, mmx, i8, ref`, so a
+VIS build never listed `vis`. Now conditional on `INFER_HAVE_VIS`.
+`--backend list` was always right.
+
+Verified with a stub `cc` that rejects GCC flags the way Studio does,
+placed ahead of a real GCC on `PATH`; `solaris*` routes to `cc` and
+`solaris-gcc*` to `gcc`. The previously failing target now builds
+warning-free and reports `vis ok ... <- selected`.
+
 ## 1.14.1 — the Sun Studio path actually compiles
 
 1.14.0 claimed dual compiler support for the VIS backend. The Sun Studio

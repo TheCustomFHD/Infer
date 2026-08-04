@@ -130,7 +130,11 @@ static const opt_def opts[] = {
   "do not print tool calls and results" },
 
 { O_BACKEND, "--backend", NULL, "<n>", 0, MODE_ALL,   G_PERF,
+#if defined(INFER_HAVE_VIS)
+  "matvec kernel: auto, vis, i8, ref -- or `list`" },
+#else
   "matvec kernel: auto, mmx, i8, ref -- or `list`" },
+#endif
 { O_LOGPERF, "--log-perf", NULL, NULL, 0, MODE_GEN,   G_PERF,
   "log TTFT, tokens/second and seconds/token per request,\n"
   "                          and a session total when chat exits" },

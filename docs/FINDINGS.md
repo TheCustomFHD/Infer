@@ -570,6 +570,61 @@ generation — GCC inlines the shim's C rather than emitting VIS
 instructions. Instruction counts from it are meaningless. Only the real
 compiler on the real machine can answer that.
 
+## 26. `CC ?= cc` cannot override make's built-in default
+
+The `solaris-gcc-*` targets exist so a Solaris user can build with GCC
+instead of Sun Studio. They never did. On a Solaris box:
+
+```
+gmake solaris-gcc-vis-profile
+cc -std=gnu89 -Wall ... -mcpu=ultrasparc -mvis ...
+cc: Warning: Option -d=gnu89 passed to ld, if ld is invoked, ignored otherwise
+cc: -W option with unknown program all
+gmake: *** [Makefile:281: solaris-gcc-vis-profile] Error 1
+```
+
+That is Sun Studio being handed GCC's flags. Studio parses `-std=gnu89`
+as `-s` followed by `td=gnu89`, and its `-W` means "pass an argument to
+a named compilation phase", so `-Wall` becomes "unknown program all".
+
+The Makefile said `CC ?= cc`. Make assigns `CC = cc` as a **built-in
+default before reading the Makefile**, so `?=` sees `CC` already set and
+does nothing. On Linux `cc` is GCC and the bug is invisible; on Solaris
+`cc` is Studio and the GCC targets silently call the wrong compiler.
+`CC = gcc` would be no better — it would break every other target for
+anyone whose compiler is not named `gcc`.
+
+**Fix:** a separate variable. `GNUCC = gcc`, used *only* by the five
+`solaris-gcc-*` targets; `$(CC)` still drives the x86 and generic test
+targets, `$(SUNCC)` the Studio ones. Overridable for a non-PATH GCC:
+
+```sh
+gmake solaris-gcc-vis GNUCC=/usr/sfw/bin/gcc
+```
+
+Verified by putting a stub `cc` that rejects GCC flags the way Studio
+does ahead of a real GCC on `PATH`, then confirming target-to-compiler
+routing:
+
+```
+solaris                    -> cc
+solaris-vis                -> cc
+solaris-gcc                -> gcc
+solaris-gcc-vis            -> gcc
+solaris-gcc-vis-profile    -> gcc
+```
+
+The same test caught a second bug: `--help` hardcoded `auto, mmx, i8,
+ref`, so a VIS build never mentioned `vis`. The string is now
+conditional on `INFER_HAVE_VIS`. `--backend list` was always correct,
+which is why this survived — the two disagreed and only the less-read
+one was right.
+
+**The general lesson:** a build target for a platform you cannot run is
+not verified by reading it. A five-line stub compiler on `PATH` tests
+the *routing* even when the real toolchain is unavailable, and routing
+is where these bugs live.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

@@ -97,7 +97,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.14.1
+VERSION = 1.14.2
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -225,6 +225,16 @@ windows-profile: $(CORE) $(WIN32) $(MMXSRC) $(HDRS)
 VISSRC    = $(SRCDIR)/backend_vis.c
 
 SUNCC     = cc
+
+# The solaris-gcc-* targets must NOT use $(CC): make gives CC a built-in
+# default of `cc`, which on Solaris is Sun Studio, so `CC ?= cc` never
+# fires and GCC flags get handed to the wrong compiler. Studio then
+# reads -std=gnu89 as -s plus td=gnu89 and dies on "-W option with
+# unknown program all". Name GCC explicitly. (Finding 26.)
+#
+# Override if GCC is not on PATH as `gcc`:
+#   gmake solaris-gcc-vis GNUCC=/usr/sfw/bin/gcc
+GNUCC     = gcc
 SUNTARGET = native
 SUNOPT    = -xO5 -xunroll=16
 SUNBITS   = -m64
@@ -244,12 +254,12 @@ solaris-profile: $(CORE) $(POSIX)
 # GCC on Solaris. -m64 for the same reason; GCC does define long long,
 # so _FILE_OFFSET_BITS would work here, but 64-bit makes it moot.
 solaris-gcc: $(CORE) $(POSIX)
-	$(CC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
+	$(GNUCC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
 		-m64 -DINFER_BIG_ENDIAN=1 \
 		-o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
 
 solaris-gcc-profile: $(CORE) $(POSIX)
-	$(CC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
+	$(GNUCC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
 		-m64 -DINFER_BIG_ENDIAN=1 -DINFER_PROFILE \
 		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(SOLLIBS)
 
@@ -273,12 +283,12 @@ solaris-vis-profile: $(CORE) $(POSIX) $(VISSRC)
 		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
 
 solaris-gcc-vis: $(CORE) $(POSIX) $(VISSRC)
-	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+	$(GNUCC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
 		-m64 -mcpu=ultrasparc -mvis -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 \
 		-o $(BIN)-solaris $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
 
 solaris-gcc-vis-profile: $(CORE) $(POSIX) $(VISSRC)
-	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+	$(GNUCC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
 		-m64 -mcpu=ultrasparc -mvis -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 \
 		-DINFER_PROFILE \
 		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
@@ -301,9 +311,9 @@ solaris-test: $(CORE) $(POSIX)
 # exactness trick the kernels depend on, and needs no model.
 solaris-gcc-vis-test: tests/t_vis.c
 	@mkdir -p $(BUILD)
-	$(CC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
+	$(GNUCC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
 		-DINFER_HAVE_VIS -o $(BUILD)/t_vis tests/t_vis.c
-	$(CC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
+	$(GNUCC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
 		-DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -I$(SRCDIR) \
 		-o $(BUILD)/t_viskern tests/t_viskern.c $(VISSRC) \
 		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
