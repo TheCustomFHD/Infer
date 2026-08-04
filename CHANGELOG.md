@@ -1,5 +1,149 @@
 # Changelog
 
+## 1.15.1 — lane budgets, re-derived
+
+Three kernel-level wins, all pure deletion, all bit-identical to `i8`.
+
+```
+                1.15.0   1.15.1   change   share of SPARC runtime
+Q4_K               261      253    -3.1%   36.7%
+Q5_K               391      343   -12.3%   34.4%
+Q6_K              1504     1338   -11.0%   27.2%
+```
+
+Weighted across the format mix: **8.5% fewer matvec instructions**, on
+top of 1.15.0. Static instruction counts per super-block, sparc64
+cross-GCC `-O2`, fully unrolled.
+
+### Q5_K was folding four times more often than needed
+
+The kernel widened its 16-bit lanes to 32-bit on every inner iteration,
+citing an 8-term budget. The budget is right; the loop only ever puts
+**one** term per lane per iteration, four in total — `4 * 31 * 127 =
+15748` against a 32767 limit. The fold was guarding an overflow that
+could not happen, and cost 12 extra `hsum16` per sub-block.
+
+This looks like the explanation for a long-standing oddity in the SPARC
+profile: Q5_K costing **2.55× the µs/call of Q4_K** despite being only
+25% wider. Width never explained that gap. Four times the fold traffic
+does.
+
+### Q6_K holds four terms instead of two
+
+Same class of error, opposite direction: it widened every iteration
+when a lane can carry all four terms. Worst case `4 * 63 * 127 = 32004`
+against 32767 — it fits, with 2.3% to spare.
+
+That margin is too thin to leave as arithmetic on paper, so
+`tests/t_vissat.c` now drives every lane to its worst case (all weights
+at maximum, all activations at the ±127 clamp) and requires bit-identity
+with `i8`. Q5_K and Q6_K both pass.
+
+The aligned Q6_K path is now **1236** instructions, below the 1423 of
+the copy-based approach it was measured against in 1.15.0 — the
+copy-free version now wins on instruction count as well as cache
+behaviour.
+
+### Chain folding
+
+Q4_K and Q5_K run two independent accumulator chains to hide the
+3-cycle VIS latency, then called `hsum16` twice. One `fpadd16` before a
+single `hsum16` is cheaper and keeps the chains independent through the
+loop, since the merge happens after it.
+
+### New
+
+- `tests/t_vissat.c` — worst-case lane saturation. Needs no model.
+
+### Still unmeasured
+
+Instruction counts, not cycles. No UltraSPARC has run this code. The
+8.5% assumes cycles track instructions, which on an in-order machine
+with a 16 KB direct-mapped D-cache they may not.
+
+## 1.15.0 — Q6_K VIS kernel
+
+Q6_K was 27.2% of measured SPARC runtime and had no VIS kernel; it fell
+through to the portable integer path. It now has one.
+
+```
+Q6_K, per 256-weight super-block, sparc64 cross-GCC -O2, unrolled:
+  scalar i8                     ~17    ops/MAC
+  VIS, 8-aligned super-block      5.45 ops/MAC   (1395 instrs)
+  VIS, 2-aligned super-block      6.30 ops/MAC   (1614 instrs)
+  averaged over the alternation   5.88 ops/MAC
+```
+
+About 2.9x fewer instructions than `i8` on the format that is a quarter
+of all matvec work, including `token_embd` and the LM head.
+
+### How it works
+
+A Q6_K weight is six bits — four from the `ql` plane, two from `qh` —
+and then biased by −32. `fmul8x16`'s first operand is unsigned, so the
+biased value cannot be fed to it. The kernel multiplies the *unbiased*
+weight and folds the bias through the block sums:
+
+```
+sum((w - 32) * x) = sum(w * x) - 32 * sum(x)
+```
+
+`bk_quantize_x` already computes `sum(x)` per 16 activations, which is
+Q6_K's scale granularity. This is the same arithmetic `i8_dot_q6_K`
+performs, in the same order, so the results are **bit-identical**.
+
+Unbiased `w` is 0..63 and `|x| <= 127`, so one product reaches 8001 and
+two fit a 16-bit lane. Products are paired before widening, halving the
+widen traffic.
+
+### Alignment without copying
+
+Q6_K's 210-byte stride makes super-block alignment alternate 0, 2, 0,
+2, ... within a row, so it cannot be decided per row — only per
+super-block. Aligned blocks take `lduw`; the rest assemble from two
+`lduh`. No copy, no extra cache traffic.
+
+### Fixed
+
+- **Byte order in the weight loader.** Assembling a lane word
+  little-endian reverses the weights on SPARC while the activations
+  stay in order — a wrong dot product, silently, and invisible on x86.
+  Only formats with odd strides (Q6_K, Q8_0, Q4_0) are affected;
+  Q4_K/Q5_K use a native aligned load and were never at risk. See
+  finding 27.
+- `make vis-shim-test` no longer claims `-DINFER_BIG_ENDIAN=1` while
+  running on a little-endian host, and prints what it does and does not
+  check.
+
+### New
+
+- `make vis-shim-test` — runs **both** compiler branches on any host.
+  `tests/vis_shim/gcc_shim.h` emulates `__builtin_vis_*` the way
+  `vis_proto.h` covers the Sun Studio path. Types, register allocation
+  and arithmetic are real; lane order is *not* checked, because the
+  host is little-endian.
+- `tools/cross-count.sh`, `tools/count_dynamic.py` — dynamic
+  instruction counts from real sparc64 cross-GCC output. Gated behind
+  `-DINFER_VIS_COUNT` so the shipping build still inlines the kernels.
+- `tests/t_viskern.c` covers Q6_K at 256/1024/3584 columns, with the
+  256-column case deliberately misaligned.
+
+### Measured and rejected
+
+64-bit `ldx` loads (1395 → 1477), copy-based alignment normalisation
+(5% fewer instructions, but 192 bytes of copy traffic per super-block
+through a 16 KB direct-mapped cache), and 32-bit-accumulator rewrites
+of Q4_K (261 → 280) and Q5_K (391 → 411). All reverted; see finding 28.
+
+### Still unmeasured
+
+Every figure here is an instruction count, not a cycle count. No
+UltraSPARC hardware has run this code. On an in-order machine with a
+16 KB direct-mapped D-cache these diverge, and this project has been
+wrong by 2–3× in both directions from counts and emulation before.
+`gmake solaris-vis-profile` on the target is the only thing that
+settles it.
+
 ## 1.14.2 — the GCC targets actually call GCC
 
 `gmake solaris-gcc-vis-profile` invoked **Sun Studio**, not GCC:

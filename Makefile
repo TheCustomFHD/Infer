@@ -97,11 +97,11 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.14.2
+VERSION = 1.15.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
-.PHONY: all linux linux-profile windows windows-profile \
+.PHONY: vis-shim-test all linux linux-profile windows windows-profile \
         solaris solaris-profile solaris-gcc solaris-gcc-profile \
         solaris-fast solaris-test \
         test bench clean version checkversion help
@@ -118,6 +118,7 @@ help:
 	@echo "make solaris            Solaris/SPARC, Sun Studio, 64-bit"
 	@echo "make solaris-profile    ...plus per-stage timers"
 	@echo "make solaris-gcc        Solaris/SPARC, GCC, 64-bit"
+	@echo "make vis-shim-test      VIS kernels vs i8 on any host (types/arith only)"
 	@echo "make solaris-vis        Solaris/SPARC + VIS kernels (Sun Studio)"
 	@echo "make solaris-gcc-vis    Solaris/SPARC + VIS kernels (GCC)"
 	@echo ""
@@ -318,7 +319,35 @@ solaris-gcc-vis-test: tests/t_vis.c
 		-o $(BUILD)/t_viskern tests/t_viskern.c $(VISSRC) \
 		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
 		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
-	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern"
+	$(GNUCC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
+		-DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -I$(SRCDIR) \
+		-o $(BUILD)/t_vissat tests/t_vissat.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern   then   ./$(BUILD)/t_vissat"
+
+vis-shim-test: tests/t_viskern.c $(VISSRC)
+	@mkdir -p $(BUILD)
+	@echo "NOTE: this runs on the HOST's byte order. It checks types and"
+	@echo "      arithmetic, NOT lane order. Use solaris-*-vis-test on a"
+	@echo "      big-endian machine for that. (Finding 27.)"
+	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+		-D__SUNPRO_C=0x5150 -Itests/vis_shim \
+		-DINFER_HAVE_VIS -I$(SRCDIR) \
+		-o $(BUILD)/t_viskern_sun tests/t_viskern.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+		-D__builtin_vis_fmul8x16=shim_fmul8x16 \
+		-D__builtin_vis_fpadd16=shim_fpadd16 \
+		-D__builtin_vis_fpadd32=shim_fpadd32 \
+		-D__builtin_vis_fmuld8ulx16=shim_fmuld8ulx16 \
+		-include tests/vis_shim/gcc_shim.h \
+		-DINFER_HAVE_VIS -I$(SRCDIR) \
+		-o $(BUILD)/t_viskern_gcc tests/t_viskern.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+	@echo "run: ./$(BUILD)/t_viskern_sun   then   ./$(BUILD)/t_viskern_gcc"
 
 solaris-vis-test: tests/t_vis.c
 	@mkdir -p $(BUILD)
@@ -333,7 +362,11 @@ solaris-vis-test: tests/t_vis.c
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(VISSRC) $(SRCDIR)/util.c $(SRCDIR)/prof.c \
 		$(SRCDIR)/sys_posix.c $(SOLLIBS)
-	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern   then   ./$(BUILD)/t_backend model.gguf"
+	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS -I$(SRCDIR) \
+		-o $(BUILD)/t_vissat tests/t_vissat.c $(VISSRC) \
+		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
+	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern   then   ./$(BUILD)/t_vissat   then   ./$(BUILD)/t_backend model.gguf"
 
 # =====================================================================
 #  Tests

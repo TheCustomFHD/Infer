@@ -131,6 +131,8 @@ typedef int bk_vis_translation_unit_not_empty;
 
 typedef float  vis_u8x4;
 typedef double vis_s16x4;
+typedef float  vis_s16x2;
+typedef double vis_s32x2;
 
 #define VMUL8X16(a, b)   vis_fmul8x16((a), (b))
 #define VADD16(a, b)     vis_fpadd16((a), (b))
@@ -260,7 +262,34 @@ static vis_s16x4 vis_zero16(void) {
     return vis_fzero();
 }
 
+
+/* Widen four 16-bit lanes to two 32-bit lanes, summing the pairs.
+ * fmuld8ulx16(1, v) is an exact widen with no rounding. */
+static vis_s32x2 vis_widen2(vis_s16x4 v) {
+    vis_lane64 in;
+    vis_lane32 one;
+
+    one.u = 0x01010101U;
+    in.d  = v;
+    return VADD32(VWIDEN(one.f, in.f[0]), VWIDEN(one.f, in.f[1]));
+}
+
+static int vis_hsum32(vis_s32x2 v) {
+    vis_wide64 w;
+    w.d = v;
+    return w.i[0] + w.i[1];
+}
+
 #else
+
+/* Union puns for the GCC branch. Declared up here because the
+ * horizontal helpers below need them; GCC lowers vector subscripts to
+ * stack round-trips on SPARC, so every lane access goes through one of
+ * these instead. */
+typedef union { vis_s16x4 v; unsigned long u; } vis_pun64;
+typedef union { vis_u8x4  v; unsigned int  u; } vis_pun32;
+typedef union { vis_s16x2 v; unsigned int  u; } vis_pun32s;
+typedef union { vis_s32x2 v; unsigned long u; } vis_pun64w;
 
 static int vis_hsum16(vis_s16x4 v) {
     vis_u8x4  one;
@@ -282,6 +311,27 @@ static vis_s16x4 vis_zero16(void) {
     vis_s16x4 z;
     z[0] = 0; z[1] = 0; z[2] = 0; z[3] = 0;
     return z;
+}
+
+
+/* As above. Union puns rather than subscripts: GCC lowers vector
+ * element access to a stack round-trip on SPARC. */
+static vis_s32x2 vis_widen2(vis_s16x4 v) {
+    vis_pun64  pu;
+    vis_pun32s lo, hi;
+    vis_u8x4   one;
+
+    one[0] = 1; one[1] = 1; one[2] = 1; one[3] = 1;
+    pu.v = v;
+    lo.u = (unsigned int) pu.u;
+    hi.u = (unsigned int) (pu.u >> 32);
+    return VADD32(VWIDEN(one, hi.v), VWIDEN(one, lo.v));
+}
+
+static int vis_hsum32(vis_s32x2 v) {
+    vis_pun64w w;
+    w.v = v;
+    return (int) (w.u >> 32) + (int) (unsigned int) w.u;
 }
 
 #endif
@@ -311,16 +361,6 @@ static vis_u8x4 vis_pack_u8x4(unsigned int u) {
 }
 #define PACK_U8X4(u)    vis_pack_u8x4((unsigned int) (u))
 #else
-typedef union {
-    vis_s16x4     v;
-    unsigned long u;
-} vis_pun64;
-
-typedef union {
-    vis_u8x4     v;
-    unsigned int u;
-} vis_pun32;
-
 #define XLOAD4(dst, p)                                                  \
     do { vis_pun64 pun_; pun_.u = *(const unsigned long *) (const void *) (p); \
          (dst) = pun_.v; } while (0)
@@ -331,6 +371,51 @@ static vis_u8x4 vis_pack_u8x4(unsigned int u) {
     return p.v;
 }
 #define PACK_U8X4(u)    vis_pack_u8x4((unsigned int) (u))
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Loading four weight bytes into VIS lane order                       */
+/*                                                                     */
+/* PACK_U8X4 reinterprets a 32-bit word as four u8 lanes, so lane 0 is  */
+/* whichever byte the word's memory image starts with. On big-endian    */
+/* SPARC that is the MOST significant byte. A loader that assembles     */
+/* q[0] into the low byte therefore feeds the weights to fmul8x16 in    */
+/* REVERSE order while the activations stay in order -- silently wrong, */
+/* and invisible on a little-endian host. (Finding 27.)                 */
+/*                                                                     */
+/* Q4_K/Q5_K super-blocks are 144/176 bytes, so their quant planes are  */
+/* always 4-aligned and take a plain lduw. Q6_K's stride is 210 and     */
+/* Q8_0/Q4_0's are 34/18, so those planes land on odd 2-byte offsets    */
+/* half the time: they must go through the halfword path, which is two  */
+/* lduh rather than a fault.                                            */
+/* ------------------------------------------------------------------ */
+
+/* Sum of 16 activations, at Q6_K's scale granularity. */
+static int vis_sum16(const bk_qx *xq, long idx) {
+    return xq->s16[idx / 16];
+}
+
+/* Aligned: the word's memory image already is the lane order. */
+#define VIS_LDW(p)  (*(const unsigned int *) (const void *) (p))
+
+/* Possibly 2-aligned. Two halfword loads, assembled most-significant
+ * first so the lane order matches VIS_LDW on this target. */
+static unsigned int vis_ldw2(const unsigned char *p) {
+#if INFER_BIG_ENDIAN
+    const unsigned short *h = (const unsigned short *) (const void *) p;
+    return ((unsigned int) h[0] << 16) | (unsigned int) h[1];
+#else
+    /* Little-endian hosts (the shim builds) byte-swap each halfword, so
+     * rebuild from bytes to keep the lane order identical. */
+    return ((unsigned int) p[3] << 24) | ((unsigned int) p[2] << 16) |
+           ((unsigned int) p[1] << 8)  |  (unsigned int) p[0];
+#endif
+}
+
+#if defined(INFER_VIS_COUNT) && defined(__GNUC__)
+#define VIS_NOINLINE __attribute__((noinline))
+#else
+#define VIS_NOINLINE
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -346,7 +431,7 @@ static vis_u8x4 vis_pack_u8x4(unsigned int u) {
 /* latency; 16 terms fit in 16-bit lanes (16*15*127 = 30480).           */
 /* ------------------------------------------------------------------ */
 
-static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
+VIS_NOINLINE static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
                           long ncols) {
     float sum = 0.0f;
     long c;
@@ -407,8 +492,8 @@ static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
                 b1 = VADD16(b1, VMUL8X16(ph, xv));
             }
 
-            acc1 = vis_hsum16(a0) + vis_hsum16(a1);
-            acc2 = vis_hsum16(b0) + vis_hsum16(b1);
+            acc1 = vis_hsum16(VADD16(a0, a1));
+            acc2 = vis_hsum16(VADD16(b0, b1));
 
             sum += xq->d[blk] *
                    ((float) acc1 * d * (float) s1 -
@@ -433,7 +518,7 @@ static float vis_dot_q4_K(const unsigned char *b, const bk_qx *xq,
 /* (8 * 31 * 127 = 31496). Four accumulators, four terms each.          */
 /* ------------------------------------------------------------------ */
 
-static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
+VIS_NOINLINE static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
                           long ncols) {
     float sum = 0.0f;
     long c;
@@ -453,7 +538,7 @@ static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
             const short *x2 = x1 + 32;
             int sh1 = j * 2, sh2 = j * 2 + 1;
             vis_s16x4 a0, a1, b0, b1;
-            int acc1, acc2, acc32_1 = 0, acc32_2 = 0;
+            int acc1, acc2;
             int l;
 
             vis_scale_min_k4(j * 2,     sc, &s1, &m1);
@@ -500,17 +585,16 @@ static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
                 XLOAD4(xv, x2 + l + 4);
                 b1 = VADD16(b1, VMUL8X16(ph, xv));
 
-                /* w can reach 31 here, so a 16-bit lane holds only 8
-                 * terms (8 * 31 * 127 = 31496). Fold to 32 bits every
-                 * other iteration and restart the lanes. */
-                acc32_1 += vis_hsum16(a0) + vis_hsum16(a1);
-                acc32_2 += vis_hsum16(b0) + vis_hsum16(b1);
-                a0 = vis_zero16(); a1 = vis_zero16();
-                b0 = vis_zero16(); b1 = vis_zero16();
             }
 
-            acc1 = acc32_1;
-            acc2 = acc32_2;
+            /* No mid-loop fold. w reaches 31 and |x| <= 127, so a lane
+             * can take 8 terms (8 * 31 * 127 = 31496 < 32767). The loop
+             * runs 4 iterations and each adds ONE term per lane, so the
+             * worst case is 4 * 31 * 127 = 15748 -- half the budget.
+             * The fold that used to sit here cost 12 extra hsum16 per
+             * sub-block for nothing. (Finding 29.) */
+            acc1 = vis_hsum16(VADD16(a0, a1));
+            acc2 = vis_hsum16(VADD16(b0, b1));
 
             sum += xq->d[blk] *
                    ((float) acc1 * d * (float) s1 -
@@ -528,6 +612,188 @@ static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
 }
 
 /* ------------------------------------------------------------------ */
+/* Q6_K                                                                */
+/*                                                                     */
+/* 256 weights per super-block in 210 bytes:                           */
+/*   [ql:128][qh:64][scales:16 signed][d:fp16]                         */
+/*                                                                     */
+/* A weight is six bits: four from ql, two from qh, then biased by      */
+/* -32. fmul8x16's first operand is UNSIGNED, so the biased value       */
+/* cannot be fed to it directly. Use the identity                       */
+/*                                                                     */
+/*     sum((w - 32) * x) = sum(w * x) - 32 * sum(x)                     */
+/*                                                                     */
+/* and take sum(x) from the block sums bk_quantize_x already computes.  */
+/* That is exactly what i8_dot_q6_K does, so the two agree bit for bit. */
+/*                                                                     */
+/* Unbiased w is 0..63 and |x| <= 127, so one product reaches 8001 and  */
+/* two fit in a 16-bit lane (16002 < 32767). Pairs are added in the     */
+/* 16-bit domain and widened once, which halves the widen traffic       */
+/* against widening every product.                                      */
+/*                                                                     */
+/* The 210-byte stride means every second super-block starts 2 mod 4,   */
+/* so the ql/qh planes are only ever 2-aligned. Rather than normalise   */
+/* with a 192-byte memcpy per super-block -- 192 bytes of pure copy      */
+/* traffic through a 16 KB direct-mapped D-cache, against 256 weights   */
+/* of real work -- the loads go through vis_ldw2(), which is two lduh   */
+/* and no copy at all.                                                  */
+/* ------------------------------------------------------------------ */
+
+#define Q6K_BODY(NAME, LDW)                                            \
+VIS_NOINLINE static float NAME(const unsigned char *b,                 \
+                               const bk_qx *xq, long c, float sum) {   \
+    {                                                                  \
+        const unsigned char *ql = b;                                   \
+        const unsigned char *qh = b + 128;                             \
+        const signed char   *sc = (const signed char *) (b + 192);     \
+        const float d = vis_rd_f16p(b + 208);                          \
+        int n;                                                         \
+                                                                       \
+        for (n = 0; n < 2; n++) {                                      \
+            const unsigned char *qln = ql + n * 64;                    \
+            const unsigned char *qhn = qh + n * 32;                    \
+            const signed char   *scn = sc + n * 8;                     \
+            long off = c + n * 128;                                    \
+            long blk = off / 32;                                       \
+            int a[8];                                                  \
+            int g;                                                     \
+                                                                       \
+            /* Two groups of 16, four sub-rows each: eight accumulators\
+             * matching i8_dot_q6_K's a0..a7. */                       \
+            for (g = 0; g < 2; g++) {                                  \
+                const short *xr0 = xs_buf + off + g * 16;              \
+                const short *xr1 = xr0 + 32;                           \
+                const short *xr2 = xr0 + 64;                           \
+                const short *xr3 = xr0 + 96;                           \
+                vis_s32x2 s0, s1, s2, s3;                              \
+                vis_s16x4 t0, t1, t2, t3;                              \
+                int l;                                                 \
+                                                                       \
+                t0 = vis_zero16(); t1 = vis_zero16();                  \
+                t2 = vis_zero16(); t3 = vis_zero16();                  \
+                                                                       \
+                for (l = 0; l < 16; l += 8) {                          \
+                    unsigned int l0w, l1w, hw, l0x, l1x, hx;           \
+                    vis_u8x4 w0, w1, w2, w3;                           \
+                    vis_s16x4 xv, p0, p1, p2, p3;                      \
+                                                                       \
+                    l0w = LDW(qln + g * 16 + l);                       \
+                    l1w = LDW(qln + g * 16 + 32 + l);                  \
+                    hw  = LDW(qhn + g * 16 + l);                       \
+                                                                       \
+                    /* Four sub-rows share one qh byte: bits 0-1 feed  \
+                     * row 0, 2-3 row 1, 4-5 row 2, 6-7 row 3. */      \
+                    w0 = PACK_U8X4((l0w & 0x0F0F0F0FU) |               \
+                                   ((hw & 0x03030303U) << 4));         \
+                    w1 = PACK_U8X4((l1w & 0x0F0F0F0FU) |               \
+                                   (((hw >> 2) & 0x03030303U) << 4));  \
+                    w2 = PACK_U8X4(((l0w >> 4) & 0x0F0F0F0FU) |        \
+                                   (((hw >> 4) & 0x03030303U) << 4));  \
+                    w3 = PACK_U8X4(((l1w >> 4) & 0x0F0F0F0FU) |        \
+                                   (((hw >> 6) & 0x03030303U) << 4));  \
+                                                                       \
+                    XLOAD4(xv, xr0 + l); p0 = VMUL8X16(w0, xv);        \
+                    XLOAD4(xv, xr1 + l); p1 = VMUL8X16(w1, xv);        \
+                    XLOAD4(xv, xr2 + l); p2 = VMUL8X16(w2, xv);        \
+                    XLOAD4(xv, xr3 + l); p3 = VMUL8X16(w3, xv);        \
+                                                                       \
+                    /* Second group of four weights: an independent    \
+                     * chain, so the 3-cycle VIS latency overlaps. */  \
+                    l0x = LDW(qln + g * 16 + l + 4);                   \
+                    l1x = LDW(qln + g * 16 + 32 + l + 4);              \
+                    hx  = LDW(qhn + g * 16 + l + 4);                   \
+                                                                       \
+                    w0 = PACK_U8X4((l0x & 0x0F0F0F0FU) |               \
+                                   ((hx & 0x03030303U) << 4));         \
+                    w1 = PACK_U8X4((l1x & 0x0F0F0F0FU) |               \
+                                   (((hx >> 2) & 0x03030303U) << 4));  \
+                    w2 = PACK_U8X4(((l0x >> 4) & 0x0F0F0F0FU) |        \
+                                   (((hx >> 4) & 0x03030303U) << 4));  \
+                    w3 = PACK_U8X4(((l1x >> 4) & 0x0F0F0F0FU) |        \
+                                   (((hx >> 6) & 0x03030303U) << 4));  \
+                                                                       \
+                    /* Pair the two groups in 16-bit lanes before      \
+                     * widening: 2 * 8001 = 16002, inside the lane. */ \
+                    XLOAD4(xv, xr0 + l + 4);                           \
+                    p0 = VADD16(p0, VMUL8X16(w0, xv));                 \
+                    XLOAD4(xv, xr1 + l + 4);                           \
+                    p1 = VADD16(p1, VMUL8X16(w1, xv));                 \
+                    XLOAD4(xv, xr2 + l + 4);                           \
+                    p2 = VADD16(p2, VMUL8X16(w2, xv));                 \
+                    XLOAD4(xv, xr3 + l + 4);                           \
+                    p3 = VADD16(p3, VMUL8X16(w3, xv));                 \
+                                                                       \
+                    /* Hold the products in 16-bit lanes across both   \
+                     * iterations rather than widening each time. Four \
+                     * terms per lane worst-case is 4 * 63 * 127 =     \
+                     * 32004, inside int16. Halves the widen traffic.  \
+                     * (Finding 29.) */                                \
+                    t0 = VADD16(t0, p0);                               \
+                    t1 = VADD16(t1, p1);                               \
+                    t2 = VADD16(t2, p2);                               \
+                    t3 = VADD16(t3, p3);                               \
+                }                                                      \
+                                                                       \
+                s0 = vis_widen2(t0);                                   \
+                s1 = vis_widen2(t1);                                   \
+                s2 = vis_widen2(t2);                                   \
+                s3 = vis_widen2(t3);                                   \
+                                                                       \
+                a[g]     = vis_hsum32(s0);                             \
+                a[g + 2] = vis_hsum32(s1);                             \
+                a[g + 4] = vis_hsum32(s2);                             \
+                a[g + 6] = vis_hsum32(s3);                             \
+            }                                                          \
+                                                                       \
+            /* Fold the -32 bias through the block sums, in the same   \
+             * order i8_dot_q6_K uses so the float result matches. */  \
+            sum += d * xq->d[blk] *                                    \
+                   ((float) scn[0] * (float) (a[0] - 32 * vis_sum16(xq, off +  0)) +\
+                    (float) scn[1] * (float) (a[1] - 32 * vis_sum16(xq, off + 16)));\
+            sum += d * xq->d[blk + 1] *                                \
+                   ((float) scn[2] * (float) (a[2] - 32 * vis_sum16(xq, off + 32)) +\
+                    (float) scn[3] * (float) (a[3] - 32 * vis_sum16(xq, off + 48)));\
+            sum += d * xq->d[blk + 2] *                                \
+                   ((float) scn[4] * (float) (a[4] - 32 * vis_sum16(xq, off + 64)) +\
+                    (float) scn[5] * (float) (a[5] - 32 * vis_sum16(xq, off + 80)));\
+            sum += d * xq->d[blk + 3] *                                \
+                   ((float) scn[6] * (float) (a[6] - 32 * vis_sum16(xq, off + 96)) +\
+                    (float) scn[7] * (float) (a[7] - 32 * vis_sum16(xq, off + 112)));\
+        }                                                              \
+    }                                                                  \
+    return sum;                                                        \
+}
+
+Q6K_BODY(vis_dot_q6_K_al, VIS_LDW)
+Q6K_BODY(vis_dot_q6_K_un, vis_ldw2)
+
+/* Pick once per row, not per load. Q6_K's 210-byte stride alternates
+ * the alignment of each super-block, but a row's first super-block
+ * settles it for the whole row when ncols is a multiple of 512 (two
+ * super-blocks, 420 bytes, even); otherwise fall back to the safe
+ * halfword path. The aligned variant is the one that runs on every
+ * tensor in the model. */
+static float vis_dot_q6_K(const unsigned char *b, const bk_qx *xq,
+                          long ncols) {
+    float sum = 0.0f;
+    long c;
+
+    /* The 210-byte stride makes alignment alternate 0,2,0,2,... within
+     * a row, so the choice has to be made per super-block, not per row.
+     * Half the blocks take the aligned lduw path for free; the other
+     * half take two lduh. No copy either way. */
+    for (c = 0; c < ncols; c += QK_K) {
+        if ((((unsigned long) b) & 3UL) == 0UL) {
+            sum = vis_dot_q6_K_al(b, xq, c, sum);
+        } else {
+            sum = vis_dot_q6_K_un(b, xq, c, sum);
+        }
+        b += 210;
+    }
+    return sum;
+}
+
+/* ------------------------------------------------------------------ */
 /* Dispatch                                                            */
 /*                                                                     */
 /* Formats without a VIS kernel fall through to the portable integer    */
@@ -540,7 +806,8 @@ void bk_qmv_vis(int type, const unsigned char *w, const float *x,
     const bk_qx *xq;
     long rowbytes, r;
 
-    if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K) {
+    if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
+        type != GGML_TYPE_Q6_K) {
         qmv_i8(type, w, x, y, ncols, nrows);
         return;
     }
@@ -553,9 +820,13 @@ void bk_qmv_vis(int type, const unsigned char *w, const float *x,
         for (r = 0; r < nrows; r++) {
             y[r] = vis_dot_q4_K(w + r * rowbytes, xq, ncols);
         }
-    } else {
+    } else if (type == GGML_TYPE_Q5_K) {
         for (r = 0; r < nrows; r++) {
             y[r] = vis_dot_q5_K(w + r * rowbytes, xq, ncols);
+        }
+    } else {
+        for (r = 0; r < nrows; r++) {
+            y[r] = vis_dot_q6_K(w + r * rowbytes, xq, ncols);
         }
     }
 }

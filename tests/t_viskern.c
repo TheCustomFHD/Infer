@@ -1,5 +1,10 @@
 /* Compare the VIS kernels against the scalar reference on synthetic
- * blocks. No model needed. Built once per compiler path. */
+ * blocks. No model needed. Built once per compiler path.
+ *
+ * The 256-column case deliberately misaligns Q6_K and Q8_0 rows (their
+ * row strides are 210*nb and 34*nb bytes, neither a multiple of four
+ * for odd nb), forcing the alignment-safe load paths.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -12,9 +17,20 @@ static unsigned int rnd(void) {
     return (unsigned int) ((rs >> 16) & 0xFFFFU);
 }
 
+static long type_rowbytes(int type, long ncols) {
+    long nb = ncols / 256;
+    switch (type) {
+        case GGML_TYPE_Q4_K: return nb * 144;
+        case GGML_TYPE_Q5_K: return nb * 176;
+        case GGML_TYPE_Q6_K: return nb * 210;
+        case GGML_TYPE_Q8_0: return (ncols / 32) * 34;
+        case GGML_TYPE_Q4_0: return (ncols / 32) * 18;
+        default:             return 0;
+    }
+}
+
 static int check(int type, const char *name, long ncols, int nrows) {
-    long rowbytes = (type == GGML_TYPE_Q4_K) ? (ncols / 256) * 144
-                                             : (ncols / 256) * 176;
+    long rowbytes = type_rowbytes(type, ncols);
     unsigned char *w = (unsigned char *) malloc((size_t)(rowbytes * nrows));
     float *x  = (float *) malloc((size_t) ncols * sizeof(float));
     float *y1 = (float *) malloc((size_t) nrows * sizeof(float));
@@ -26,9 +42,26 @@ static int check(int type, const char *name, long ncols, int nrows) {
     for (r = 0; r < nrows; r++) {
         long base = r * rowbytes; long blk;
         for (blk = 0; blk < ncols / 256; blk++) {
-            long o = base + blk * ((type == GGML_TYPE_Q4_K) ? 144 : 176);
+            long o;
+            switch (type) {
+                case GGML_TYPE_Q4_K: o = base + blk * 144; break;
+                case GGML_TYPE_Q5_K: o = base + blk * 176; break;
+                case GGML_TYPE_Q6_K: o = base + blk * 210; break;
+                default:             o = base; break;
+            }
             w[o]   = (unsigned char)(rnd() & 0xFF); w[o+1] = 0x2C; /* ~0.06 */
-            w[o+2] = (unsigned char)(rnd() & 0xFF); w[o+3] = 0x2B;
+            if (type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q4_0) {
+                w[o+2] = (unsigned char)(rnd() & 0xFF); w[o+3] = 0x2B;
+            }
+        }
+        /* Q8_0 and Q4_0 have 32-element blocks; give every block a
+         * sane fp16 scale so no comparison is skipped by a NaN. */
+        if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) {
+            long step = (type == GGML_TYPE_Q8_0) ? 34 : 18;
+            for (blk = 0; blk < ncols / 32; blk++) {
+                long o = base + blk * step;
+                w[o]   = (unsigned char)(rnd() & 0xFF); w[o+1] = 0x2C;
+            }
         }
     }
     for (i = 0; i < ncols; i++)
@@ -59,6 +92,11 @@ int main(void) {
     bad += check(GGML_TYPE_Q5_K, "Q5_K", 256, 4);
     bad += check(GGML_TYPE_Q5_K, "Q5_K", 1024, 8);
     bad += check(GGML_TYPE_Q5_K, "Q5_K", 3584, 4);
+    bad += check(GGML_TYPE_Q6_K, "Q6_K", 256, 4);
+    bad += check(GGML_TYPE_Q6_K, "Q6_K", 1024, 8);
+    bad += check(GGML_TYPE_Q6_K, "Q6_K", 3584, 4);
+    bad += check(GGML_TYPE_Q8_0, "Q8_0", 1024, 8);
+    bad += check(GGML_TYPE_Q4_0, "Q4_0", 1024, 8);
     printf(bad ? "\n%d FAILURE(S)\n" : "\nkernels agree with the reference\n", bad);
     return bad ? 1 : 0;
 }

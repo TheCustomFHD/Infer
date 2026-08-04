@@ -625,6 +625,158 @@ not verified by reading it. A five-line stub compiler on `PATH` tests
 the *routing* even when the real toolchain is unavailable, and routing
 is where these bugs live.
 
+## 27. A byte-order bug that only a big-endian machine can see
+
+The natural way to load four weight bytes into a VIS register is to
+build a 32-bit word and pun it into lanes. The natural way to build
+that word is little-endian:
+
+```c
+return (unsigned int) (q[0] | (q[1] << 8)) |
+       ((unsigned int) (q[2] | (q[3] << 8)) << 16);
+```
+
+`PACK_U8X4` reinterprets the word as four u8 lanes, and lane 0 is the
+byte the word's memory image *starts* with. On big-endian SPARC that is
+the most significant byte, so the loader above delivers the weights
+**reversed** while the activations stay in order:
+
+```
+bytes in memory : 11 22 33 44
+x86    lanes    : 11 22 33 44   correct
+sparc  lanes    : 44 33 22 11   reversed
+```
+
+The products are then summed, so the error is not a clean permutation
+of the output -- it is a wrong dot product, silently. Measured error
+against the i8 kernel ran to 8194% on Q4_0.
+
+Two properties made this dangerous:
+
+- It is **invisible on x86**. A shim that emulates VIS arithmetic on a
+  little-endian host reports every case bit-exact.
+- It only affects formats whose planes are *not* 4-aligned. Q4_K and
+  Q5_K super-blocks are 144 and 176 bytes, so a plain `lduw` always
+  works and the native load preserves memory order. Q6_K (210), Q8_0
+  (34) and Q4_0 (18) have odd strides, need a byte-assembling loader,
+  and are the only ones that fail. Passing three formats out of five is
+  exactly the pattern that makes a bug look like a corner case.
+
+**The rule this repo already had:** finding 20 says never guess byte
+order, `#error` instead. The same rule applies to *validation*: a test
+that can only run little-endian cannot certify a big-endian target.
+`make vis-shim-test` now says so in its own output, and the loaders are
+written so both orders produce identical lane order by construction:
+
+```c
+#define VIS_LDW(p)  (*(const unsigned int *) (const void *) (p))
+
+static unsigned int vis_ldw2(const unsigned char *p) {
+#if INFER_BIG_ENDIAN
+    const unsigned short *h = (const unsigned short *) (const void *) p;
+    return ((unsigned int) h[0] << 16) | (unsigned int) h[1];
+#else
+    return ((unsigned int) p[3] << 24) | ((unsigned int) p[2] << 16) |
+           ((unsigned int) p[1] << 8)  |  (unsigned int) p[0];
+#endif
+}
+```
+
+## 28. Three optimisations that measurement rejected
+
+All three were tried on the Q6_K kernel and reverted. Counts are static
+instructions per super-block from a real sparc64 cross-GCC at `-O2`,
+fully unrolled.
+
+**Normalising alignment with a copy — not adopted.** Q6_K's 210-byte
+stride makes every second super-block start 2 mod 4. Copying the
+192-byte quant plane into an aligned buffer buys `lduw` loads
+throughout: 1423 instructions against 1504 for choosing a loader per
+block. But the copy is ~48 extra memory operations and dirties 192
+bytes of a 16 KB *direct-mapped write-through* D-cache per super-block,
+against 256 weights of actual work. The instruction count favours the
+copy by 5%; the cache behaviour is unmeasurable without hardware. Kept
+the copy-free version and recorded the 5% as a known, deliberate cost
+rather than claiming a win either way.
+
+**64-bit loads — rejected, 1395 -> 1477.** Every load offset in the
+kernel is 0 mod 8, so `ldx` could replace pairs of `lduw` and halve the
+load count. It made the kernel *worse*: the extra shifting and masking
+to split the doubleword cost more than the saved load, and holding
+64-bit values raised pressure on the 32-entry FP register file. Halving
+memory operations is not the same as halving cost when the operations
+were already cheap.
+
+**Rewriting Q4_K/Q5_K around 32-bit accumulation — rejected.** Folding
+the 16-bit chains into 32-bit lanes earlier looks like it should reduce
+fold traffic. Measured: Q4_K 261 -> 280 instructions (106 -> 118 memory
+ops), Q5_K 391 -> 411 (146 -> 170). Both worse, so both originals were
+kept unchanged. The existing 16-bit accumulation already runs the
+maximum number of terms the lane width allows, and anything that folds
+sooner just adds work.
+
+**A note on the accumulator.** Splitting a kernel into aligned and
+unaligned variants initially broke bit-exactness (2.4e-07 instead of
+0). Each variant started its own `sum = 0.0f`, so partial sums were
+rounded per super-block instead of accumulating in one running float.
+Threading the accumulator through as a parameter restored exactness.
+Bit-identity with `i8` is a property of *float accumulation order*, not
+just of the integer arithmetic.
+
+## 29. Two lane budgets that were never checked against the loop
+
+The VIS kernels accumulate products in 16-bit lanes and widen to 32-bit
+only when the lane would overflow. Each kernel carries a comment naming
+its budget. Two of them were being enforced far more often than the
+loop actually required.
+
+**Q5_K folded four times as often as needed.** The comment reads "a
+16-bit lane holds only 8 terms (8 * 31 * 127 = 31496)", which is
+correct. But the loop is `for (l = 0; l < 32; l += 8)` -- four
+iterations, each adding *one* term per lane. The worst case is
+`4 * 31 * 127 = 15748`, less than half the budget. The mid-loop fold
+was guarding an overflow that could not occur, at a cost of 12 extra
+`hsum16` per sub-block:
+
+```
+Q5_K   391 -> 347 instructions, 146 -> 129 memory ops   (-11%)
+```
+
+This is almost certainly the long-standing anomaly recorded in the
+SPARC profile -- Q5_K costing 2.55x the microseconds per call of Q4_K
+despite being only 25% wider. The extra width never explained a 2.55x
+gap; four times the fold traffic does.
+
+**Q6_K widened every iteration when it could hold four terms.** Two
+iterations, two terms each, `4 * 63 * 127 = 32004` against a 32767
+limit. It fits, with 2.3% to spare:
+
+```
+Q6_K   1395 -> 1236 aligned, 1614 -> 1441 unaligned      (-11%)
+```
+
+That margin is too thin to leave as arithmetic on paper.
+`tests/t_vissat.c` now drives every lane to its worst case -- all
+weights at maximum, all activations at the +-127 clamp -- and requires
+bit-identity with `i8`. Both formats pass.
+
+**Folding the accumulator chains costs nothing.** Q4_K and Q5_K each
+run two independent chains to hide the 3-cycle VIS latency, then called
+`hsum16` on both. Adding them with a single `fpadd16` first and taking
+one `hsum16` keeps the chains independent through the loop -- the merge
+happens once, after it:
+
+```
+Q4_K   261 -> 253      Q5_K   347 -> 343
+```
+
+**The lesson:** a lane budget is a property of the *loop*, not of the
+format. Both comments described the format's limit correctly and both
+kernels then enforced it against the wrong iteration count. Worth
+re-deriving the term count from the loop bounds whenever one of these
+is written, and worth a test that actually saturates the lanes rather
+than trusting the arithmetic.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

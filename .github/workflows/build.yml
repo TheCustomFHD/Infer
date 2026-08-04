@@ -7,7 +7,7 @@ name: build
 #             and uploads the binaries as an artifact you can download
 #             from the Actions tab.
 #
-#   release   runs ONLY for a tag like v1.14.0. It does not rebuild --
+#   release   runs ONLY for a tag like vX.Y.Z. It does not rebuild --
 #             it downloads the artifact the `build` job just verified,
 #             packages it with checksums, and publishes a GitHub
 #             Release.
@@ -22,11 +22,11 @@ name: build
 # ---------------------------------------------------------------------
 #
 #   1. Bump the version in BOTH places (make checkversion asserts this):
-#        src/infer.h   #define INFER_VERSION "1.14.0"
-#        Makefile      VERSION = 1.14.0
+#        src/infer.h   #define INFER_VERSION "X.Y.Z"
+#        Makefile      VERSION = X.Y.Z
 #
-#   2. git commit -am "1.14.0"
-#      git tag v1.14.0
+#   2. git commit -am "X.Y.Z"
+#      git tag vX.Y.Z
 #      git push && git push --tags
 #
 # The tag must match VERSION. The workflow fails loudly if it does not,
@@ -41,6 +41,13 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+# A push to a branch that also has a PR open would otherwise run this
+# twice. Cancel the older run of the same ref; never cancel a tag,
+# because that run publishes a release.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 permissions:
   contents: read

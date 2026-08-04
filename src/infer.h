@@ -28,7 +28,7 @@
 typedef double gg_off;
 
 #ifndef INFER_VERSION
-#define INFER_VERSION "1.14.2"
+#define INFER_VERSION "1.15.1"
 #endif
 
 /* ------------------------------------------------------------------ */

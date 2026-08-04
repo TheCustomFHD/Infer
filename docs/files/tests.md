@@ -111,6 +111,20 @@ It proves types and arithmetic only. GCC inlines the shim's C instead
 of emitting VIS instructions, so instruction counts taken this way are
 meaningless — Studio's code generation can only be judged by Studio.
 
+## `t_vissat` — worst-case lane saturation
+
+The kernels accumulate in 16-bit lanes and widen only when the budget
+runs out. Q6_K sits at 32004 of 32767 — a 2.3% margin — so the bound is
+tested, not asserted. Every weight at maximum, every activation at the
+±127 clamp, bit-identity with `i8` required:
+
+```
+Q6_K all-max saturation: bit-identical
+Q5_K all-max saturation: bit-identical
+```
+
+Needs no model.
+
 ## Beyond the suite
 
 Two checks were run during development and are worth repeating after
