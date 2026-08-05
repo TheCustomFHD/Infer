@@ -101,6 +101,11 @@ static const mmx_const c_mask_1_u  MMX_ALIGN8 = { 0x0001000100010001LL };
 /* Byte-domain single-bit mask, companion to c_mask_fb. */
 static const mmx_const c_mask_1b_u MMX_ALIGN8 = { 0x0101010101010101LL };
 static const mmx_const c_mask_3_u MMX_ALIGN8 = { 0x0003000300030003LL };
+/* Byte-domain 2-bit mask, companion to c_mask_fb. Q6_K extracts its
+ * high 2 bits from PACKED qh bytes, before any widening, so the mask
+ * must repeat per byte -- the word-domain c_mask_3 above would keep
+ * only every other lane. */
+static const mmx_const c_mask_3b_u MMX_ALIGN8 = { 0x0303030303030303LL };
 static const mmx_const c_8_u      MMX_ALIGN8 = { 0x0008000800080008LL };
 static const mmx_const c_32_u     MMX_ALIGN8 = { 0x0020002000200020LL };
 
@@ -116,6 +121,7 @@ const void *mmx_const_addrs[5] = {
 #define c_mask_1b (c_mask_1b_u.v)
 #define c_mask_1 (c_mask_1_u.v)
 #define c_mask_3 (c_mask_3_u.v)
+#define c_mask_3b (c_mask_3b_u.v)
 #define c_8      (c_8_u.v)
 #define c_32     (c_32_u.v)
 
@@ -406,67 +412,97 @@ MMX_Q5K_SUBROW_FN(6, 7, mmx_q5K_subrow_3)
  * bytes / 16 qh bytes / 16 x shorts; offsets are in bytes. J2R is the
  * hi-bit shift (2*sub-row); sub-rows 2..3 read the high nibble of ql
  * via NIB. */
-#define MMX_Q6K_HALF8(QO, HO, XO, J2R, NIB) \
+/* Eight ql bytes -> SIXTEEN weights: the low nibbles feed one plane
+ * and the high nibbles feed the plane 32 weights further on. Both are
+ * produced from ONE ql load and ONE qh load.
+ *
+ * The original kernel made two separate passes over the same bytes,
+ * re-loading and re-unpacking ql and qh each time: 3.50 MMX
+ * instructions per weight against Q4_K's 1.19, which is exactly the
+ * 2x cost per weight that showed up in the bench. Q4_K already used
+ * this shape; Q6_K did not, only because its 2-bit high part needs a
+ * different shift for each plane -- and that is two instructions, not
+ * a second pass. (Finding 51.)
+ *
+ * All masking is byte-domain, so one PAND covers eight lanes.
+ * Widening to words happens once, after the 6-bit weight is assembled.
+ *
+ * QO/HO byte offsets, XA/XB byte offsets into the short x array,
+ * SA/SB the two 2-bit shifts, ACA/ACB the accumulator registers.
+ */
+#define MMX_Q6K_DUAL(QO, HO, XA, XB, SA, SB, ACA, ACB) \
     "movq " QO "(%0), %%mm2\n\t" \
     "movq %%mm2, %%mm3\n\t" \
-    "punpcklbw %%mm7, %%mm2\n\t" \
-    "punpckhbw %%mm7, %%mm3\n\t" \
-    NIB \
-    "pand %4, %%mm2\n\t" \
-    "pand %4, %%mm3\n\t" \
+    "pand %4, %%mm2\n\t"                     /* low nibble  */ \
+    "psrlw $4, %%mm3\n\t" \
+    "pand %4, %%mm3\n\t"                     /* high nibble */ \
     "movq " HO "(%1), %%mm4\n\t" \
     "movq %%mm4, %%mm5\n\t" \
-    "punpcklbw %%mm7, %%mm4\n\t" \
+    "psrlw $" SA ", %%mm4\n\t" \
+    "pand %5, %%mm4\n\t" \
+    "psllw $4, %%mm4\n\t"                    /* plane A: 0x00..0x30 */ \
+    "psrlw $" SB ", %%mm5\n\t" \
+    "pand %5, %%mm5\n\t" \
+    "psllw $4, %%mm5\n\t"                    /* plane B */ \
+    "paddb %%mm4, %%mm2\n\t"                 /* 6-bit weights, packed */ \
+    "paddb %%mm5, %%mm3\n\t" \
+    "movq %%mm2, %%mm4\n\t" \
+    "movq %%mm3, %%mm5\n\t" \
+    "punpcklbw %%mm7, %%mm2\n\t" \
+    "punpckhbw %%mm7, %%mm4\n\t" \
+    "punpcklbw %%mm7, %%mm3\n\t" \
     "punpckhbw %%mm7, %%mm5\n\t" \
-    "movq %%mm4, %%mm6\n\t" \
-    "psrlw $" J2R ", %%mm6\n\t" \
-    "pand %5, %%mm6\n\t" \
-    "psllw $4, %%mm6\n\t" \
-    "paddw %%mm6, %%mm2\n\t" \
-    "movq %%mm5, %%mm6\n\t" \
-    "psrlw $" J2R ", %%mm6\n\t" \
-    "pand %5, %%mm6\n\t" \
-    "psllw $4, %%mm6\n\t" \
-    "paddw %%mm6, %%mm3\n\t" \
-    "psubw %6, %%mm2\n\t" \
+    "psubw %6, %%mm2\n\t"                    /* bias -32 */ \
+    "psubw %6, %%mm4\n\t" \
     "psubw %6, %%mm3\n\t" \
-    "movq " XO "(%2), %%mm6\n\t" \
+    "psubw %6, %%mm5\n\t" \
+    "movq " XA "(%2), %%mm6\n\t" \
     "pmaddwd %%mm2, %%mm6\n\t" \
-    "paddd %%mm6, %%mm0\n\t" \
-    "movq " XO "+8(%2), %%mm6\n\t" \
+    "paddd %%mm6, %%mm" ACA "\n\t" \
+    "movq " XA "+8(%2), %%mm6\n\t" \
+    "pmaddwd %%mm4, %%mm6\n\t" \
+    "paddd %%mm6, %%mm" ACA "\n\t" \
+    "movq " XB "(%2), %%mm6\n\t" \
     "pmaddwd %%mm3, %%mm6\n\t" \
-    "paddd %%mm6, %%mm0\n\t"
+    "paddd %%mm6, %%mm" ACB "\n\t" \
+    "movq " XB "+8(%2), %%mm6\n\t" \
+    "pmaddwd %%mm5, %%mm6\n\t" \
+    "paddd %%mm6, %%mm" ACB "\n\t"
 
-#define MMX_Q6K_GROUP_ABS(QO, HO, XO, J2R, NIB, AO) \
-    "pxor %%mm0, %%mm0\n\t" \
-    MMX_Q6K_HALF8(QO, HO, XO, J2R, NIB) \
-    MMX_Q6K_HALF8(QO "+8", HO "+8", XO "+16", J2R, NIB) \
-    "movq %%mm0, %%mm2\n\t" \
+#define MMX_Q6K_RED(ACC, AO) \
+    "movq %%mm" ACC ", %%mm2\n\t" \
     "psrlq $32, %%mm2\n\t" \
-    "paddd %%mm2, %%mm0\n\t" \
-    "movd %%mm0, " AO "(%3)\n\t"
+    "paddd %%mm2, %%mm" ACC "\n\t" \
+    "movd %%mm" ACC ", " AO "(%3)\n\t"
 
-#define NIB_LOW ""
-#define NIB_HIGH "psrlw $4, %%mm2\n\tpsrlw $4, %%mm3\n\t"
+/* One 16-weight scale group of plane A and one of plane B, together. */
+#define MMX_Q6K_GPAIR(QO, HO, XA, XB, SA, SB, AOA, AOB) \
+    "pxor %%mm0, %%mm0\n\t" \
+    "pxor %%mm1, %%mm1\n\t" \
+    MMX_Q6K_DUAL(QO,      HO,      XA,       XB,       SA, SB, "0", "1") \
+    MMX_Q6K_DUAL(QO "+8", HO "+8", XA "+16", XB "+16", SA, SB, "0", "1") \
+    MMX_Q6K_RED("0", AOA) \
+    MMX_Q6K_RED("1", AOB)
 
+/* Eight 16-weight groups per half-block. Planes 0/2 share ql bytes
+ * 0..31 with qh shifts 0 and 4; planes 1/3 share ql bytes 32..63 with
+ * shifts 2 and 6 -- matching i8_dot_q6_K exactly. */
 #define MMX_Q6K_HALF \
     "pxor %%mm7, %%mm7\n\t" \
-    MMX_Q6K_GROUP_ABS("0",  "0",  "0",   "0", NIB_LOW,  "0") \
-    MMX_Q6K_GROUP_ABS("16", "16", "32",  "0", NIB_LOW,  "4") \
-    MMX_Q6K_GROUP_ABS("32", "0",  "64",  "2", NIB_LOW,  "8") \
-    MMX_Q6K_GROUP_ABS("48", "16", "96",  "2", NIB_LOW,  "12") \
-    MMX_Q6K_GROUP_ABS("0",  "0",  "128", "4", NIB_HIGH, "16") \
-    MMX_Q6K_GROUP_ABS("16", "16", "160", "4", NIB_HIGH, "20") \
-    MMX_Q6K_GROUP_ABS("32", "0",  "192", "6", NIB_HIGH, "24") \
-    MMX_Q6K_GROUP_ABS("48", "16", "224", "6", NIB_HIGH, "28") \
+    MMX_Q6K_GPAIR("0",  "0",  "0",   "128", "0", "4", "0",  "16") \
+    MMX_Q6K_GPAIR("16", "16", "32",  "160", "0", "4", "4",  "20") \
+    MMX_Q6K_GPAIR("32", "0",  "64",  "192", "2", "6", "8",  "24") \
+    MMX_Q6K_GPAIR("48", "16", "96",  "224", "2", "6", "12", "28")
+
+
 
 /* One Q6_K half-block: 8 dot products of 16 int16 pairs into accs[8]. */
 static void mmx_q6K_half(const unsigned char *ql, const unsigned char *qh,
                          const short *x, int *accs) {
     __asm__ __volatile__ (MMX_Q6K_HALF
         : : "r" (ql), "r" (qh), "r" (x), "r" (accs),
-            "m" (*(const short (*)[4]) c_mask_f),
-            "m" (*(const short (*)[4]) c_mask_3),
+            "m" (*(const short (*)[4]) c_mask_fb),
+            "m" (*(const short (*)[4]) c_mask_3b),
             "m" (*(const short (*)[4]) c_32)
         : INFER_MMX_CLOBBERS);
 }

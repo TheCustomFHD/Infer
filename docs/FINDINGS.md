@@ -2065,6 +2065,82 @@ A build flag that changes the instruction floor is a support burden
 disguised as an optimisation -- put the fast code in its own gated
 object instead, and let the CPU decide.
 
+## 51. MMX Q6_K: two passes over the same bytes, and the MMX floor
+
+Q6_K measured **0.601 ns/weight against Q4_K's 0.293** while being 42%
+of this model's matvec time. The cause was structural, not scheduling:
+`mmx_q6K_half` handled the low-nibble and high-nibble planes in
+separate passes, re-loading and re-unpacking the same `ql` and `qh`
+bytes each time.
+
+| format | MMX instrs / weight | ns/weight |
+|---|---|---|
+| Q4_K | 1.19 | 0.293 |
+| Q5_K | 1.88 | 0.384 |
+| Q6_K before | 3.50 | 0.601 |
+| Q6_K after | 2.12 | 0.420 |
+
+**Instruction count predicted the ratio almost exactly** (3.50/1.19 =
+2.94 against a measured 2.05), which is the opposite of finding 36,
+where the i486's cost model was *not* instruction count. On this
+in-order-ish MMX path it is.
+
+Q4_K and Q5_K already used the merged shape -- one `ql` load, `PAND`
+for the low nibble, `PSRLW`+`PAND` for the high, all masking in the
+byte domain, one widening at the end. Q6_K did not, only because its
+2-bit high field needs a different shift per plane. That is two
+instructions, not a second pass.
+
+### The byte-domain vs word-domain mask trap
+
+`c_mask_3` is `0x0003000300030003` -- a **word** mask. The rewritten
+kernel masks *packed bytes* before widening, so it needs
+`0x0303030303030303`. The old kernel got away with the word constant
+because it unpacked first. Any MMX code that masks in the byte domain
+needs a byte-domain constant, and the file already had `c_mask_fb`
+alongside `c_mask_f` for exactly this reason -- the 2-bit companion
+was simply missing. Symptom was a silently wrong Q6_K, caught by
+`t_ident`'s memcmp.
+
+### Two plausible optimisations that measured worse
+
+- **Halving the reduction rate.** One `MOVD` per 32 weights instead of
+  per 16, with two independent accumulator chains: **0.601 -> 0.598**.
+  Nothing. The store traffic was never the bottleneck, and the
+  dependency chain was already short enough to hide.
+- **The VIS bias trick.** `sum((w-32)*x) == sum(w*x) - 32*sum(x)`
+  removes four `PSUBW` per 16 weights, and `xq->s16` already holds the
+  sums. Kernel improved 0.420 -> 0.409; **the whole model got slower,
+  3.173 -> 3.129 tok/s.** The correction adds a multiply and a
+  subtract per 16-weight group to the scalar float phase, and Q6_K has
+  eight groups per 128 weights, so the float side lost more than the
+  MMX side gained. The same trick is a win on VIS (finding 15.0)
+  because that kernel's float phase is shaped differently.
+
+### Where the MMX floor actually is
+
+matvec is 93.2% of the forward pass and uses **1.43 GB/s of ~10 GB/s
+available** -- instruction-bound, not memory-bound, and already
+issuing ~1.6-2 MMX instructions per cycle. Only instruction count is
+left.
+
+Q4_K's 19 instructions per 16 weights break down as 5 nibble extract,
+**6 widening**, 4 `PMADDWD`, 4 `PADDD`. The six `PUNPCK` exist only
+because `PMADDWD` consumes words while the weights arrive as packed
+nibbles. MMX has no unsigned-byte multiply-accumulate: `PMADDUBSW` is
+SSSE3 (2006), and Extended MMX -- the newest thing a Geode LX has --
+adds `PSHUFW`, `PMAXSW`, `PAVGB`, `PSADBW`, `MOVNTQ`, `PREFETCH` and
+nothing that helps here.
+
+Weighted by each format's share of the model's weights (Q4_K 46.6%,
+Q5_K 23.0%, Q6_K 30.4%), the kernels now average **1.63 instr/weight**.
+Driving Q5_K and Q6_K all the way to Q4_K's 1.19 would be 1.37x, or
+about **4.35 tok/s** -- and that is the optimistic bound assuming
+perfect kernels. **Further MMX gains have to come from outside the
+inner loop**, which is what makes lm-head requantisation (25% of the
+pass, in the most expensive format per weight) the next lever rather
+than more instruction-shaving.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.21.1 — MMX Q6_K rewritten: 2.70 -> 3.18 tok/s
+
+Single core, sandbox Xeon, `--backend mmx`, Qwen3.5-0.8B-Q4_K_M:
+**2.696 -> 3.183 tok/s (1.18x)**. All of it from one kernel.
+
+### Q6_K was making two passes over the same bytes
+
+`mmx_q6K_half` processed the low-nibble planes and the high-nibble
+planes separately, re-loading and re-unpacking the same `ql` and `qh`
+bytes for each. Measured cost:
+
+| format | MMX instrs / weight | ns/weight |
+|---|---|---|
+| Q4_K | 1.19 | 0.293 |
+| Q5_K | 1.88 | 0.384 |
+| **Q6_K (before)** | **3.50** | **0.601** |
+| **Q6_K (after)** | **2.12** | **0.420** |
+
+Q4_K and Q5_K already used the merged shape: load the `ql` byte once,
+`PAND` for the low nibble, `PSRLW`+`PAND` for the high, mask entirely
+in the byte domain, widen to words once at the end. Q6_K did not, only
+because its 2-bit high part needs a different shift per plane -- and
+that is two extra instructions, not a second pass.
+
+**1.43x on Q6_K, which was 42% of matvec time.**
+
+### A latent bug found on the way
+
+`c_mask_3` is a WORD-domain constant (`0x0003000300030003`), but the
+new kernel masks *packed bytes* before widening. Added `c_mask_3b`
+(`0x0303030303030303`). The old code got away with it by unpacking
+first; anything that masks bytes needs the byte-domain constant, and
+the same applies to `c_mask_f` vs `c_mask_fb`.
+
+### Two changes measured and reverted
+
+Both are recorded because the reasoning looked sound and the numbers
+disagreed:
+
+- **Halving the reduction rate** (one `MOVD` per 32 weights instead of
+  per 16, with two independent accumulator chains): 0.601 -> 0.598
+  ns/weight. Nothing. The reduction was not the bottleneck.
+- **The VIS bias trick** (drop four `PSUBW` per 16 weights, fold
+  `-32*sum(x)` into the float phase using the precomputed `s16` sums):
+  the kernel improved 0.420 -> 0.409, but the whole model got
+  *slower*, 3.173 -> 3.129 tok/s. The extra float work per group cost
+  more than the four saved MMX instructions.
+
+Bit-identical to `i8` and `ref` on every format (`tests/t_ident.c`,
+memcmp). The 486 baseline is unchanged: 0 CMOV, 0 SSE/AVX.
+
+### Why this stops at 3.18 and not 4.5
+
+matvec is 93.2% of the forward pass and uses **1.43 GB/s of ~10 GB/s
+available** -- purely instruction-bound, not memory-bound. The kernels
+already issue ~1.6-2 MMX instructions per cycle, so scheduling is not
+the lever; instruction count is.
+
+Q4_K at 1.19 instr/weight is at the MMX floor. Six of its nineteen
+instructions per sixteen weights are `PUNPCK` widening that exists
+only because `PMADDWD` takes words -- MMX has no unsigned-byte
+multiply-accumulate, `PMADDUBSW` is SSSE3 (2006), and Extended MMX on
+the Geode adds only `PSHUFW`/`PAVGB`/`PSADBW`.
+
+Weighting the three formats by their share of the model's weights
+gives 1.63 instr/weight today. Driving Q5_K and Q6_K all the way down
+to Q4_K's 1.19 would be **1.37x -> about 4.35 tok/s**, and that is the
+optimistic bound with perfect kernels. Reaching 4.5 needs a change
+outside the MMX inner loop.
+
 ## 1.21.0 — one binary per platform, with AVX2 inside the 486 build
 
 1.18.0 shipped an ISA ladder: separate `-sse2` and `-avx2` downloads
