@@ -92,6 +92,8 @@ jobs:
             libc6-dev-i386 \
             gcc-mingw-w64-i686-win32 \
             binutils-mingw-w64-i686 \
+            gcc-mingw-w64-x86-64-win32 \
+            binutils-mingw-w64-x86-64 \
             qemu-user-static
 
       # Best-effort, and genuinely optional: SPARC and s390x only widen
@@ -167,21 +169,45 @@ jobs:
           ok() { echo "$1=yes" >> "$GITHUB_OUTPUT"; echo "  $1: yes"; }
           no() { echo "$1=no"  >> "$GITHUB_OUTPUT"; echo "::warning::$1 unavailable"; }
 
+          # ASK THE MAKEFILE which compilers it intends to invoke,
+          # rather than repeating their names here. Run #36 failed
+          # because 1.18.0 added a second mingw (x86_64-w64-mingw32-gcc
+          # for the new 64-bit Windows builds) and this workflow still
+          # listed only the 32-bit one -- so apt never installed it,
+          # the probe never looked for it, and `make all` died at the
+          # first `make windows BITS=64`. Deriving the names means a
+          # new toolchain can never again be missing from CI without
+          # the probe noticing.
+          CC32=$(make -s printvar VAR=CC     2>/dev/null || echo cc)
+          WCC32=$(make -s printvar VAR=WINCC   2>/dev/null || echo i686-w64-mingw32-gcc)
+          WCC64=$(make -s printvar VAR=WINCC64 2>/dev/null || echo x86_64-w64-mingw32-gcc)
+          echo "  compilers the Makefile wants: $CC32 / $WCC32 / $WCC64"
+
           req=0
-          if cc -m32 -D_FILE_OFFSET_BITS=64 -o /tmp/p32 /tmp/p.c 2>/tmp/e32; then
+          if $CC32 -m32 -D_FILE_OFFSET_BITS=64 -o /tmp/p32 /tmp/p.c 2>/tmp/e32; then
             ok x86_32
           else
-            echo "::error::x86_32 unusable -- 'cc -m32' cannot compile the"\
+            echo "::error::x86_32 unusable -- '$CC32 -m32' cannot compile the"\
                  "system headers src/net_posix.c needs. The 32-bit kernel"\
                  "headers (linux-libc-dev:i386) or libc6-dev-i386 are missing."
             sed 's/^/    /' /tmp/e32; req=1
           fi
-          if i686-w64-mingw32-gcc -o /tmp/p.exe /tmp/pw.c 2>/tmp/ewin; then
+          if $WCC32 -o /tmp/p32.exe /tmp/pw.c 2>/tmp/ewin; then
             ok win32
           else
-            echo "::error::win32 unusable -- i686-w64-mingw32-gcc cannot"\
-                 "compile the winsock headers src/net_win32.c needs."
+            echo "::error::win32 unusable -- $WCC32 cannot compile the"\
+                 "winsock headers src/net_win32.c needs."\
+                 "(package: gcc-mingw-w64-i686-win32)"
             sed 's/^/    /' /tmp/ewin; req=1
+          fi
+          if $WCC64 -o /tmp/p64.exe /tmp/pw.c 2>/tmp/ewin64; then
+            ok win64
+          else
+            echo "::error::win64 unusable -- $WCC64 cannot compile the"\
+                 "winsock headers src/net_win32.c needs. 'make all' builds"\
+                 "infer-*-windows64.exe and windows64-avx2.exe with it."\
+                 "(package: gcc-mingw-w64-x86-64-win32)"
+            sed 's/^/    /' /tmp/ewin64; req=1
           fi
           if [ "$req" -ne 0 ]; then
             echo "::error::Required toolchains are missing or incomplete."\
@@ -243,6 +269,30 @@ jobs:
           make all
           ls -l "$LINUX" "$LINUX64" "$WIN" "$WIN_SSE2" "$WIN64" "$WIN64_AVX2"
           ./"$LINUX" --version
+
+      # The probe can only check compilers it knows about. This asserts
+      # the probe knows about ALL of them, by asking `make -n all` which
+      # binaries it would actually invoke and confirming each one exists.
+      # Without this, adding a target with a new toolchain silently
+      # bypasses the probe -- which is exactly how run #36 happened.
+      - name: the probe covers every compiler 'make all' uses
+        run: |
+          make clean >/dev/null
+          missing=0
+          for c in $(make -n all 2>/dev/null \
+                     | grep -oE '(^|[[:space:]])[a-z0-9_]+(-[a-z0-9_]+)*-(gcc|cc)\b' \
+                     | tr -d ' ' | sort -u); do
+            if command -v "$c" >/dev/null 2>&1; then
+              echo "  $c: present"
+            else
+              echo "::error::'make all' invokes '$c' but it is not installed,"\
+                   "and the probe step did not catch it. Add it to the"\
+                   "required-toolchains step and to the probe."
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+          make all >/dev/null
 
       - name: unit tests
         run: |
@@ -531,10 +581,18 @@ jobs:
 
       - name: logging is opt-in, and says so when it cannot comply
         run: |
-          # --log-stages on a build without timers must explain itself,
-          # and must do so before touching the model.
+          # --log-stages on a build WITHOUT timers must explain itself,
+          # and must do so before touching the model. Since 1.18.0 the
+          # shipped binaries all carry the timers, so this has to be
+          # checked against a deliberately timer-less build rather than
+          # against $LINUX -- which is why the old form of this step
+          # started failing the moment the artifacts changed.
+          make clean >/dev/null
+          make linux >/dev/null
           ./"$LINUX" run /nonexistent.gguf --log-stages 2>&1 \
             | grep -q 'INFER_PROFILE'
+          make clean >/dev/null
+          make all >/dev/null
           # every shipped build has the timers, and must stay silent
           # unless they are asked for
           ! ./"$LINUX" run /nonexistent.gguf 2>&1 | grep -q 'STAGE PROFILE'

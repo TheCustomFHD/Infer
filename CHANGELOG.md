@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.18.1 — CI: the probe now derives its compiler list from the Makefile
+
+1.18.0 added the 64-bit Windows builds, which need a **second** mingw
+toolchain (`x86_64-w64-mingw32-gcc`). The workflow still installed and
+probed only the 32-bit one. Run #36 got through nine green steps and
+died in `make all`:
+
+```
+make[1]: x86_64-w64-mingw32-gcc: No such file or directory
+make[1]: *** [Makefile:389: windows] Error 127
+make: *** [Makefile:302: all] Error 2
+```
+
+Reproduced locally by hiding the binary — identical error.
+
+This is finding 43 again, and that is the part worth fixing. The probe
+exists specifically to catch "a compiler the build needs is missing",
+and it missed this one for the dumbest possible reason: it had the
+compiler names *hardcoded*, so a new toolchain was invisible to it.
+Patching the list would fix this instance and leave the next one.
+
+Two structural changes:
+
+- **`make printvar VAR=X`** — a one-line target that prints any
+  Makefile variable. The probe now asks the Makefile for `CC`, `WINCC`
+  and `WINCC64` instead of repeating the answer. A renamed or added
+  toolchain propagates automatically.
+- **A new step asserts the probe is complete**: it runs `make -n all`,
+  extracts every compiler that would actually be invoked, and fails if
+  any is absent — naming the tool and telling you to add it to both
+  places. Adding a target with a new toolchain can no longer bypass
+  the probe silently.
+
+Both verified in both directions: healthy runner passes; with
+`x86_64-w64-mingw32-gcc` hidden the probe now fails at **step 5**
+naming `gcc-mingw-w64-x86-64-win32`, instead of at step 10 with
+`Error 127`.
+
+`gcc-mingw-w64-x86-64-win32` and `binutils-mingw-w64-x86-64` are also
+now in the required-toolchains transaction, where they should have gone
+in 1.18.0.
+
+No source change. `infer` is byte-identical to 1.18.0 apart from the
+version string.
+
 ## 1.18.0 — Windows 64-bit, and an SSE2/AVX2 ladder
 
 Windows users download binaries; Linux users generally build their own.

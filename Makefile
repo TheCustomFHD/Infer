@@ -98,7 +98,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.18.0
+VERSION = 1.18.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -269,7 +269,7 @@ TOOLCHAIN = studio
 
 .PHONY: all linux windows solaris \
         test bench solaris-test vis-shim-test i8-split-test \
-        clean version checkversion help
+        clean version checkversion printvar help
 
 # Everything shippable: portable and 64-bit, each with and without the
 # timers. NATIVE=1 is deliberately absent -- it only runs on the machine
@@ -680,6 +680,19 @@ bench: $(BUILD)/t_backend
 
 version:
 	@echo $(VERSION)
+
+# Print any single variable, so a script can ask the Makefile what it
+# intends to do instead of hardcoding a duplicate answer:
+#
+#     make printvar VAR=WINCC64   ->  x86_64-w64-mingw32-gcc
+#
+# CI uses this to discover which compilers to install and probe. When
+# 1.18.0 added the 64-bit Windows builds the workflow still named only
+# the 32-bit mingw, so the new toolchain was never installed and the
+# run died in `make all` (finding 45). Deriving the names makes that
+# class of drift impossible.
+printvar:
+	@echo $($(VAR))
 
 # Guard against VERSION drifting from src/infer.h.
 checkversion:

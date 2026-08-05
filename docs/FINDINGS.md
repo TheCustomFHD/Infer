@@ -1600,6 +1600,54 @@ under both `gcc -m32` and mingw. The *runtime* is not:
 So the floor is a Pentium II for reasons outside our code, exactly as
 finding 34 said. Nothing regressed; the MMX build is byte-identical.
 
+## 45. A probe with a hardcoded list is a probe with a blind spot
+
+Finding 43 replaced a trivial probe with one that compiles the real
+headers, and said: *a capability probe must exercise the same headers,
+flags and libraries as the build it authorises.* Run #36 found the hole
+that sentence left open — the probe checked the right **things**, but
+against a **hardcoded list of tools**.
+
+1.18.0 added 64-bit Windows builds, which invoke a second mingw
+(`x86_64-w64-mingw32-gcc`). The workflow named only the 32-bit one, in
+two places: the apt transaction and the probe. So the compiler was
+never installed, the probe never looked for it, nine steps went green,
+and `make all` died:
+
+```
+make[1]: x86_64-w64-mingw32-gcc: No such file or directory
+make[1]: *** [Makefile:389: windows] Error 127
+```
+
+The tempting fix is to add the package name to both lists. That fixes
+this instance and guarantees a repeat the next time a target gains a
+toolchain — the failure mode is *duplication between the Makefile and
+the workflow*, not a missing string.
+
+Fixed by removing the duplication:
+
+1. **`make printvar VAR=X`** prints any Makefile variable, so CI can
+   ask which compilers the build intends to use:
+   ```
+   CC32=$(make -s printvar VAR=CC)
+   WCC32=$(make -s printvar VAR=WINCC)
+   WCC64=$(make -s printvar VAR=WINCC64)
+   ```
+2. **A completeness assertion.** `make -n all` is parsed for every
+   compiler it would invoke, and each must exist. If a future target
+   adds a toolchain the probe doesn't know about, *that* step fails
+   with a message naming the tool — the probe can no longer be
+   silently incomplete.
+
+Verified in both directions: healthy runner reports
+`x86_32/win32/win64: yes`; with the 64-bit mingw hidden, the probe
+fails at step 5 naming `gcc-mingw-w64-x86-64-win32`, instead of at
+step 10 with `Error 127`.
+
+**The rule:** any list in CI that restates something the build system
+already knows will drift, and it will drift silently. Derive it, or
+assert the two agree. "Remember to update both" is not a mechanism.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full
