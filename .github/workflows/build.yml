@@ -67,7 +67,9 @@ jobs:
             build-essential \
             gcc-multilib \
             gcc-mingw-w64-i686-win32 \
-            binutils-mingw-w64-i686
+            binutils-mingw-w64-i686 \
+            gcc-sparc64-linux-gnu \
+            qemu-user-static
 
       # Everything below refers to $LINUX / $WIN instead of a literal
       # version, so a VERSION bump cannot break the workflow.
@@ -80,6 +82,8 @@ jobs:
           echo "LINUX_P=infer-$V-linux-profile"     >> "$GITHUB_ENV"
           echo "WIN=infer-$V-windows.exe"           >> "$GITHUB_ENV"
           echo "WIN_P=infer-$V-windows-profile.exe" >> "$GITHUB_ENV"
+          echo "LINUX64=infer-$V-linux64" >> "$GITHUB_ENV"
+          echo "LINUX64_P=infer-$V-linux64-profile" >> "$GITHUB_ENV"
 
       - name: Makefile VERSION matches src/infer.h
         run: make checkversion
@@ -124,6 +128,47 @@ jobs:
           ./build/t_endian
           ./build/t_jinja
 
+      # Our objects must be 486-clean even though the linked binary
+      # needs a Pentium II (glibc's _dl_aux_init uses CMOV -- see
+      # finding 34). This checks what we control.
+      - name: our own objects contain no CMOV and no SSE/AVX
+        run: |
+          bad=0
+          for f in src/*.c; do
+            case "$f" in *win32*|*_vis*) continue;; esac
+            gcc -std=gnu89 -O2 -m32 -march=i486 -mtune=geode -mmmx \
+                -mno-sse -mno-sse2 -mfpmath=387 -DINFER_HAVE_MMX \
+                -D_FILE_OFFSET_BITS=64 -Isrc -c -o /tmp/chk.o "$f" || continue
+            n=$(objdump -d /tmp/chk.o --no-show-raw-insn \
+                | grep -cE '^[[:space:]]+[0-9a-f]+:[[:space:]]+(cmov|.*%xmm|.*%ymm)' || true)
+            if [ "$n" -ne 0 ]; then echo "::error::$f has $n non-486 instructions"; bad=1; fi
+          done
+          test "$bad" -eq 0
+
+      # The default build must keep selecting the hand-written MMX
+      # kernel. If a change ever makes `auto` pick something else here,
+      # the 486/Geode target has silently changed behaviour.
+      # The 64-bit artifact is a different promise: it targets x86-64,
+      # so SSE2 is guaranteed and `auto` should take the vectorised i8.
+      - name: 64-bit artifact selects the vectorised i8
+        run: |
+          ./"$LINUX64" --backend list
+          ./"$LINUX64" --backend list | grep -qE '^  i8.*selected'
+          n=$(objdump -d "$LINUX64" --no-show-raw-insn | grep -cE '%xmm' || true)
+          echo "64-bit SIMD instructions: $n"
+          test "$n" -gt 100
+
+      - name: default build still selects mmx
+        run: |
+          ./"$LINUX" --backend list | grep -qE '^  mmx.*selected'
+
+      - name: shipped binary runs on an emulated Pentium II
+        run: |
+          sudo apt-get install -y qemu-user-static
+          qemu-i386-static -cpu pentium2 ./"$LINUX" --backend list
+          qemu-i386-static -cpu pentium2 ./"$LINUX" --backend list \
+            | grep -q 'mmx.*selected'
+
       - name: i486 baseline -- no CMOV emitted for ordinary code
         run: |
           # MMX is expected: backend_mmx.c is runtime-gated on CPUID.
@@ -146,6 +191,79 @@ jobs:
           ./"$LINUX" --backend list | grep -q '^  mmx'
           ./"$LINUX" --backend list | grep -q '^  i8'
           ./"$LINUX" --backend list | grep -q '^  ref'
+
+      # -------------------------------------------------------------
+      # The shipped binary must be GENERIC: every accelerated kernel
+      # compiled in, none of them reachable unless the CPU has it.
+      # These two checks are the whole promise of "one binary".
+      # -------------------------------------------------------------
+      - name: shipped binary contains no unconditional SSE/AVX
+        run: |
+          # backend_mmx.c is allowed MMX (runtime CPUID gate). Anything
+          # touching xmm/ymm would fault on a 486 or a Geode, which have
+          # no such registers, and nothing gates those today.
+          n=$(objdump -d "$LINUX" --no-show-raw-insn \
+              | grep -cE '%xmm|%ymm' || true)
+          echo "xmm/ymm references: $n"
+          test "$n" -eq 0
+          n=$(objdump -d "$WIN" --no-show-raw-insn \
+              | grep -cE '%xmm|%ymm' || true)
+          echo "windows xmm/ymm references: $n"
+          test "$n" -eq 0
+
+      - name: every build flag still builds
+        run: |
+          for f in "PROFILE=1" "NATIVE=1" "BITS=64" "NO_MMX=1" \
+                   "NO_SSE2=1" "NO_AVX2=1" "BITS=64 PROFILE=1"; do
+            echo "== make linux $f =="
+            make clean >/dev/null
+            make linux $f
+          done
+          make clean >/dev/null
+          make all
+
+      # -------------------------------------------------------------
+      # SPARC / Solaris. No Solaris runner exists, so this
+      # cross-compiles with sparc64-linux-gnu-gcc and runs the tests
+      # under qemu. It catches endianness and VIS breakage, which is
+      # what has actually gone wrong on that target historically.
+      # -------------------------------------------------------------
+      - name: SPARC cross-build (big-endian, VIS in and out)
+        run: |
+          for f in "" "NO_VIS=1" "PROFILE=1"; do
+            echo "== solaris $f =="
+            make clean >/dev/null
+            make solaris TOOLCHAIN=gcc GNUCC=sparc64-linux-gnu-gcc \
+                 SOLLIBS=-lm $f
+          done
+          make clean >/dev/null
+
+      - name: SPARC kernels are bit-exact under qemu
+        run: |
+          make solaris-test TOOLCHAIN=gcc \
+               GNUCC="sparc64-linux-gnu-gcc -static" SOLLIBS=-lm
+          for t in t_vis t_viskern t_vissat t_endian; do
+            echo "== $t =="
+            qemu-sparc64-static build/$t
+          done
+          make clean >/dev/null
+
+      - name: SPARC binary runs without VIS on a CPU that lacks it
+        run: |
+          # A no-VIS build must still select a working backend rather
+          # than falling over -- that is the "gated" half of generic.
+          make solaris TOOLCHAIN=gcc NO_VIS=1 \
+               GNUCC="sparc64-linux-gnu-gcc -static" SOLLIBS=-lm
+          qemu-sparc64-static "$(make version | sed 's/^/infer-/')-solaris" \
+              --backend list
+          make clean >/dev/null
+
+      - name: host-side kernel exactness (no model needed)
+        run: |
+          make i8-split-test && ./build/t_i8split
+          make vis-shim-test && ./build/t_viskern_sun && ./build/t_viskern_gcc
+          make clean >/dev/null
+          make all
 
       - name: windows exe imports only XP-safe DLLs
         run: |
@@ -229,6 +347,8 @@ jobs:
           path: |
             infer-*-linux
             infer-*-linux-profile
+            infer-*-linux64
+            infer-*-linux64-profile
             infer-*-windows.exe
             infer-*-windows-profile.exe
 
@@ -280,44 +400,64 @@ jobs:
           fi
           ls -l "infer-$VER-binaries.zip" "infer-$VER-source.zip"
 
+      # Pull the newest CHANGELOG section into the release body, so the
+      # notes are the ones actually written for this version instead of
+      # a fixed blurb nobody updates.
+      - name: release notes from CHANGELOG
+        env:
+          VER: ${{ needs.build.outputs.version }}
+        run: |
+          # everything from the first "## " heading to just before the next
+          awk '/^## /{n++; if(n>1) exit} n==1' CHANGELOG.md > notes.md
+          head -1 notes.md | grep -q "$VER" || {
+            echo "::error::newest CHANGELOG section is not for $VER:"
+            head -1 notes.md
+            exit 1
+          }
+          {
+            echo
+            echo "---"
+            echo
+            echo "### Downloads"
+            echo
+            echo "| file | notes |"
+            echo "|---|---|"
+            echo "| \`infer-$VER-windows.exe\` | Windows, 32-bit -- Pentium II and later |"
+            echo "| \`infer-$VER-windows-profile.exe\` | ...with per-stage timers |"
+            echo "| \`infer-$VER-linux\` | Linux, 32-bit -- i486 baseline, picks \\\`mmx\\\` |"
+            echo "| \`infer-$VER-linux-profile\` | ...with per-stage timers |"
+            echo "| \`infer-$VER-linux64\` | Linux, 64-bit -- picks the SSE2-vectorised \\\`i8\\\` |"
+            echo "| \`infer-$VER-linux64-profile\` | ...with per-stage timers |"
+            echo
+            echo "Every binary carries **all** the x86 kernels (\`mmx\`, \`i8\`,"
+            echo "\`ref\`) and picks one at run time after a CPUID probe."
+            echo
+            echo "The 32-bit builds use an **i486 baseline** and select"
+            echo "\`mmx\`. The 64-bit build has SSE2 by definition, so the"
+            echo "compiler vectorises the portable \`i8\` path and \`auto\`"
+            echo "picks that instead -- measurably faster than the"
+            echo "hand-written MMX kernel on a modern CPU."
+            echo
+            echo "In practice the 32-bit binaries need a **Pentium II or"
+            echo "later**: our own objects contain no CMOV, but glibc and the"
+            echo "mingw CRT do."
+            echo
+            echo "Solaris/SPARC is not shipped as a binary -- the toolchain"
+            echo "cannot be redistributed. Build it with \`gmake solaris\`;"
+            echo "CI cross-compiles and tests it under qemu on every push."
+            echo
+            echo "\`\`\`sh"
+            echo "sha256sum -c SHA256SUMS"
+            echo "\`\`\`"
+          } >> notes.md
+          echo "--- release body ---"
+          cat notes.md
+
       - name: publish
         uses: softprops/action-gh-release@v2
         with:
           name: infer ${{ needs.build.outputs.version }}
-          generate_release_notes: true
+          body_path: notes.md
           files: |
             infer-${{ needs.build.outputs.version }}-binaries.zip
             infer-${{ needs.build.outputs.version }}-source.zip
-          body: |
-            ## infer ${{ needs.build.outputs.version }}
-
-            Four binaries. Two platforms, two options each: with or
-            without the profiler.
-
-            | file | notes |
-            |---|---|
-            | `infer-${{ needs.build.outputs.version }}-windows.exe` | Windows XP and later |
-            | `infer-${{ needs.build.outputs.version }}-windows-profile.exe` | ...with per-stage timers |
-            | `infer-${{ needs.build.outputs.version }}-linux` | Linux, 32-bit x86 |
-            | `infer-${{ needs.build.outputs.version }}-linux-profile` | ...with per-stage timers |
-
-            **All four contain all three backends** (`mmx`, `i8`, `ref`)
-            and pick the fastest the CPU supports at run time. **All four
-            use an i486 baseline**, so one binary runs on a 486 and
-            accelerates on anything with MMX.
-
-            The Windows binaries import exactly three DLLs — KERNEL32,
-            msvcrt, WS2_32 — all present on a stock XP install.
-
-            These are the exact binaries the CI job verified: 0 CMOV in
-            our code, MMX kernels present, three DLLs, all backends
-            agreeing under greedy decoding. `SHA256SUMS` is inside the
-            zip.
-
-            No model weights and no third-party chat templates are
-            bundled; see `README-BINARIES.txt`.
-
-            SPARC/Solaris is not shipped as a binary — build it with
-            `gmake solaris`. See `COMPILE.md`.
-
-            See `CHANGELOG.md` for what changed.

@@ -69,23 +69,86 @@ make all
 ls -1 infer-*
 ```
 ```
-infer-1.14.0-linux
-infer-1.14.0-linux-profile
-infer-1.14.0-windows-profile.exe
-infer-1.14.0-windows.exe
+infer-<version>-linux
+infer-<version>-linux-profile
+infer-<version>-windows-profile.exe
+infer-<version>-windows.exe
 ```
 
-Four binaries, no more. There is no separate MMX or i486 build: all four
-contain all three backends and use an i486 baseline.
+Four binaries from two targets. There is no separate MMX or i486 build:
+every x86 binary contains all the x86 kernels (`mmx`, `i8`, `ref`) and uses an i486 baseline, selecting one at run time.
 
 Individually:
 
 ```sh
 make linux
-make linux-profile
+make linux PROFILE=1
 make windows
-make windows-profile
+make windows PROFILE=1
 ```
+
+Flags, all combinable: `PROFILE=1`, `NATIVE=1`, `BITS=64`,
+`TOOLCHAIN=gcc` (Solaris), and `NO_MMX=1` / `NO_SSE2=1` / `NO_AVX2=1` /
+`NO_VIS=1` to leave a kernel out. **Do not add build targets** — there
+are three (`linux`, `windows`, `solaris`) and anything else is a flag.
+
+---
+
+## 2b. Which build for which machine
+
+Measured on a Xeon @ 2.60 GHz with the 0.8B Q4_K_M model, `-n 10 -t 0
+--seed 1 -c 512`, generation tok/s, best of 3. Ordering transfers to
+other hosts; magnitudes do not.
+
+| target CPU | build | picks | tok/s here | notes |
+|---|---|---|---|---|
+| **pure 486** (no MMX) | `make linux` + musl/uClibc | `ref` | — | see the libc trap below |
+| **Geode LX** (486+MMX) | `make linux` | `mmx` | 2.45 | the shipped default |
+| **Pentium M / Dothan** | `make linux` | `mmx` | 2.45 | SSE2 exists but no kernel uses it yet |
+| **i7 9th gen (AVX2)** | `make linux BITS=64 NATIVE=1` | `i8` | **4.23** | 1.73x; runs only on that CPU class |
+| i7, portable binary | `make linux` | `mmx` | 2.45 | same binary as the Geode |
+
+`NATIVE=1` and `BITS=64` both emit CMOV and SSE/AVX (`NATIVE=1`: 114
+CMOV + 716 SSE/AVX; `BITS=64`: 126 + 2455). **Neither is 486- or
+Geode-safe.** Only the default and `PROFILE=1` are.
+
+### The libc trap on a real 486
+
+Our object files are clean — 0 CMOV, 0 SSE/AVX across every
+translation unit. **glibc is not.** A `make linux` binary, and even a
+static `printf("hi")`, dies before `main()`:
+
+```
+$ qemu-i386-static -cpu 486 ./infer-<version>-linux
+qemu: uncaught target signal 4 (Illegal instruction)
+
+$ qemu-i386-static -cpu 486 -d in_asm /tmp/hello_static
+IN: _dl_aux_init
+0x0805eb79:  0f 42 c2   cmovbl %edx, %eax      <-- inside glibc
+```
+
+Emulated floor, default build:
+
+```
+486        Illegal instruction   (glibc _dl_aux_init)
+pentium    Illegal instruction   (same)
+pentium2   mmx  <- selected
+pentium3   mmx  <- selected
+n270       mmx  <- selected
+core2duo   mmx  <- selected
+Haswell    mmx  <- selected
+```
+
+So the shipped Linux binary is **Pentium II and later** in practice,
+for the same reason the Windows builds are Pentium-Pro-and-later: the
+C runtime, not our code. A genuine 486 needs a libc built for one —
+musl or uClibc-ng, statically linked. Debian's `musl-gcc` is x86-64
+only, so this has **not been verified here**; it is the known route,
+not a tested one.
+
+This mirrors the mingw CRT finding: `strtod`/`pow`/`ldexp` pull in
+CMOV on Windows too. Keep asserting our own objects are clean; do not
+claim the linked binary boots a 486 without testing it on one.
 
 ---
 
@@ -242,8 +305,8 @@ make clean
 | four DLLs, one is `libwinpthread-1.dll` | posix mingw | install the `-win32` variant |
 | `PE32+` instead of `PE32` | used `x86_64-w64-mingw32-gcc` | use `i686-` |
 | `cannot open 'model.gguf'` mid-session | sandbox pruned it | re-download |
-| `--log-stages` prints nothing | non-profile build | use `make linux-profile` |
-| `make: *** No rule to make target 'geode'` | old target name | targets are `linux`, `linux-profile`, `windows`, `windows-profile` |
+| `--log-stages` prints nothing | non-profile build | use `make linux PROFILE=1` |
+| `make: *** No rule to make target 'geode'` | old target name | targets are `linux`, `windows`, `solaris`; everything else is a flag |
 | backends print different text | a kernel is broken | compare against `--backend ref` |
 
 ---
@@ -254,8 +317,8 @@ Separate world. Different compiler, big-endian, 64-bit, no MMX.
 
 ```sh
 gmake solaris              # Sun Studio, 64-bit
-gmake solaris-profile      # ...with stage timers
-gmake solaris-gcc          # GCC on Solaris, 64-bit
+gmake solaris PROFILE=1      # ...with stage timers
+gmake solaris TOOLCHAIN=gcc          # GCC on Solaris, 64-bit
 gmake solaris-test         # test programs
 ```
 

@@ -45,15 +45,18 @@ the PIC register.
 
 ## Lessons recorded in the source
 
-**Nibble lookup tables.** Two 256-byte tables mapping a packed byte to
-its two nibbles measured **2.46x** on an isolated 486-targeted
-benchmark — and **0.97x** on real Geode hardware for Q4_K. They are now
-used only by Q5_K, whose inner loop already loads the `qh` byte so the
-table load rides along with one that was happening anyway.
+**Nibble lookup tables (removed in 1.16.0).** Two 256-byte tables
+mapping a packed byte to its two nibbles measured **2.46x** on an
+isolated 486-targeted benchmark and **0.97x** on real Geode hardware.
+They survived in Q5_K on the theory that its `qh` load made the table
+load free. Re-measured in 1.16.0 they were slower than the arithmetic
+on every remaining target (sparc64 155 → 147 instructions, i486 2.224 →
+1.984 ns/weight), and a table lookup is a gather that no vectoriser can
+handle. Both tables are gone; the nibbles are computed. See finding 32.
 
-The comment in the source says it plainly: *a microbenchmark with
-everything in L1 does not predict this machine.* That cost a release to
-learn.
+Two lessons, not one: *a microbenchmark with everything in L1 does not
+predict this machine*, and an optimisation kept on a rationale nobody
+re-runs will outlive its own justification.
 
 ## The i8 floor
 

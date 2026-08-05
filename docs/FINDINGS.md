@@ -777,6 +777,420 @@ re-deriving the term count from the loop bounds whenever one of these
 is written, and worth a test that actually saturates the lanes rather
 than trusting the arithmetic.
 
+## 30. us/call is the wrong unit when call sizes differ 6x
+
+The SPARC profile groups matvec time by weight format. Read as
+microseconds per call, it says Q6_K is the most expensive format on the
+machine -- 5.16x the cost of a Q4_K call. That reading drove the whole
+1.15.0 effort, and it is wrong.
+
+The formats do not carry equal work per call:
+
+```
+Q4_K   299,892,736 elements / 2646 calls =   113,338 elements/call
+Q5_K   150,994,944 elements /  972 calls =   155,345 elements/call
+Q6_K   300,417,024 elements /  443 calls =   678,142 elements/call
+```
+
+A Q6_K call carries **6x** the weights of a Q4_K call, because Q6_K
+holds `token_embd`, the LM head and the FFN down-projections -- the
+largest tensors in the model. Normalised per weight, on the same runs:
+
+```
+nanoseconds per weight       Q4_K     Q5_K     Q6_K
+i8   1.11.0 (32-bit)       618.05   975.41   508.35
+i8   1.12.1 (64-bit)       590.05  1097.44   435.96
+vis  1.14.2 (best of 3)    495.26  1151.72   426.90
+```
+
+**Q6_K has always been the cheapest format per weight on this machine**,
+including when it ran the portable integer path with no VIS kernel at
+all. It occupies ~27% of matvec time because it is ~40% of all weights,
+not because it is slow. Its 210-byte super-block carries 256 weights at
+6.56 bits each, so it streams fewer bytes per MAC than Q4_K's effective
+4.5 -- and on a machine this memory-bound, bytes per MAC is what a
+kernel is really paying.
+
+The format that stood out was **Q5_K, at 2.3x the per-weight cost of
+Q4_K** despite being only 25% wider. That was the real anomaly, and it
+was a code defect (finding 29), not a property of the format.
+
+### What the hardware said about the Q6_K kernel
+
+The kernel written on the strength of the misread profile is correct,
+bit-identical to `i8`, and cuts the instruction count 3.1x (4180 ->
+1338 per super-block). On an UltraSPARC IIi it bought nothing:
+
+```
+Q6_K / Q4_K cost per weight, same run (cancels machine state)
+  1.14.2, Q6_K on portable i8      0.862
+  1.15.1, Q6_K on the VIS kernel   0.855
+```
+
+0.8%. The 1.15.1 run was taken in a different session and is inflated
+overall -- `rms norms`, which no version touched, is 4.3x slower in it
+-- so absolute times across the two are not comparable. Correcting by
+any factor consistent with the untouched stages (1.14x to 1.28x) puts
+the Q6_K change between **+8% and -4%**. Under every plausible
+correction, the 3.1x instruction reduction is invisible.
+
+Q6_K was never instruction-bound. The kernel stays in the tree behind
+`-DINFER_VIS_Q6K` (`make solaris-vis-q6k`) and is **off by default**,
+because the default should be the path that measured faster.
+
+### The rules this produces
+
+- **Normalise by work, not by call.** A profile grouped by anything
+  whose call sizes differ must be divided by elements before formats
+  are compared. `us/call` compares tensor shapes, not kernel quality.
+- **Ratios within one run are the only safe cross-version comparison**
+  when runs come from different sessions. Absolute seconds carry the
+  machine's mood; ratios cancel it.
+- **Always check a stage nobody touched.** `rms norms` moving 4.3x is
+  what proved the 1.15.1 log was contaminated. Without that control the
+  Q4_K "regression" in the same log looks real -- it is 3 instructions
+  shorter and measured 8.5% slower.
+
+## 31. The same idea, opposite verdicts on two backends
+
+`i8_dot_q4_K` walked both nibble streams in one interleaved loop:
+
+```c
+for (l = 0; l < 32; l++) {
+    int w = qs[l];
+    acc1 += (w & 0xF) * x1[l];
+    acc2 += (w >> 4)  * x2[l];
+}
+```
+
+Splitting it into two separate reductions -- one per stream -- is worth
+**1.25x on x86-64** and **1.08x on the i486/Geode build**, bit-identical
+either way. It is pure deletion of interleaving; no new arithmetic.
+
+The interesting part is that **"split the loops" was already measured
+and rejected for the MMX backend at 0.90x** (see the rejected-optimisation
+list). Same transformation, same format, opposite sign:
+
+- In hand-written MMX the two streams share loaded registers. Splitting
+  forces the packed bytes to be re-loaded and re-masked for the second
+  pass, so it costs a full extra load+mask per 8 weights.
+- In portable C the compiler was juggling two dependency chains and two
+  activation pointers through one loop body. Separated, each loop is a
+  textbook reduction it can unroll and software-pipeline freely, and
+  `qs[l]` stays in a register across both uses of the same cache line.
+
+**A transformation is not good or bad in itself; it is good or bad
+against a particular register allocator.** Anything on the rejected list
+for one backend is worth re-testing on another rather than assumed dead.
+
+### Two things that did NOT work
+
+**Byte-domain nibble masking, ported from MMX: 0.78 -> 1.03 ns/weight.**
+The MMX kernel wins by masking four nibbles with one `pand` before
+widening (that was the 1.5.0 change). Hand-assembling the same 32-bit
+word in C from four `qs[]` bytes costs more than the byte loads it
+replaces, because the compiler already keeps those bytes in a register
+and folds the mask into the multiply. Reverted.
+
+**Splitting Q5_K the same way: 1.43 -> 1.51 ns/weight.** Q5_K reads two
+planes, `qs[l]` and `qh[l]`. Splitting doubles the loads of both, and
+the hi-bit shift has to be redone per stream. Q4_K reads one plane, so
+it does not pay that. Reverted; only Q4_K is split.
+
+### Measuring this needed care
+
+Comparing the two kernels through their float results reported
+differences on `-mfpmath=387` builds and none on x86-64 or SPARC. The
+integer accumulators are identical on all three -- verified over 200,000
+random sub-rows per architecture in `tests/t_i8split.c`. What differed
+was x87 80-bit intermediates being spilled at different points because
+the reference lived in another translation unit; `-ffloat-store` or
+`-mfpmath=sse` makes it vanish.
+
+**Never diff a float result to validate an integer change.** Compare the
+integers.
+
+### And the trend that motivated it holds everywhere
+
+Cost per weight relative to Q4_K in the same run, best kernel per
+platform:
+
+```
+                     Q5_K    Q6_K
+Geode  mmx 1.6.0     1.24    0.68
+i7     mmx 1.6.0     1.24    0.80
+SPARC  vis 1.15.1    1.15    0.86
+```
+
+Q6_K is the cheapest format per weight on **every** platform, and Q4_K
+is the one carrying 40% of the weights. The SPARC-only conclusion from
+finding 30 generalises. Notably the Q5_K outlier was fixed independently
+on x86 back in 1.5.0 (byte-domain masking, 52 -> 26 instructions per 16
+weights) and on SPARC in 1.15.1 (removing a redundant fold) -- the same
+class of defect, found ten versions apart.
+
+## 32. A lookup table that stopped paying, and then blocked vectorisation
+
+`i8_dot_q5_K` read its nibbles through a pair of 256-byte tables:
+
+```c
+static unsigned char nib_lo[256];   /* i & 0x0F */
+static unsigned char nib_hi[256];   /* i >> 4   */
+```
+
+The rationale, in a comment above them, was that two L1-resident loads
+beat an AND and a SHIFT on a 486. That comment also claimed "~2.4x on
+the Q4_K inner loop" -- but **Q4_K never used the tables**, in this
+version or any earlier one. Only Q5_K did.
+
+Two separate problems.
+
+**They block vectorisation.** A table lookup is a gather. No
+autovectoriser can do it, so under `-march=haswell` Q5_K stayed scalar
+while Q4_K and Q6_K sped up 2.2x and 1.7x around it. Q5_K is 20% of the
+model's weights and grew to **56% of matvec time**, cancelling the
+entire SIMD win: the whole-model figure was 3.18 tok/s with the tables
+and 4.58 without.
+
+**They were not faster scalar either.** Measured with the tables
+removed, on the two targets that ship:
+
+```
+i8_dot_q5_K, static instruction count
+  sparc64  155 -> 147   (35 -> 30 loads)
+  i486     168 -> 165
+
+Q5_K, i486-targeted build, ns/weight, best of 7
+  table       2.224
+  arithmetic  1.984      1.12x
+```
+
+An AND and a SHIFT are one cycle each and pipeline freely; a load has
+latency even from L1, and two loads per weight is two more slots in a
+loop that is already load-bound. Whatever advantage the tables had on
+a real 486 did not survive to any machine this project currently
+targets.
+
+Removed unconditionally -- no `-march` gate, because nothing measured
+faster with them. `nib_init()` and both tables are gone.
+
+**The lesson is about comment rot as much as caching.** The
+justification named a kernel that did not use the code, and no test
+covered the claim, so it survived unexamined through fifteen releases.
+An optimisation whose rationale cannot be re-run is a liability.
+
+## 33. A static backend priority list is wrong once the compiler vectorises
+
+`bk_select("auto")` walks a fixed table and takes the first entry the
+CPU supports:
+
+```c
+{ "vis", ... }, { "mmx", ... }, { "i8", ... }, { "ref", ... }
+```
+
+The ordering encodes "a hand-written SIMD kernel always beats portable
+C". That held for fifteen releases and stopped holding the moment
+`NATIVE=1` existed. Measured on the same machine, same model, same
+seed:
+
+```
+make linux NATIVE=1
+  --backend mmx    2.456 tok/s     <- what auto picked
+  --backend i8     3.274 tok/s     <- 1.33x faster
+```
+
+The MMX kernel is 64-bit SIMD written by hand. Under `-march=native`
+the compiler vectorises the *portable* `i8` path to 128/256-bit SSE2 or
+AVX2, and wins comfortably. Auto-selection handed the user a 33%
+slowdown and reported it as the fast path.
+
+The fix is a compile-time test, not a runtime benchmark:
+
+```c
+#if defined(__AVX2__) || defined(__SSE2__)
+#define I8_IS_VECTORISED 1
+#endif
+```
+
+`__SSE2__` and `__AVX2__` are defined by the compiler exactly when it
+may emit those instructions, which is exactly when `i8` gets
+vectorised. If set, `auto` prefers `i8` over the hand-written kernels.
+The default i486 build defines neither, so its selection is unchanged --
+verified by diffing the disassembly of `i8_dot_q4_K` before and after:
+byte-identical, and the object file is 64 bytes *smaller* because the
+dead branch folds away.
+
+**The general point:** a priority list is a cached benchmark result. It
+is only valid for the build configuration it was written against, and
+adding a build flag can silently invalidate it. Anything that ranks
+implementations should either re-derive the ranking from the build
+configuration, as here, or measure.
+
+## 34. The i486 baseline is real; the binary still needs a Pentium II
+
+Every claim in this project about running on a 486 has been about *our*
+code. That part holds — compiled with the shipping flags, every
+translation unit contains **zero** CMOV and zero SSE/AVX instructions.
+
+The linked binary is another matter. Under `qemu-i386 -cpu 486` the
+default build dies before reaching `main()`:
+
+```
+qemu: uncaught target signal 4 (Illegal instruction)
+
+IN: _dl_aux_init
+0x0805eb79:  0f 42 c2   cmovbl %edx, %eax
+```
+
+`_dl_aux_init` is glibc's own startup. A static `printf("hi")` built
+with `-march=i486` fails identically, so this is not our code at all.
+Emulated floor for the shipped binary:
+
+```
+486        Illegal instruction
+pentium    Illegal instruction
+pentium2   mmx  <- selected      <-- first CPU that works
+pentium3   mmx  <- selected
+n270 / core2duo / Haswell   all fine
+```
+
+Modern glibc targets i686. The i486 baseline still buys the Geode,
+which is a 486-class core *with* MMX and runs everything from
+`pentium2` upward, and it keeps `ref` genuinely portable for anyone
+linking a different libc.
+
+**This is the same shape as the mingw CRT finding**: the Windows builds
+are Pentium-Pro-and-later because `strtod`/`pow`/`ldexp` in the CRT use
+CMOV, not because our kernels do. Two runtimes, same conclusion, and in
+both cases the compiler flags were doing exactly what they claimed.
+
+A real 486 needs a libc compiled for one — musl or uClibc-ng, static.
+Debian's `musl-gcc` is x86-64 only, so that route is **documented but
+untested here**.
+
+**The rule:** keep asserting our objects are clean, because that is
+what we control and CI can check it. Do not extend the claim to the
+linked binary without running it on the target. "Built to an i486
+baseline" and "boots a 486" are different statements.
+
+## 35. Which loop shape is fastest depends on the compiler flags
+
+`i8_dot_q5_K` reads two planes, `qs` and `qh`, and produces two
+accumulators. Two ways to write it:
+
+- **interleaved** -- one loop, each plane read once, two chains
+- **split** -- two loops, each a clean reduction, both planes re-read
+
+1.15.3 measured the split and rejected it: it doubles the loads, and
+scalar that costs more than it saves (i486 165 -> 170 instructions,
+sparc64 147 -> 160).
+
+That verdict inverts the moment SSE2 is available. Interleaved, the
+vectoriser produces something poor; split, each loop is a textbook
+reduction. On a Dothan-targeted build (`-march=pentium-m -msse2
+-ftree-vectorize`), whole-model:
+
+```
+matvec Q5_K   3.489 s -> 1.853 s     1.88x
+end to end    2.756   -> 3.308 tok/s 1.20x
+```
+
+Without the split, SSE2 was barely worth having: Q4_K went 1.87x
+faster and Q6_K 1.28x, but Q5_K went **0.56x** -- backwards -- and
+swallowed the rest, leaving 1.07x on matvec overall. It is 20% of the
+model's weights and had become 48% of matvec time.
+
+So the shape is selected by the same predicate as finding 33:
+
+```c
+#if defined(__SSE2__) || defined(__AVX2__)
+    /* split: two clean reductions */
+#else
+    /* interleaved: one pass, fewer loads */
+#endif
+```
+
+The i486 object is **byte-identical** to before the change, verified by
+diffing disassembly. Both shapes are the same reassociation of
+independent integer sums -- proven exact over 200,000 random sub-rows
+on x86-64, i486, SSE2 and big-endian sparc64 (`tests/t_q5split.c`).
+
+**The pattern, now three times over:** finding 31 (split helps i8, hurts
+MMX), finding 33 (priority list wrong once i8 vectorises), and this. An
+optimisation is not fast or slow in itself; it is fast or slow against
+a specific code generator. A rejected result is only valid for the
+configuration it was measured in, and adding a build flag can flip it.
+
+## 36. Instruction count is not the i486's cost model either
+
+The 1.15.3 Q4_K split was justified on x86-64 and a modern host. Its
+effect on the i486-targeted build looked like a regression:
+
+```
+i8_dot_q4_K   151 -> 159 static instructions
+```
+
+Eight more instructions, on the one target where instruction count is
+supposed to matter most. Measured, on the same build:
+
+```
+Q4_K   1.788 -> 1.609 ns/weight     1.11x FASTER
+Q5_K   2.219 -> 2.040 ns/weight     1.09x FASTER
+```
+
+End to end with `--backend i8`: 1.277 -> 1.386 tok/s, 8.5% faster.
+
+The split adds loop overhead but removes the interleaving of two
+dependency chains and two activation pointers through one body. Even a
+486 has a pipeline; two clean reductions schedule better than one
+tangled loop, and that outweighs eight extra instructions.
+
+**The i486 default is untouched regardless.** It selects `mmx`, and
+`backend_mmx.c` compiles to a byte-identical object -- none of this
+session's work touched the hand-written kernels. Default build,
+end to end: 2.435 -> 2.427 tok/s, i.e. noise.
+
+**So there was nothing to gate.** The instinct to gate any regression
+is right; the instinct to trust a static instruction count as evidence
+of one is not. This is the fourth time in this project that counts
+pointed the wrong way (see findings 28, 30, 31), and the second time
+they did so on the 486 specifically. Measure the target, then decide
+whether a gate is needed.
+
+## 37. Two logs, six releases apart, read as a backend comparison
+
+The uploads directory holds `perf-i7-9th-i8.txt` and
+`perf-i7-9th-mmx-1.6.0.txt`. Nothing in the filenames says so, but the
+first is **infer 1.0.0** and the second is **1.6.0**. Compared as if
+they were a backend A/B they give i8 = 0.44x of mmx, and that number
+was repeated in this project's own analysis.
+
+It is wrong. Same version, same host:
+
+```
+1.0.0 Geode   i8 0.026   mmx 0.028   0.93x
+1.0.0 i7      i8 1.236   mmx 1.265   0.98x
+1.6.0 Geode   i8 0.030   mmx 0.063   0.48x
+```
+
+**At 1.0.0 the backends were within 2-7% of each other.** The gap is
+not architectural; it is 1.3.0-1.5.0 of MMX kernel work (2.08x on the
+Geode) that i8 did not receive. The 0.44x figure measures six releases
+of development and attributes it to instruction sets.
+
+`ref`, meanwhile, has always been far behind: ~0.45 tok/s against i8's
+1.27 in the same run, and 6.4x behind i8 on Q6_K specifically.
+
+**Two rules this produces:**
+
+- **Version-stamp every log, and check it before comparing.** These
+  files carry the version in their first line; the filenames do not,
+  and the filenames are what got read.
+- **A backend comparison must come from one binary.** Different builds
+  differ in more than the flag you are studying. The same mistake in a
+  different costume produced the 1.15.1 "regression" (finding 30) --
+  two runs, fifteen hours apart, treated as comparable.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

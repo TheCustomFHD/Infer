@@ -97,32 +97,164 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.15.1
+VERSION = 1.16.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
-.PHONY: vis-shim-test all linux linux-profile windows windows-profile \
-        solaris solaris-profile solaris-gcc solaris-gcc-profile \
-        solaris-fast solaris-test \
-        test bench clean version checkversion help
+# Per-stage timers. A COMPILE-TIME choice, not a separate target:
+#
+#     make linux              plain
+#     make linux PROFILE=1    same target, timers compiled in
+#
+# The timers stay compile-time rather than a runtime flag on purpose.
+# PROF_STOP sits inside the per-layer path, so a runtime test would put
+# a load-and-branch in the hot loop of every build, on machines where
+# that is measurable. The binary is named -profile so the two cannot be
+# confused.
+PROFILE   =
+PROFFLAGS = $(PROFILE:1=-DINFER_PROFILE)
+PROFSUF   = $(PROFILE:1=-profile)
 
-all: linux linux-profile windows windows-profile
+# ---------------------------------------------------------------------
+# Opt-OUT flags. Every accelerated kernel is compiled in by default and
+# selected at RUN TIME after a CPUID / feature probe. These switch one
+# off at build time, for a smaller binary or to isolate a codegen bug:
+#
+#     make linux NO_MMX=1
+#     make linux NO_AVX2=1 NO_SSE2=1
+#     make solaris NO_VIS=1
+#
+# All-on is the supported configuration. The runtime cost of having
+# them is one indirect call per matrix ROW -- measured at the noise
+# floor on both x86-64 and an i486-targeted build.
+#
+# Implemented with indirect variable expansion ($(VAR_$(NO_X))) rather
+# than ifeq, because this Makefile must also work with Solaris
+# /usr/ccs/bin/make, which has no conditionals.
+# ---------------------------------------------------------------------
+NO_MMX  =
+NO_SSE2 =
+NO_AVX2 =
+NO_VIS  =
+
+MMXSRC_   = $(SRCDIR)/backend_mmx.c
+MMXFLG_   = -DINFER_HAVE_MMX
+MMXSRC_1  =
+MMXFLG_1  =
+SSE2FLG_  = -DINFER_HAVE_SSE2
+SSE2FLG_1 =
+AVX2FLG_  = -DINFER_HAVE_AVX2
+AVX2FLG_1 =
+VISSRC_   = $(SRCDIR)/backend_vis.c
+VISFLG_   = -DINFER_HAVE_VIS
+VISSRC_1  =
+VISFLG_1  =
+
+USE_MMXSRC  = $(MMXSRC_$(NO_MMX))
+USE_MMXFLG  = $(MMXFLG_$(NO_MMX))
+USE_SSE2FLG = $(SSE2FLG_$(NO_SSE2))
+USE_AVX2FLG = $(AVX2FLG_$(NO_AVX2))
+USE_VISSRC  = $(VISSRC_$(NO_VIS))
+USE_VISFLG  = $(VISFLG_$(NO_VIS))
+
+# Linux word size. 32-bit by default: that is what runs on a 486 and on
+# the Geode. BITS=64 gives AVX2 sixteen ymm registers instead of eight,
+# which is worth having on a modern machine.
+#
+#     make linux            -> infer-X.Y.Z-linux     (32-bit, 486 floor)
+#     make linux BITS=64    -> infer-X.Y.Z-linux64
+# NATIVE=1 tunes for the machine doing the build: -march=native
+# -mtune=native on GCC/Clang, -xtarget=native on Sun Studio. It REPLACES
+# the portable baseline, so the result runs only on that CPU (or one
+# with a superset of its features). Never ship a NATIVE build.
+#
+#     make linux NATIVE=1
+#     make solaris NATIVE=1 TOOLCHAIN=gcc
+#
+# Kernel selection stays a run-time decision either way; NATIVE only
+# changes what the compiler may emit for the portable C.
+NATIVE       =
+NATSUF_      =
+NATSUF_1     = -native
+NATSUF       = $(NATSUF_$(NATIVE))
+SOLNATGCC_   =
+SOLNATGCC_1  = -mcpu=native
+
+BITS     = 32
+BITSUF_32 =
+BITSUF_64 = 64
+BITSUF   = $(BITSUF_$(BITS))
+# 32-bit needs the LFS macro; on 64-bit off_t is already wide.
+LFS_32   = -D_FILE_OFFSET_BITS=64
+LFS_64   =
+USE_LFS  = $(LFS_$(BITS))
+# The i486 baseline only means anything in a 32-bit build.
+ARCH_32  = -march=i486 -mtune=geode -mno-sse -mno-sse2 -mfpmath=387
+ARCH_64  = -mtune=generic
+BASEARCH = $(ARCH_$(BITS))
+# NATIVE replaces the baseline outright. Appending -march=native after
+# -mno-sse does NOT work: the -mno-* flags are sticky and silently
+# leave you with a native-tuned binary that may emit no SIMD at all.
+ARCHSEL_  = $(BASEARCH)
+ARCHSEL_1 = -march=native -mtune=native
+USE_ARCH  = $(ARCHSEL_$(NATIVE))
+
+# Solaris compiler. Sun Studio by default; TOOLCHAIN=gcc switches.
+# Deliberately NOT spelled CC: make gives CC a built-in default of
+# `cc`, which on Solaris is Studio, so `CC ?= gcc` silently does
+# nothing. That cost a release once already (finding 26).
+TOOLCHAIN = studio
+
+.PHONY: all linux windows solaris \
+        test bench solaris-test vis-shim-test i8-split-test \
+        clean version checkversion help
+
+# Everything shippable: portable and 64-bit, each with and without the
+# timers. NATIVE=1 is deliberately absent -- it only runs on the machine
+# that built it, so it is never a release artifact.
+#
+#   infer-X.Y.Z-linux                 32-bit, i486 floor, mmx
+#   infer-X.Y.Z-linux-profile         ...with stage timers
+#   infer-X.Y.Z-linux64               64-bit, i8 autovectorised (SSE2)
+#   infer-X.Y.Z-linux64-profile       ...with stage timers
+#   infer-X.Y.Z-windows.exe           32-bit, i486 floor, mmx
+#   infer-X.Y.Z-windows-profile.exe   ...with stage timers
+all:
+	@$(MAKE) linux
+	@$(MAKE) linux PROFILE=1
+	@$(MAKE) linux BITS=64
+	@$(MAKE) linux BITS=64 PROFILE=1
+	@$(MAKE) windows
+	@$(MAKE) windows PROFILE=1
 
 help:
-	@echo "make linux              Linux/x86, all backends, i486 baseline"
-	@echo "make linux-profile      ...plus per-stage timers (~2% slower)"
-	@echo "make windows            Windows XP/x86, all backends, i486 baseline"
-	@echo "make windows-profile    ...plus per-stage timers (~2% slower)"
-	@echo "make all                all four"
+	@echo "TARGETS"
+	@echo "  make linux              Linux/x86  -- mmx + i8 + ref"
+	@echo "  make windows            Windows/x86 (XP and later), same set"
+	@echo "  make solaris            Solaris/SPARC -- vis + i8 + ref"
+	@echo "  make all                linux + windows"
 	@echo ""
-	@echo "make solaris            Solaris/SPARC, Sun Studio, 64-bit"
-	@echo "make solaris-profile    ...plus per-stage timers"
-	@echo "make solaris-gcc        Solaris/SPARC, GCC, 64-bit"
-	@echo "make vis-shim-test      VIS kernels vs i8 on any host (types/arith only)"
-	@echo "make solaris-vis        Solaris/SPARC + VIS kernels (Sun Studio)"
-	@echo "make solaris-gcc-vis    Solaris/SPARC + VIS kernels (GCC)"
+	@echo "Every accelerated kernel is compiled in and picked at RUN TIME"
+	@echo "after a CPUID / feature probe. One binary per platform."
 	@echo ""
-	@echo "make test / bench / clean / version / checkversion"
+	@echo "FLAGS (combine freely)"
+	@echo "  PROFILE=1               per-stage timers, names the binary -profile"
+	@echo "  BITS=64                 64-bit Linux build (default 32, runs on a 486)"
+	@echo "  TOOLCHAIN=gcc           build Solaris with GCC instead of Sun Studio"
+	@echo "  NATIVE=1                -march=native; runs ONLY on this machine"
+	@echo "  FAST=1                  Solaris non-IEEE float; verify with t_backend"
+	@echo "  NO_MMX=1 NO_SSE2=1      leave a kernel out"
+	@echo "  NO_AVX2=1 NO_VIS=1"
+	@echo ""
+	@echo "  make linux PROFILE=1 BITS=64"
+	@echo "  make solaris TOOLCHAIN=gcc NO_VIS=1"
+	@echo ""
+	@echo "TESTS"
+	@echo "  make test               full suite (needs a model for some)"
+	@echo "  make i8-split-test      i8 Q4_K exactness, any host, no model"
+	@echo "  make vis-shim-test      VIS kernels vs i8 on any host"
+	@echo "  make solaris-vis-test   VIS assumptions, on the real machine"
+
 
 # =====================================================================
 #  x86: Linux and Windows
@@ -146,26 +278,20 @@ help:
 # versus letting the compiler use CMOV: 0.6%, in favour of the baseline.
 
 X86FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-           -march=i486 -mtune=geode -mmmx -mno-sse -mno-sse2 -mfpmath=387 \
-           -DINFER_HAVE_MMX
+           $(USE_ARCH) -mmmx \
+           $(USE_MMXFLG) $(USE_SSE2FLG) $(USE_AVX2FLG)
 
-linux: $(CORE) $(POSIX) $(MMXSRC) $(HDRS)
-	$(CC) $(X86FLAGS) -m32 -D_FILE_OFFSET_BITS=64 \
-		-o $(BIN)-linux $(CORE) $(POSIX) $(MMXSRC) $(LDLIBS)
-
-linux-profile: $(CORE) $(POSIX) $(MMXSRC) $(HDRS)
-	$(CC) $(X86FLAGS) -m32 -D_FILE_OFFSET_BITS=64 -DINFER_PROFILE \
-		-o $(BIN)-linux-profile $(CORE) $(POSIX) $(MMXSRC) $(LDLIBS)
+linux: $(CORE) $(POSIX) $(HDRS)
+	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) $(PROFFLAGS) \
+		-o $(BIN)-linux$(BITSUF)$(NATSUF)$(PROFSUF) \
+		$(CORE) $(POSIX) $(USE_MMXSRC) $(LDLIBS)
 
 # -D_WIN32_WINNT=0x0501 pins the Windows API surface to XP, so the
 # compiler refuses anything newer and the import table stays clean.
-windows: $(CORE) $(WIN32) $(MMXSRC) $(HDRS)
-	$(WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 \
-		-o $(BIN)-windows.exe $(CORE) $(WIN32) $(MMXSRC) -lws2_32
-
-windows-profile: $(CORE) $(WIN32) $(MMXSRC) $(HDRS)
-	$(WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 -DINFER_PROFILE \
-		-o $(BIN)-windows-profile.exe $(CORE) $(WIN32) $(MMXSRC) -lws2_32
+windows: $(CORE) $(WIN32) $(HDRS)
+	$(WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 $(PROFFLAGS) \
+		-o $(BIN)-windows$(NATSUF)$(PROFSUF).exe \
+		$(CORE) $(WIN32) $(USE_MMXSRC) -lws2_32
 
 # =====================================================================
 #  SPARC / Solaris
@@ -236,107 +362,122 @@ SUNCC     = cc
 # Override if GCC is not on PATH as `gcc`:
 #   gmake solaris-gcc-vis GNUCC=/usr/sfw/bin/gcc
 GNUCC     = gcc
-SUNTARGET = native
+# -xtarget=generic keeps the binary runnable on any UltraSPARC; this
+# used to say `native`, which silently made every Solaris build
+# machine-specific. NATIVE=1 opts back in.
+SUNTGT_   = generic
+SUNTGT_1  = native
+SUNTARGET = $(SUNTGT_$(NATIVE))
 SUNOPT    = -xO5 -xunroll=16
 SUNBITS   = -m64
 SUNFLAGS  = -Xc -xc99=none $(SUNOPT) $(SUNBITS) -xtarget=$(SUNTARGET) \
             -DINFER_BIG_ENDIAN=1
 SOLLIBS   = -lm -lsocket -lnsl
 
-solaris: $(CORE) $(POSIX)
-	$(SUNCC) $(SUNFLAGS) -o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
-	@echo "note: scalar build, i8 backend only."
-	@echo "      backend_vis.c is NOT compiled in -- use 'make solaris-vis' for that."
+# One target. TOOLCHAIN picks the compiler, NO_VIS drops the VIS
+# kernels, INFER_VIS_Q6K opts the Q6_K kernel back in (it measured no
+# faster than the portable path on an UltraSPARC IIi -- finding 30).
+#
+#     make solaris
+#     make solaris TOOLCHAIN=gcc
+#     make solaris NO_VIS=1 PROFILE=1
+#
+# -m64 is not a performance choice: in a 32-bit Solaris build with
+# _FILE_OFFSET_BITS=64 and -Xc, off_t becomes a union that cannot be
+# passed to mmap(). LP64 makes off_t a plain long. (See the header
+# comment further up.)
+SOL_CC_studio    = $(SUNCC)
+SOL_CC_gcc       = $(GNUCC)
+SOL_FLAGS_studio = $(SUNFLAGS) $(SOLVIS_studio$(NO_VIS))
+SOL_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+                   -m64 -DINFER_BIG_ENDIAN=1 $(SOLVIS_gcc$(NO_VIS)) \
 
-solaris-profile: $(CORE) $(POSIX)
-	$(SUNCC) $(SUNFLAGS) -DINFER_PROFILE \
-		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(SOLLIBS)
+SOLVIS_studio    = -xarch=sparcvis -xvis
+SOLVIS_studio1   =
+SOLVIS_gcc       = $(SOLCPU_$(NATIVE)) -mvis
+SOLVIS_gcc1      =
+SOLCPU_          = -mcpu=ultrasparc
+# GCC's -mcpu=native only works when the compiler runs ON a SPARC; a
+# cross-compiler rejects it. SOLCPU overrides it for cross builds:
+#   gmake solaris TOOLCHAIN=gcc NATIVE=1 SOLCPU_1=-mcpu=ultrasparc3
+SOLCPU_1         = -mcpu=native
 
-# GCC on Solaris. -m64 for the same reason; GCC does define long long,
-# so _FILE_OFFSET_BITS would work here, but 64-bit makes it moot.
-solaris-gcc: $(CORE) $(POSIX)
-	$(GNUCC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m64 -DINFER_BIG_ENDIAN=1 \
-		-o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
-
-solaris-gcc-profile: $(CORE) $(POSIX)
-	$(GNUCC) -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m64 -DINFER_BIG_ENDIAN=1 -DINFER_PROFILE \
-		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(SOLLIBS)
+solaris: $(CORE) $(POSIX) $(HDRS)
+	$(SOL_CC_$(TOOLCHAIN)) $(SOL_FLAGS_$(TOOLCHAIN)) \
+		$(USE_VISFLG) $(PROFFLAGS) $(USE_FAST) \
+		-o $(BIN)-solaris$(NATSUF)$(PROFSUF) \
+		$(CORE) $(POSIX) $(USE_VISSRC) $(SOLLIBS)
 
 # Opt-in, non-IEEE float. Verify with t_backend before trusting output.
-solaris-fast: $(CORE) $(POSIX)
-	$(SUNCC) $(SUNFLAGS) -fast \
-		-o $(BIN)-solaris $(CORE) $(POSIX) $(SOLLIBS)
+# Non-IEEE float (-fast: -fsimple=2, flush-to-zero). Opt-in and Studio
+# only; verify with t_backend before trusting output. This is a FLAG
+# because it is a property of the build, not a different target:
+#     gmake solaris FAST=1
+# Studio spells it -fast; GCC's nearest equivalent is -Ofast. Both
+# relax IEEE semantics, so both are opt-in and both want t_backend run
+# before the output is trusted.
+FAST            =
+FASTFLG_studio  =
+FASTFLG_studio1 = -fast
+FASTFLG_gcc     =
+FASTFLG_gcc1    = -Ofast
+USE_FAST = $(FASTFLG_$(TOOLCHAIN)$(FAST))
 
-# Solaris make has no pattern rules we can rely on, so these are spelled
-# out rather than sharing the rules below.
 # ---------------------------------------------------------------------
-# VIS builds. -xarch=sparcvis -xvis (Sun Studio) / -mcpu=ultrasparc -mvis (GCC)
-# select the VIS 1 instruction set, present on every UltraSPARC.
+# SPARC test programs. One target; TOOLCHAIN picks the compiler, exactly
+# as `make solaris` does.
+#
+#     gmake solaris-test                  Sun Studio
+#     gmake solaris-test TOOLCHAIN=gcc    GCC
+#
+# Builds every SPARC-relevant test: the VIS assumptions (t_vis), the
+# kernels against i8 (t_viskern), worst-case lane saturation
+# (t_vissat), byte order (t_endian) and the backend comparison
+# (t_backend, the only one needing a model).
 # ---------------------------------------------------------------------
-solaris-vis: $(CORE) $(POSIX) $(VISSRC)
-	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS \
-		-o $(BIN)-solaris $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
+STEST_CC_studio    = $(SUNCC)
+STEST_CC_gcc       = $(GNUCC)
+STEST_FLAGS_studio = $(SUNFLAGS) $(SOLVIS_studio$(NO_VIS))
+STEST_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+                     -m64 -DINFER_BIG_ENDIAN=1 $(SOLVIS_gcc$(NO_VIS))
+STEST_CC    = $(STEST_CC_$(TOOLCHAIN))
+STEST_FLAGS = $(STEST_FLAGS_$(TOOLCHAIN))
+STEST_DEPS  = $(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
+              $(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c
 
-solaris-vis-profile: $(CORE) $(POSIX) $(VISSRC)
-	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS -DINFER_PROFILE \
-		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
-
-solaris-gcc-vis: $(CORE) $(POSIX) $(VISSRC)
-	$(GNUCC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m64 -mcpu=ultrasparc -mvis -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 \
-		-o $(BIN)-solaris $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
-
-solaris-gcc-vis-profile: $(CORE) $(POSIX) $(VISSRC)
-	$(GNUCC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-		-m64 -mcpu=ultrasparc -mvis -DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 \
-		-DINFER_PROFILE \
-		-o $(BIN)-solaris-profile $(CORE) $(POSIX) $(VISSRC) $(SOLLIBS)
-
-solaris-test: $(CORE) $(POSIX)
+solaris-test: tests/t_vis.c tests/t_viskern.c tests/t_vissat.c
 	@mkdir -p $(BUILD)
-	$(SUNCC) $(SUNFLAGS) -o $(BUILD)/t_endian tests/t_endian.c \
-		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
-	$(SUNCC) $(SUNFLAGS) -o $(BUILD)/t_backend tests/t_backend.c \
-		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
-	$(SUNCC) $(SUNFLAGS) -o $(BUILD)/t_tokenizer tests/t_tokenizer.c \
-		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
-		$(SRCDIR)/sys_posix.c $(SOLLIBS)
-	@echo "run: ./$(BUILD)/t_endian [model.gguf]"
+	$(STEST_CC) $(STEST_FLAGS) $(USE_VISFLG) \
+		-o $(BUILD)/t_vis tests/t_vis.c
+	$(STEST_CC) $(STEST_FLAGS) $(USE_VISFLG) -I$(SRCDIR) \
+		-o $(BUILD)/t_viskern tests/t_viskern.c $(USE_VISSRC) \
+		$(STEST_DEPS) $(SOLLIBS)
+	$(STEST_CC) $(STEST_FLAGS) $(USE_VISFLG) -I$(SRCDIR) \
+		-o $(BUILD)/t_vissat tests/t_vissat.c $(USE_VISSRC) \
+		$(STEST_DEPS) $(SOLLIBS)
+	$(STEST_CC) $(STEST_FLAGS) $(USE_VISFLG) -I$(SRCDIR) \
+		-o $(BUILD)/t_endian tests/t_endian.c $(USE_VISSRC) \
+		$(STEST_DEPS) $(SOLLIBS)
+	$(STEST_CC) $(STEST_FLAGS) $(USE_VISFLG) -I$(SRCDIR) \
+		-o $(BUILD)/t_backend tests/t_backend.c $(USE_VISSRC) \
+		$(STEST_DEPS) $(SOLLIBS)
+	@echo "run: ./$(BUILD)/t_vis  ./$(BUILD)/t_viskern  ./$(BUILD)/t_vissat"
+	@echo "     ./$(BUILD)/t_endian   then   ./$(BUILD)/t_backend model.gguf"
 
-# VIS assumptions. Run this FIRST on any new SPARC box: it proves the
-# exactness trick the kernels depend on, and needs no model.
-solaris-gcc-vis-test: tests/t_vis.c
-	@mkdir -p $(BUILD)
-	$(GNUCC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
-		-DINFER_HAVE_VIS -o $(BUILD)/t_vis tests/t_vis.c
-	$(GNUCC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
-		-DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -I$(SRCDIR) \
-		-o $(BUILD)/t_viskern tests/t_viskern.c $(VISSRC) \
-		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
-		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
-	$(GNUCC) -std=gnu89 -Wall -Wextra -O2 -m64 -mcpu=ultrasparc -mvis \
-		-DINFER_HAVE_VIS -DINFER_BIG_ENDIAN=1 -I$(SRCDIR) \
-		-o $(BUILD)/t_vissat tests/t_vissat.c $(VISSRC) \
-		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
-		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
-	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern   then   ./$(BUILD)/t_vissat"
-
+# Host-side checks. Neither needs a model or a SPARC.
+#   vis-shim-test  both VIS compiler branches on any host (finding 27:
+#                  little-endian, so it cannot check lane order)
+#   i8-split-test  i8 Q4_K split-loop integer exactness (finding 31)
 vis-shim-test: tests/t_viskern.c $(VISSRC)
 	@mkdir -p $(BUILD)
-	@echo "NOTE: this runs on the HOST's byte order. It checks types and"
-	@echo "      arithmetic, NOT lane order. Use solaris-*-vis-test on a"
+	@echo "NOTE: runs on the HOST's byte order. Checks types and"
+	@echo "      arithmetic, NOT lane order. Use solaris-test on a"
 	@echo "      big-endian machine for that. (Finding 27.)"
 	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
 		-D__SUNPRO_C=0x5150 -Itests/vis_shim \
 		-DINFER_HAVE_VIS -I$(SRCDIR) \
 		-o $(BUILD)/t_viskern_sun tests/t_viskern.c $(VISSRC) \
-		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
-		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+		$(STEST_DEPS) -lm
 	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
 		-D__builtin_vis_fmul8x16=shim_fmul8x16 \
 		-D__builtin_vis_fpadd16=shim_fpadd16 \
@@ -345,28 +486,14 @@ vis-shim-test: tests/t_viskern.c $(VISSRC)
 		-include tests/vis_shim/gcc_shim.h \
 		-DINFER_HAVE_VIS -I$(SRCDIR) \
 		-o $(BUILD)/t_viskern_gcc tests/t_viskern.c $(VISSRC) \
-		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
-		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c -lm
+		$(STEST_DEPS) -lm
 	@echo "run: ./$(BUILD)/t_viskern_sun   then   ./$(BUILD)/t_viskern_gcc"
 
-solaris-vis-test: tests/t_vis.c
+i8-split-test: tests/t_i8split.c tests/t_q5split.c
 	@mkdir -p $(BUILD)
-	$(SUNCC) -Xc -xc99=none -xO3 -m64 -xarch=sparcvis -xvis -DINFER_HAVE_VIS \
-		-o $(BUILD)/t_vis tests/t_vis.c
-	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS -I$(SRCDIR) \
-		-o $(BUILD)/t_viskern tests/t_viskern.c $(VISSRC) \
-		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
-		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
-	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS \
-		-o $(BUILD)/t_backend tests/t_backend.c \
-		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(VISSRC) $(SRCDIR)/util.c $(SRCDIR)/prof.c \
-		$(SRCDIR)/sys_posix.c $(SOLLIBS)
-	$(SUNCC) $(SUNFLAGS) -xarch=sparcvis -xvis -DINFER_HAVE_VIS -I$(SRCDIR) \
-		-o $(BUILD)/t_vissat tests/t_vissat.c $(VISSRC) \
-		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
-		$(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c $(SOLLIBS)
-	@echo "run: ./$(BUILD)/t_vis   then   ./$(BUILD)/t_viskern   then   ./$(BUILD)/t_vissat   then   ./$(BUILD)/t_backend model.gguf"
+	$(CC) -std=gnu89 -Wall -Wextra -O2 -o $(BUILD)/t_i8split tests/t_i8split.c
+	$(CC) -std=gnu89 -Wall -Wextra -O2 -o $(BUILD)/t_q5split tests/t_q5split.c
+	@echo "run: ./$(BUILD)/t_i8split   then   ./$(BUILD)/t_q5split"
 
 # =====================================================================
 #  Tests

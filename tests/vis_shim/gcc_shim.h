@@ -20,6 +20,15 @@
 #ifndef INFER_VIS_GCC_SHIM_H
 #define INFER_VIS_GCC_SHIM_H
 
+/* Not every shim is used by every configuration -- the Q6_K kernel is
+ * off by default (finding 30), so its helpers go unreferenced. Mark
+ * them so a -Wall -Wextra build of the tests stays silent. */
+#if defined(__GNUC__)
+#define INFER_SHIM_UNUSED __attribute__((unused))
+#else
+#define INFER_SHIM_UNUSED
+#endif
+
 #include <string.h>
 
 /* The vector types are declared in backend_vis.c before any use of the
@@ -37,7 +46,7 @@
 
 SHIM_VIS_TYPES;
 
-static shim_s16x4 shim_fmul8x16(shim_u8x4 a, shim_s16x4 b) {
+static INFER_SHIM_UNUSED shim_s16x4 shim_fmul8x16(shim_u8x4 a, shim_s16x4 b) {
     unsigned char ab[4]; short bs[4], rs[4]; shim_s16x4 r; int i;
     memcpy(ab, &a, 4); memcpy(bs, &b, 8);
     for (i = 0; i < 4; i++)
@@ -46,7 +55,7 @@ static shim_s16x4 shim_fmul8x16(shim_u8x4 a, shim_s16x4 b) {
     return r;
 }
 
-static shim_s16x4 shim_fpadd16(shim_s16x4 x, shim_s16x4 y) {
+static INFER_SHIM_UNUSED shim_s16x4 shim_fpadd16(shim_s16x4 x, shim_s16x4 y) {
     short a[4], b[4], c[4]; shim_s16x4 r; int i;
     memcpy(a, &x, 8); memcpy(b, &y, 8);
     for (i = 0; i < 4; i++) c[i] = (short) (a[i] + b[i]);
@@ -54,7 +63,7 @@ static shim_s16x4 shim_fpadd16(shim_s16x4 x, shim_s16x4 y) {
     return r;
 }
 
-static shim_s32x2 shim_fpadd32(shim_s32x2 x, shim_s32x2 y) {
+static INFER_SHIM_UNUSED shim_s32x2 shim_fpadd32(shim_s32x2 x, shim_s32x2 y) {
     int a[2], b[2], c[2]; shim_s32x2 r; int i;
     memcpy(a, &x, 8); memcpy(b, &y, 8);
     for (i = 0; i < 2; i++) c[i] = a[i] + b[i];
@@ -62,7 +71,7 @@ static shim_s32x2 shim_fpadd32(shim_s32x2 x, shim_s32x2 y) {
     return r;
 }
 
-static shim_s32x2 shim_fmuld8ulx16(shim_u8x4 a, shim_s16x2 b) {
+static INFER_SHIM_UNUSED shim_s32x2 shim_fmuld8ulx16(shim_u8x4 a, shim_s16x2 b) {
     unsigned char ab[4]; short bs[2]; int c[2]; shim_s32x2 r; int i;
     memcpy(ab, &a, 4); memcpy(bs, &b, 4);
     for (i = 0; i < 2; i++) c[i] = (int) ab[i + 2] * (int) bs[i];

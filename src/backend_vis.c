@@ -265,6 +265,7 @@ static vis_s16x4 vis_zero16(void) {
 
 /* Widen four 16-bit lanes to two 32-bit lanes, summing the pairs.
  * fmuld8ulx16(1, v) is an exact widen with no rounding. */
+#if defined(INFER_VIS_Q6K)
 static vis_s32x2 vis_widen2(vis_s16x4 v) {
     vis_lane64 in;
     vis_lane32 one;
@@ -273,12 +274,15 @@ static vis_s32x2 vis_widen2(vis_s16x4 v) {
     in.d  = v;
     return VADD32(VWIDEN(one.f, in.f[0]), VWIDEN(one.f, in.f[1]));
 }
+#endif
 
+#if defined(INFER_VIS_Q6K)
 static int vis_hsum32(vis_s32x2 v) {
     vis_wide64 w;
     w.d = v;
     return w.i[0] + w.i[1];
 }
+#endif
 
 #else
 
@@ -316,6 +320,7 @@ static vis_s16x4 vis_zero16(void) {
 
 /* As above. Union puns rather than subscripts: GCC lowers vector
  * element access to a stack round-trip on SPARC. */
+#if defined(INFER_VIS_Q6K)
 static vis_s32x2 vis_widen2(vis_s16x4 v) {
     vis_pun64  pu;
     vis_pun32s lo, hi;
@@ -327,12 +332,15 @@ static vis_s32x2 vis_widen2(vis_s16x4 v) {
     hi.u = (unsigned int) (pu.u >> 32);
     return VADD32(VWIDEN(one, hi.v), VWIDEN(one, lo.v));
 }
+#endif
 
+#if defined(INFER_VIS_Q6K)
 static int vis_hsum32(vis_s32x2 v) {
     vis_pun64w w;
     w.v = v;
     return (int) (w.u >> 32) + (int) (unsigned int) w.u;
 }
+#endif
 
 #endif
 
@@ -390,16 +398,19 @@ static vis_u8x4 vis_pack_u8x4(unsigned int u) {
 /* lduh rather than a fault.                                            */
 /* ------------------------------------------------------------------ */
 
+#if defined(INFER_VIS_Q6K)
 /* Sum of 16 activations, at Q6_K's scale granularity. */
 static int vis_sum16(const bk_qx *xq, long idx) {
     return xq->s16[idx / 16];
 }
+#endif
 
 /* Aligned: the word's memory image already is the lane order. */
 #define VIS_LDW(p)  (*(const unsigned int *) (const void *) (p))
 
 /* Possibly 2-aligned. Two halfword loads, assembled most-significant
  * first so the lane order matches VIS_LDW on this target. */
+#if defined(INFER_VIS_Q6K)
 static unsigned int vis_ldw2(const unsigned char *p) {
 #if INFER_BIG_ENDIAN
     const unsigned short *h = (const unsigned short *) (const void *) p;
@@ -411,6 +422,7 @@ static unsigned int vis_ldw2(const unsigned char *p) {
            ((unsigned int) p[1] << 8)  |  (unsigned int) p[0];
 #endif
 }
+#endif
 
 #if defined(INFER_VIS_COUNT) && defined(__GNUC__)
 #define VIS_NOINLINE __attribute__((noinline))
@@ -611,6 +623,12 @@ VIS_NOINLINE static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
     return sum;
 }
 
+#if defined(INFER_VIS_Q6K)
+#define VIS_USE_Q6K 1
+#else
+#define VIS_USE_Q6K 0
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Q6_K                                                                */
 /*                                                                     */
@@ -638,6 +656,8 @@ VIS_NOINLINE static float vis_dot_q5_K(const unsigned char *b, const bk_qx *xq,
 /* of real work -- the loads go through vis_ldw2(), which is two lduh   */
 /* and no copy at all.                                                  */
 /* ------------------------------------------------------------------ */
+
+#if VIS_USE_Q6K
 
 #define Q6K_BODY(NAME, LDW)                                            \
 VIS_NOINLINE static float NAME(const unsigned char *b,                 \
@@ -793,6 +813,8 @@ static float vis_dot_q6_K(const unsigned char *b, const bk_qx *xq,
     return sum;
 }
 
+#endif /* VIS_USE_Q6K */
+
 /* ------------------------------------------------------------------ */
 /* Dispatch                                                            */
 /*                                                                     */
@@ -801,13 +823,32 @@ static float vis_dot_q6_K(const unsigned char *b, const bk_qx *xq,
 /* never at risk from a missing kernel.                                 */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Q6_K: VIS kernel present, but OFF by default                        */
+/*                                                                     */
+/* The kernel below is correct and bit-identical to i8, and it cuts    */
+/* the instruction count 3.1x (4180 -> 1338 per super-block). On real  */
+/* UltraSPARC IIi that bought nothing measurable: the Q6_K/Q4_K cost   */
+/* ratio per weight moved 0.862 -> 0.855, and across every plausible   */
+/* correction for the contaminated session the change lands between    */
+/* -4% and +8%. See finding 30.                                        */
+/*                                                                     */
+/* Q6_K was never instruction-bound. Per weight it has always been the */
+/* CHEAPEST format on this machine -- ~427 ns/weight against 495 for   */
+/* Q4_K and 1152 for Q5_K, even running the portable integer path. It  */
+/* only looked expensive in the profile because its calls carry 6x     */
+/* more weights than Q4_K's, so us/call flattered the other formats.   */
+/*                                                                     */
+/* Build with -DINFER_VIS_Q6K to switch it on and measure for          */
+/* yourself; the default is the path that measured faster.             */
+/* ------------------------------------------------------------------ */
 void bk_qmv_vis(int type, const unsigned char *w, const float *x,
                 float *y, long ncols, long nrows) {
     const bk_qx *xq;
     long rowbytes, r;
 
     if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-        type != GGML_TYPE_Q6_K) {
+        (type != GGML_TYPE_Q6_K || !VIS_USE_Q6K)) {
         qmv_i8(type, w, x, y, ncols, nrows);
         return;
     }
@@ -825,9 +866,11 @@ void bk_qmv_vis(int type, const unsigned char *w, const float *x,
             y[r] = vis_dot_q5_K(w + r * rowbytes, xq, ncols);
         }
     } else {
+#if VIS_USE_Q6K
         for (r = 0; r < nrows; r++) {
             y[r] = vis_dot_q6_K(w + r * rowbytes, xq, ncols);
         }
+#endif
     }
 }
 

@@ -199,6 +199,95 @@ It trades 4 saved activation loads for 6 extra weight loads.
 
 ---
 
+## i8 versus mmx: the whole history, same-version only
+
+Comparing logs from different versions is meaningless, and doing so
+produced a wrong claim in this project's own notes: `perf-i7-9th-i8.txt`
+is **1.0.0** and `perf-i7-9th-mmx-1.6.0.txt` is **1.6.0**, six releases
+apart. Read as a backend comparison it says i8 is 0.44x of mmx. It is
+not; it is measuring six releases of MMX work.
+
+Same version, same host, generation tok/s:
+
+```
+version / host    i8       mmx      i8/mmx
+1.0.0 Geode       0.026    0.028    0.93x    <- neck and neck
+1.0.0 i7          1.236    1.265    0.98x    <- neck and neck
+1.5.0 Geode       0.030    0.063    0.48x
+1.6.0 Geode       0.030    0.063    0.48x
+1.16.0 Xeon       1.386    2.427    0.57x
+```
+
+**At 1.0.0 the two backends were within 2-7% of each other.** The gap
+opened in 1.3.0-1.5.0, when the MMX kernels were rewritten (2.08x on the
+Geode) while i8 gained comparatively little. It has since closed
+slightly, 0.48x -> 0.57x, from the split-loop work in 1.15.3/1.16.0.
+
+`ref` has always been far behind both. From `OPTIMIZATION_REPORT.md`
+(32-bit build, `-n 60`): `ref` ~0.45 tok/s against i8 1.27 and mmx 1.92
+— i8 is **2.8x** faster than ref end to end, and per-kernel:
+
+```
+Mflop/s   ref    i8     mmx      i8/ref
+Q4_K      1449   2068   4272     1.43x
+Q5_K      1308   1686   2853     1.29x
+Q6_K       331   2108   3014     6.37x
+Q8_0      2263   1718   2539     0.76x   <- ref wins here
+```
+
+Q6_K is where i8 earns its place: 6.4x over `ref`, because `ref`
+re-sums 16 activations eight times per super-block while i8 uses the
+precomputed `s16[]` sums. Q8_0 is the one format where `ref` is
+faster, and it is 0.1% of runtime.
+
+**The rule:** every backend comparison must come from one binary, one
+run, one machine. Cross-version comparisons measure development, not
+architecture.
+
+## SPARC: cost per weight, not per call
+
+Every SPARC log this project has collected, normalised by the number of
+weight elements each format actually carries. Machine is an UltraSPARC
+IIi at 440 MHz.
+
+```
+nanoseconds per weight        Q4_K      Q5_K      Q6_K     overall
+i8   1.11.0  (32-bit)       618.05    975.41    508.35     646.01
+i8   1.12.1  (64-bit)       590.05   1097.44    435.96     630.41
+vis  1.14.2  (best of 3)    495.26   1151.72    426.90     599.86
+vis  1.15.1  (see note)     614.17    704.56    525.18     596.75
+```
+
+Two things this makes visible that the raw profile hides.
+
+**Q6_K is the cheapest format, and always has been.** Its calls carry
+678,142 weights against Q4_K's 113,338 — six times as many — so
+`us/call` makes it look six times more expensive than it is. It holds
+`token_embd`, the LM head and the FFN down-projections. At 6.56 bits
+per weight in a 210-byte super-block it also streams fewer bytes per
+MAC than Q4_K's effective 4.5 bits plus scales, which matters more than
+instruction count on a machine this memory-bound.
+
+**Q5_K was the outlier.** 2.3x the per-weight cost of Q4_K for a format
+only 25% wider. That gap was a redundant fold in the kernel, fixed in
+1.15.1, and it closed to 1.15x.
+
+The 1.15.1 row comes from a different session and is inflated across
+the board — `rms norms`, untouched by any version, is 4.3x slower in
+that log. Compare it only through within-run ratios:
+
+```
+cost per weight, relative to Q4_K in the same run
+                      Q5_K     Q6_K
+i8   1.11.0           1.58     0.82
+i8   1.12.1           1.86     0.74
+vis  1.14.2 (x3)      2.33     0.86-0.94
+vis  1.15.1           1.15     0.86
+```
+
+Q5_K 2.33 -> 1.15 is the fold fix. Q6_K 0.86 -> 0.86 is the VIS kernel
+buying nothing, which is why it is off by default.
+
 ## A methodological lesson
 
 The reference host is out-of-order, has a 3-cycle IMUL, a 32 MB L3 and a

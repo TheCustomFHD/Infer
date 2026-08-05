@@ -1,5 +1,421 @@
 # Changelog
 
+## 1.16.1 — everything since 1.14.2
+
+The last release on GitHub is **1.14.2**. This rolls up five versions of
+work: a Q6_K VIS kernel (later switched off on the evidence), the first
+real-hardware verdict from an UltraSPARC IIi, a build system collapsed
+to three targets, and several corrections to this project's own
+measurements.
+
+Per-version detail is in the sections below; this is the summary.
+
+### Performance
+
+| change | effect | where |
+|---|---|---|
+| Q5_K redundant fold removed | **2.03x** on Q5_K | SPARC, real hardware |
+| i8 Q4_K split into two reductions | 1.25x x86-64, 1.11x i486 | all targets |
+| Q5_K nibble lookup table removed | 1.12x, and unblocks vectorising | all targets |
+| Q5_K loop shape chosen by build flags | **1.88x** under SSE2 | SSE2/AVX2 builds |
+| `auto` prefers vectorised i8 | **1.33x** | `NATIVE=1` / `BITS=64` |
+
+On the SPARC the Q5_K fix is the headline: the long-standing anomaly
+where Q5_K cost 2.55x a Q4_K call, despite being only 25% wider, was a
+fold guarding an overflow that could not happen. Three baseline runs
+agreed to three significant figures before and after.
+
+End to end on a modern x86 host, same model and seed:
+
+```
+make linux                      2.45 tok/s    (i486 floor, picks mmx)
+make linux BITS=64              3.11          (picks vectorised i8)
+make linux BITS=64 NATIVE=1     4.23          1.73x
+```
+
+### Build system
+
+Sixteen make targets became **three** — `linux`, `windows`, `solaris` —
+plus four test targets. Everything else is a flag: `PROFILE=1`,
+`NATIVE=1`, `BITS=64`, `TOOLCHAIN=gcc`, `FAST=1`, and
+`NO_MMX=1` / `NO_SSE2=1` / `NO_AVX2=1` / `NO_VIS=1`.
+
+`make all` now builds all six shipping artifacts (32- and 64-bit Linux,
+32-bit Windows, each with and without timers). It previously built two,
+and CI uploaded a `windows-profile.exe` that nothing produced.
+
+### Negative results kept
+
+Three optimisations were written, measured, and **not** adopted or
+turned off by default. They are in the tree, tested, and documented:
+
+- **Q6_K VIS kernel** — correct, bit-identical, 3.1x fewer
+  instructions, and **0.8% faster** on an UltraSPARC IIi. Off by
+  default; `-DINFER_VIS_Q6K` enables it. Q6_K was never
+  instruction-bound: per weight it is the *cheapest* format on every
+  platform measured, and only looked expensive because its calls carry
+  6x more weights than Q4_K's.
+- **64-bit VIS loads** — 1395 → 1477 instructions. Rejected.
+- **Copy-based alignment for Q6_K** — 5% fewer instructions but 192
+  bytes of copy traffic per super-block through a 16 KB direct-mapped
+  cache. Rejected.
+
+### Corrections to our own measurements
+
+- **i8 vs mmx was never 0.44x.** That compared a 1.0.0 log with a 1.6.0
+  log. Same version they are within 2–7%: at 1.0.0, Geode 0.026 vs
+  0.028, i7 1.236 vs 1.265. The gap is the 1.3.0–1.5.0 MMX rewrite, not
+  the instruction set. (Finding 37.)
+- **The i486 baseline is real; the binary still needs a Pentium II.**
+  Our objects contain zero CMOV and zero SSE/AVX, asserted per-file in
+  CI. glibc's `_dl_aux_init` does not — a static `printf("hi")` at
+  `-march=i486` dies the same way. (Finding 34.)
+- **Instruction counts are not a cost model**, on any of these targets.
+  The i486 Q4_K kernel gained 8 instructions and got 1.11x *faster*.
+  (Finding 36.)
+- **qemu does not enforce CPU feature masks** in user mode: `-cpu
+  pentium2` will happily run SSE2. It can prove the 486 case, which is
+  a real decode failure, and nothing about SSE2 gating.
+
+### CI
+
+Now cross-compiles and tests **SPARC** on every push (sparc64 GCC +
+qemu: `t_vis`, `t_viskern`, `t_vissat`, `t_endian`, with and without
+VIS), exercises every build flag, asserts the shipped 32-bit binaries
+contain **no unconditional SSE/AVX**, checks each artifact selects the
+intended backend, and runs the binary under an emulated Pentium II.
+
+Release notes are extracted from the newest `CHANGELOG.md` section,
+with a guard that fails the release if that section is not for the tag
+being built.
+
+### Also
+
+- prompt-prefix cache kept after review: ~100 lines, two call sites,
+  saves minutes per request on a 440 MHz machine
+- `.github/workflows/release.yml` deleted — it was a second, older
+  releaser racing the one in `build.yml` on the same tags
+- new tests, none needing a model: `t_vissat`, `t_i8split`,
+  `t_q5split`, `t_viskern`, and a VIS shim that runs both compiler
+  branches on any host
+- findings 27–37 added to `docs/FINDINGS.md`
+
+---
+
+## 1.16.0 — three targets, everything else a flag
+
+### Build system
+
+Sixteen make targets collapsed to **three**:
+
+```sh
+make linux      make windows      make solaris
+```
+
+Plus four test targets (`test`, `solaris-test`, `vis-shim-test`,
+`i8-split-test`) and the usual utilities. Everything else is a flag:
+
+| flag | effect |
+|---|---|
+| `PROFILE=1` | per-stage timers; binary named `...-profile` |
+| `NATIVE=1` | `-march=native`; runs only on the build machine |
+| `BITS=64` | 64-bit Linux, named `...-linux64` (default 32-bit) |
+| `TOOLCHAIN=gcc` | Solaris via GCC instead of Sun Studio |
+| `FAST=1` | Solaris non-IEEE float (`-fast` / `-Ofast`), opt-in |
+| `NO_MMX=1` `NO_SSE2=1` `NO_AVX2=1` `NO_VIS=1` | leave a kernel out |
+
+`solaris-vis-test` and `solaris-gcc-vis-test` were the same three
+programs built by different compilers; they are now
+`solaris-test [TOOLCHAIN=gcc]`, which also builds `t_endian` and
+`t_backend`. `solaris-fast` became `FAST=1`.
+
+Implemented with indirect variable expansion (`$(VAR_$(FLAG))`) rather
+than `ifeq`, because this Makefile also has to work with Solaris
+`/usr/ccs/bin/make`, which has no conditionals.
+
+### Auto-selection was giving away 33% in NATIVE builds
+
+The backend table is a static priority list that assumes hand-written
+SIMD always beats portable C. Under `-march=native` that is false:
+
+```
+make linux NATIVE=1
+  --backend mmx    2.456 tok/s    <- what auto picked
+  --backend i8     3.274 tok/s    <- 1.33x faster
+```
+
+`auto` now prefers `i8` when `__SSE2__` or `__AVX2__` is defined, i.e.
+exactly when the compiler was allowed to vectorise it. The i486 build
+defines neither and is untouched — `i8_dot_q4_K` disassembles
+byte-identically, and the object is 64 bytes smaller. See finding 33.
+
+### Two bugs found while adding NATIVE
+
+**`-march=native` appended after the i486 baseline did nothing useful.**
+`-mno-sse -mno-sse2` are sticky and survive a later `-march`, so the
+result was a native-*tuned* binary emitting no SIMD at all. `NATIVE=1`
+now **replaces** the baseline: default build 0 SIMD instructions,
+`NATIVE=1` build 716.
+
+**Solaris was always building native.** `SUNTARGET` was hardcoded to
+`native`, so every Sun Studio binary was silently machine-specific. The
+default is now `-xtarget=generic`. GCC on SPARC needs `-mcpu=native`,
+not `-march=native`, and cross-compilers reject it — override with
+`SOLCPU_1=-mcpu=ultrasparc3`.
+
+`FAST=1` is toolchain-aware for the same reason: Studio spells it
+`-fast`, GCC `-Ofast`, and passing the wrong one is a hard build error.
+
+### Q5_K picks its loop shape from the build flags
+
+Splitting the Q5_K nibble loops was measured and rejected in 1.15.3 --
+scalar, it costs loads (i486 165 -> 170 instructions). Under SSE2 the
+verdict inverts completely:
+
+```
+matvec Q5_K   3.489 s -> 1.853 s      1.88x
+end to end    2.756   -> 3.308 tok/s  1.20x
+```
+
+Without it, an SSE2 build was nearly pointless: Q4_K 1.87x and Q6_K
+1.28x faster, but Q5_K **0.56x** -- backwards -- eating the win and
+leaving 1.07x. It is 20% of the weights and had grown to 48% of matvec
+time.
+
+The shape is now chosen by `#if defined(__SSE2__) || defined(__AVX2__)`.
+The i486 object is byte-identical to before. `tests/t_q5split.c` proves
+both shapes agree over 200,000 random sub-rows on four targets. See
+finding 35.
+
+### The i486 baseline is real; the binary needs a Pentium II
+
+Our objects are clean — zero CMOV, zero SSE/AVX in every translation
+unit, now asserted per-file in CI. The *linked* binary is not: glibc's
+`_dl_aux_init` uses CMOV, so `qemu-i386 -cpu 486` kills it before
+`main()`. A static `printf("hi")` at `-march=i486` fails identically.
+
+```
+486 / pentium    Illegal instruction (glibc)
+pentium2 and up  mmx <- selected
+```
+
+The Geode is unaffected: 486-class core *with* MMX, behaves as
+`pentium2`+. A genuine 486 needs static musl or uClibc-ng — documented,
+not tested here. Same shape as the mingw CRT finding. See finding 34.
+
+### Corrected: i8 vs mmx was never 0.44x
+
+`docs/PERFORMANCE-ANALYSIS.md` compared `perf-i7-9th-i8.txt` (**1.0.0**)
+with `perf-i7-9th-mmx-1.6.0.txt` (**1.6.0**) and reported the difference
+as a backend gap. Same-version numbers:
+
+```
+1.0.0 Geode   i8 0.026   mmx 0.028   0.93x
+1.0.0 i7      i8 1.236   mmx 1.265   0.98x
+1.6.0 Geode   i8 0.030   mmx 0.063   0.48x
+```
+
+At 1.0.0 the two were within 2-7%. The gap is the 1.3.0-1.5.0 MMX
+rewrite, not the instruction set. `ref` has always been ~3x behind i8
+end to end and 6.4x behind on Q6_K. See finding 37.
+
+### `make all` now builds everything shippable
+
+It built two artifacts and CI uploaded a `windows-profile.exe` that
+nothing produced. Now six:
+
+```
+infer-X.Y.Z-linux                 32-bit, i486 floor, picks mmx
+infer-X.Y.Z-linux-profile         ...with timers
+infer-X.Y.Z-linux64               64-bit, picks the SSE2-vectorised i8
+infer-X.Y.Z-linux64-profile       ...with timers
+infer-X.Y.Z-windows.exe           32-bit, i486 floor, picks mmx
+infer-X.Y.Z-windows-profile.exe   ...with timers
+```
+
+`NATIVE=1` is deliberately not a release artifact: it runs only on the
+machine that built it. CI uploads all six and asserts each picks the
+right backend — 32-bit `mmx`, 64-bit `i8` with >100 SIMD instructions.
+
+### CI
+
+`build.yml` now cross-compiles and tests **SPARC** on every push
+(sparc64 GCC + qemu: `t_vis`, `t_viskern`, `t_vissat`, `t_endian`,
+with and without VIS), exercises every build flag, and asserts the
+shipped x86 binaries contain **no unconditional SSE/AVX** — the check
+that makes "one generic binary" a fact rather than an intention.
+
+Release notes are now extracted from the newest `CHANGELOG.md` section
+instead of a fixed blurb, with a guard that fails the release if that
+section is not for the tag being built.
+
+### Q5_K no longer uses a lookup table
+
+`i8_dot_q5_K` read its nibbles through two 256-byte tables. They were
+slower than the arithmetic they replaced, on every target still in use:
+
+```
+i8_dot_q5_K, static instruction count
+  sparc64  155 -> 147   (35 -> 30 loads)
+  i486     168 -> 165
+
+Q5_K, i486-targeted build, ns/weight, best of 7
+  table       2.224
+  arithmetic  1.984      1.12x
+```
+
+Bit-identical output on x86-64, i486 and big-endian SPARC.
+
+They were also a hard blocker for any autovectoriser, because a table
+lookup is a gather. In an experimental `-march=haswell` build Q4_K and
+Q6_K sped up 2.2x and 1.7x while Q5_K stayed scalar and grew to 56% of
+matvec time, cancelling the win — 3.18 tok/s with the tables against
+4.58 without. That build is not part of the project, but the blocker it
+exposed is real for the SPARC builds too.
+
+The comment justifying the tables claimed "~2.4x on the Q4_K inner
+loop". Q4_K has never used them. See finding 32.
+
+### PROFILE=1 instead of nine duplicate targets
+
+The per-stage timers are still a compile-time choice, but no longer a
+separate rule per target:
+
+```sh
+make linux PROFILE=1          # == make linux-profile
+make solaris-vis PROFILE=1    # == make solaris-vis-profile
+```
+
+`PROFILE=1` appends `-DINFER_PROFILE` and renames the binary to
+`...-profile`, so the two builds cannot collide. Every `*-profile`
+target still exists as a one-line alias, so nothing that used them
+breaks, and the nine duplicated compile lines are gone.
+
+The timers stay compile-time rather than a runtime flag deliberately:
+`PROF_STOP` sits inside the per-layer path, so a runtime test would put
+a load-and-branch in the hot loop of every build — including the 440
+MHz Ultra and the 500 MHz Geode, where it is measurable.
+
+## 1.15.3 — i8 Q4_K, one reduction per nibble stream
+
+`i8_dot_q4_K` interleaved both nibble streams in a single loop. Split
+into two clean reductions it is measurably faster on every x86 target,
+and bit-identical:
+
+```
+                     before    after   speedup
+x86-64                0.747    0.598     1.25x
+i486/geode (32-bit)   1.844    1.707     1.08x     (median of 10)
+```
+
+ns per weight, 3584-column rows, 8 rows, 60 repeats. The i486 figure is
+the 486-baseline **build** running on a modern host, so it predicts
+direction, not magnitude — the real Geode has a different cache and
+issue width.
+
+This is the portable `i8` backend, so it also lands on SPARC, Solaris
+and every other target with no MMX. Verified bit-identical there too.
+
+### Why this is interesting
+
+**"Split the loops" was already measured and rejected for MMX at
+0.90x.** Same transformation, same format, opposite sign. In hand-written
+MMX the two streams share loaded registers and splitting forces a
+re-load and re-mask; in portable C, separating them lets the compiler
+unroll and pipeline each reduction freely. A transformation is good or
+bad against a particular register allocator, not in the abstract — so
+the rejected list is worth re-testing per backend, not treated as
+settled. See finding 31.
+
+### Measured and rejected
+
+- **Byte-domain nibble masking** ported from the MMX kernel: 0.78 →
+  1.03 ns/weight. Hand-assembling a 32-bit word in C costs more than
+  the byte loads it replaces.
+- **Splitting Q5_K the same way**: 1.43 → 1.51 ns/weight. Q5_K reads two
+  planes (`qs` and `qh`), so splitting doubles the loads. Only Q4_K is
+  split.
+
+### New
+
+- `tests/t_i8split.c` — 200,000 random sub-rows per architecture,
+  comparing the integer accumulators directly. Needs no model.
+
+A note for anyone repeating this: comparing the two kernels through
+their **float** results reports spurious differences on `-mfpmath=387`
+builds. That is x87 80-bit excess precision spilling at different
+points across translation units, not an arithmetic change. The integer
+accumulators are identical on x86-64, i486 and big-endian SPARC.
+
+### Also confirmed
+
+The per-weight cost trend from finding 30 holds on x86, not just SPARC:
+Q6_K is the cheapest format per weight on Geode, i7 and UltraSPARC
+alike, and Q4_K carries 40% of the weights on all of them.
+
+## 1.15.2 — first real-hardware verdict, and Q6_K switched off
+
+An UltraSPARC IIi finally ran this. One change is a large win, one is
+worthless, and the profile that motivated the second was misread.
+
+### Q5_K: confirmed, ~2x faster
+
+The 1.15.1 fold removal is real and reproducible. Within-run ratios,
+which cancel any machine-state difference between sessions:
+
+```
+Q5_K / Q4_K cost per call
+  1.14.2 run #1   3.19x
+  1.14.2 run #2   3.19x      three runs, identical to 3 s.f.
+  1.14.2 run #3   3.19x
+  1.15.1          1.57x      2.03x faster
+```
+
+Per weight, Q5_K went from ~1152 ns to ~617 ns. The long-standing
+"Q5_K costs 2.55x Q4_K despite being 25% wider" anomaly was a redundant
+fold, and it is gone.
+
+### Q6_K: kernel disabled by default
+
+The Q6_K VIS kernel cuts instructions 3.1x and measured **0.8%** on
+hardware:
+
+```
+Q6_K / Q4_K cost per weight, same run
+  1.14.2, portable i8 path   0.862
+  1.15.1, VIS kernel         0.855
+```
+
+`make solaris-vis` now routes Q6_K to `qmv_i8`, which measured faster.
+The kernel is kept and still tested — build `make solaris-vis-q6k` (or
+`-DINFER_VIS_Q6K`) to enable it. When disabled it is compiled out
+entirely, along with its four helpers, so the default binary carries no
+dead code.
+
+### Why the profile was misleading
+
+Grouped by `us/call`, Q6_K looked like the most expensive format. Call
+sizes are not comparable:
+
+```
+Q4_K   113,338 elements/call
+Q5_K   155,345 elements/call
+Q6_K   678,142 elements/call     <- 6x a Q4_K call
+```
+
+Per weight, across every log going back to 1.11.0, **Q6_K has always
+been the cheapest format on this machine** — ~427 ns/weight against 495
+for Q4_K and 1152 for Q5_K, even with no VIS kernel. It is 27% of
+matvec time because it is 40% of the weights. See finding 30.
+
+### Note on the 1.15.1 log
+
+That run came from a different session and is inflated throughout:
+`rms norms`, which no version has touched, is 4.3x slower in it. Absolute
+times are not comparable across the two logs; the ratios above are.
+Anyone repeating this should run the versions back to back in one
+session.
+
 ## 1.15.1 — lane budgets, re-derived
 
 Three kernel-level wins, all pure deletion, all bit-identical to `i8`.

@@ -37,13 +37,13 @@ cd Infer
 make linux
 ```
 
-That produces `infer-1.14.0-linux`. Get a model and run it:
+That produces `infer-<version>-linux`. Get a model and run it:
 
 ```sh
 curl -L -o Qwen3.5-0.8B-Q4_K_M.gguf \
   "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf"
 
-./infer-1.14.0-linux run Qwen3.5-0.8B-Q4_K_M.gguf \
+./infer-<version>-linux run Qwen3.5-0.8B-Q4_K_M.gguf \
     -p "The capital of France is" -n 10 -t 0
 ```
 
@@ -55,28 +55,78 @@ The capital of France is **Paris**.
 
 If you got that, everything below is optional.
 
-### There are only four targets
+### There are only three targets
 
 ```sh
-make linux              # -> infer-1.14.0-linux
-make linux-profile      # -> infer-1.14.0-linux-profile
-make windows            # -> infer-1.14.0-windows.exe
-make windows-profile    # -> infer-1.14.0-windows-profile.exe
+make linux              # -> infer-<version>-linux
+make windows            # -> infer-<version>-windows.exe
+make solaris            # -> infer-<version>-solaris
 
-make all                # all four
-make help               # this list
+make all                # linux + windows
+make help               # the full flag list
 ```
 
-**Every one of those contains all three backends** — `mmx`, `i8`, `ref` —
-and picks the fastest the CPU supports at run time. **Every one is built
-to an i486 baseline**, so the same binary runs on a 486 and accelerates
-on anything with MMX.
+**Every one contains every kernel it could use**, and picks one at run
+time after a CPUID / feature probe. On x86 that is `mmx`, `i8` and `ref`; on SPARC it is `vis`, `i8` and `ref`. The x86
+builds use an **i486 baseline**, so the same binary runs on a 486 and
+accelerates on anything newer.
 
-There is no separate "MMX build" and "non-MMX build", and no separate
-"i486 build". One binary covers all of it. The only axis is whether you
-want the profiler.
+There is no separate "MMX build", no separate "i486 build", and no
+separate profiling target. One binary per platform.
 
-Solaris/SPARC is a separate world with different flags — section 6.
+### Which build for which machine
+
+| target CPU | build | picks | tok/s* | 486-safe |
+|---|---|---|---|---|
+| pure 486 (no MMX) | `make linux` + musl/uClibc, static | `ref` | — | see below |
+| Geode LX (486+MMX) | `make linux` | `mmx` | 2.45 | yes |
+| Pentium M / Dothan | `make linux` | `mmx` | 2.45 | yes |
+| i7 9th gen (AVX2) | `make linux BITS=64 NATIVE=1` | `i8` | **4.23** | no |
+| anything, one binary | `make linux` | auto | 2.45 | yes |
+
+\* Xeon @ 2.60 GHz, 0.8B Q4_K_M, `-n 10 -t 0 --seed 1 -c 512`, best of
+3. Ordering transfers between machines; magnitudes do not.
+
+**Important:** the shipped Linux binary needs a **Pentium II or later**
+in practice — not because of our code, which contains zero CMOV and
+zero SSE/AVX, but because modern glibc's startup uses CMOV. A genuine
+486 needs a static musl or uClibc-ng build. See finding 34.
+
+The Geode is unaffected: it is a 486-class core *with* MMX and behaves
+as `pentium2` and up.
+
+### Flags, not targets
+
+| flag | effect |
+|---|---|
+| `PROFILE=1` | per-stage timers; binary named `...-profile` |
+| `NATIVE=1` | `-march=native`; **runs only on the build machine** |
+| `BITS=64` | 64-bit Linux, named `...-linux64` (default 32-bit) |
+| `TOOLCHAIN=gcc` | Solaris via GCC instead of Sun Studio |
+| `NO_MMX=1` | leave the MMX kernels out |
+| `NO_SSE2=1` `NO_AVX2=1` | ...likewise |
+| `NO_VIS=1` | leave the VIS kernels out (Solaris) |
+
+They combine:
+
+```sh
+make linux PROFILE=1
+make linux BITS=64 NATIVE=1
+make solaris TOOLCHAIN=gcc NO_VIS=1
+```
+
+`NATIVE=1` **replaces** the portable baseline rather than adding to it.
+Appending `-march=native` after `-mno-sse` does not work — the `-mno-*`
+flags are sticky and you would get a native-tuned binary that emits no
+SIMD at all. Verified: the default build has 0 SIMD instructions, the
+`NATIVE=1` build has 716.
+
+`NO_*` flags exist for a smaller binary or to isolate a codegen bug.
+All-on is the supported configuration, and the runtime cost of carrying
+every kernel is one indirect call per matrix *row* — at the noise floor
+on both x86-64 and an i486-targeted build.
+
+Solaris specifics are in section 6.
 
 ### Why the version is in the filename
 
@@ -84,8 +134,8 @@ Every binary is named `infer-<version>-<platform>`, so several builds
 can live in one directory without being renamed:
 
 ```sh
-make version        # -> 1.14.0
-make checkversion   # -> version 1.14.0 ok   (asserts Makefile == src/infer.h)
+make version        # -> the current version
+make checkversion   # -> version X.Y.Z ok  (asserts Makefile == src/infer.h)
 make SUFFIX=        # -> infer-linux, no version, for scratch builds
 ```
 
@@ -196,7 +246,7 @@ downstream will silently produce a binary with a fourth DLL dependency.
 
 ```sh
 make windows
-make windows-profile
+make windows PROFILE=1
 ```
 
 That is the whole build. No configure, no cmake, no object files.
@@ -204,7 +254,7 @@ That is the whole build. No configure, no cmake, no object files.
 ### Step 4 — verify, because "it compiled" is not "it works on XP"
 
 ```sh
-i686-w64-mingw32-objdump -p infer-1.14.0-windows.exe | grep -c 'DLL Name'
+i686-w64-mingw32-objdump -p infer-<version>-windows.exe | grep -c 'DLL Name'
 ```
 ```
 3
@@ -214,7 +264,7 @@ Anything other than `3` means it will not run on a stock XP install.
 See which they are:
 
 ```sh
-i686-w64-mingw32-objdump -p infer-1.14.0-windows.exe | grep 'DLL Name'
+i686-w64-mingw32-objdump -p infer-<version>-windows.exe | grep 'DLL Name'
 ```
 ```
 	DLL Name: KERNEL32.dll
@@ -225,7 +275,7 @@ i686-w64-mingw32-objdump -p infer-1.14.0-windows.exe | grep 'DLL Name'
 Confirm it is a 32-bit PE:
 
 ```sh
-file infer-1.14.0-windows.exe
+file infer-<version>-windows.exe
 ```
 ```
 PE32 executable (console) Intel 80386, for MS Windows
@@ -234,7 +284,7 @@ PE32 executable (console) Intel 80386, for MS Windows
 Confirm the MMX kernels are in there:
 
 ```sh
-i686-w64-mingw32-objdump -d infer-1.14.0-windows.exe \
+i686-w64-mingw32-objdump -d infer-<version>-windows.exe \
   | grep -cE 'pmaddwd|punpcklbw'
 ```
 ```
@@ -244,7 +294,7 @@ i686-w64-mingw32-objdump -d infer-1.14.0-windows.exe \
 Confirm no post-XP API crept in:
 
 ```sh
-i686-w64-mingw32-objdump -p infer-1.14.0-windows.exe \
+i686-w64-mingw32-objdump -p infer-<version>-windows.exe \
   | grep -oE '\b(GetTickCount64|InitializeCriticalSectionEx|CreateFile2|InetPton|GetAddrInfoW|SetThreadStackGuarantee)\b' \
   | sort -u
 ```
@@ -267,9 +317,9 @@ make linux
 curl -L -o model.gguf \
   "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf"
 
-./infer-1.14.0-linux run model.gguf -p "The capital of France is" \
+./infer-<version>-linux run model.gguf -p "The capital of France is" \
     -n 8 -t 0 --seed 1 --backend mmx -c 256
-./infer-1.14.0-linux run model.gguf -p "The capital of France is" \
+./infer-<version>-linux run model.gguf -p "The capital of France is" \
     -n 8 -t 0 --seed 1 --backend i8 -c 256
 ```
 
@@ -296,7 +346,7 @@ make clean
 | binary is `PE32+` | used `x86_64-w64-mingw32-gcc`; use `i686-` |
 | `cannot open 'model.gguf'` mid-session | the sandbox pruned it; re-download |
 | tried to run the `.exe` under Wine | do not; verify statically and test the Linux twin |
-| `--log-stages` prints nothing | you built the non-profile target; use `make windows-profile` |
+| `--log-stages` prints nothing | you built without PROFILE=1; use `make windows PROFILE=1` |
 
 ---
 
@@ -313,7 +363,7 @@ cc -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
    -march=i486 -mtune=geode -mmmx -mno-sse -mno-sse2 -mfpmath=387 \
    -DINFER_HAVE_MMX \
    -m32 -D_FILE_OFFSET_BITS=64 \
-   -o infer-1.14.0-linux \
+   -o infer-<version>-linux \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
@@ -346,7 +396,7 @@ build emits, only 3 are in a hot function.
 ### Verify
 
 ```sh
-./infer-1.14.0-linux --backend list
+./infer-<version>-linux --backend list
 ```
 ```
 CPU: GenuineIntel  features: mmx cmov
@@ -360,7 +410,7 @@ available backends:
 All three present. Now the 486 guarantee:
 
 ```sh
-objdump -d infer-1.14.0-linux --no-show-raw-insn \
+objdump -d infer-<version>-linux --no-show-raw-insn \
   | grep -cE '^\s+[0-9a-f]+:\s+cmov[a-z]+'
 ```
 ```
@@ -370,7 +420,7 @@ objdump -d infer-1.14.0-linux --no-show-raw-insn \
 And the MMX kernels are really there:
 
 ```sh
-objdump -d infer-1.14.0-linux | grep -cE 'pmaddwd|punpcklbw|paddd'
+objdump -d infer-<version>-linux | grep -cE 'pmaddwd|punpcklbw|paddd'
 ```
 ```
 354
@@ -379,11 +429,11 @@ objdump -d infer-1.14.0-linux | grep -cE 'pmaddwd|punpcklbw|paddd'
 ### Prove the backends agree
 
 ```sh
-./infer-1.14.0-linux run model.gguf -p "The capital of France is" \
+./infer-<version>-linux run model.gguf -p "The capital of France is" \
     -n 8 -t 0 --seed 1 --backend mmx -c 256
-./infer-1.14.0-linux run model.gguf -p "The capital of France is" \
+./infer-<version>-linux run model.gguf -p "The capital of France is" \
     -n 8 -t 0 --seed 1 --backend i8 -c 256
-./infer-1.14.0-linux run model.gguf -p "The capital of France is" \
+./infer-<version>-linux run model.gguf -p "The capital of France is" \
     -n 8 -t 0 --seed 1 --backend ref -c 256
 ```
 
@@ -421,7 +471,7 @@ accounts for that loader's layout.
 Statically, confirm `.rodata` is aligned at least 8:
 
 ```sh
-readelf -S infer-1.14.0-linux | grep -A1 '\.rodata'
+readelf -S infer-<version>-linux | grep -A1 '\.rodata'
 ```
 
 The last column is the alignment. Do not try to grep absolute addresses
@@ -444,7 +494,7 @@ i686-w64-mingw32-gcc -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
    -march=i486 -mtune=geode -mmmx -mno-sse -mno-sse2 -mfpmath=387 \
    -DINFER_HAVE_MMX \
    -D_WIN32_WINNT=0x0501 \
-   -o infer-1.14.0-windows.exe \
+   -o infer-<version>-windows.exe \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
@@ -460,7 +510,7 @@ the compiler refuses anything newer.
 ### Verify
 
 ```sh
-i686-w64-mingw32-objdump -p infer-1.14.0-windows.exe | grep 'DLL Name'
+i686-w64-mingw32-objdump -p infer-<version>-windows.exe | grep 'DLL Name'
 ```
 ```
 	DLL Name: KERNEL32.dll
@@ -471,7 +521,7 @@ i686-w64-mingw32-objdump -p infer-1.14.0-windows.exe | grep 'DLL Name'
 All three are present on a stock XP install.
 
 ```sh
-file infer-1.14.0-windows.exe
+file infer-<version>-windows.exe
 ```
 ```
 PE32 executable (console) Intel 80386, for MS Windows
@@ -484,7 +534,7 @@ Our code contains **no CMOV**. mingw's C runtime does — in `strtod`,
 `strtod` in the JSON and Jinja parsers):
 
 ```sh
-i686-w64-mingw32-objdump -d infer-1.14.0-windows.exe --no-show-raw-insn \
+i686-w64-mingw32-objdump -d infer-<version>-windows.exe --no-show-raw-insn \
   | grep -cE '^\s+[0-9a-f]+:\s+cmov[a-z]+'
 ```
 ```
@@ -502,23 +552,41 @@ limitation, not a claim.
 ## 5. Profiling builds
 
 ```sh
-make linux-profile
-make windows-profile
+make linux PROFILE=1
+make windows PROFILE=1
 ```
 
 Identical to the normal targets plus `-DINFER_PROFILE`. Overhead is
 about **2%**.
+
+Since 1.16.0 the timers are a flag rather than a set of parallel rules,
+so **any** target can carry them:
+
+```sh
+make linux PROFILE=1
+make solaris PROFILE=1
+make solaris TOOLCHAIN=gcc PROFILE=1
+```
+
+`PROFILE=1` appends `-DINFER_PROFILE` and renames the output to
+`...-profile`, so a profiling build can never overwrite a normal one.
+The `*-profile` targets still exist and are now one-line aliases.
+
+The timers remain a **compile-time** choice on purpose. `PROF_STOP` sits
+inside the per-layer path; making it a runtime test would put a load and
+a branch in the hot loop of every build, including the machines slow
+enough for that to show up.
 
 ### Both logging features are opt-in
 
 A profiling build prints **nothing** until asked:
 
 ```sh
-./infer-1.14.0-linux-profile run model.gguf -p "hi" -n 10 \
+./infer-<version>-linux-profile run model.gguf -p "hi" -n 10 \
     --log-perf                                    # throughput only
-./infer-1.14.0-linux-profile run model.gguf -p "hi" -n 10 \
+./infer-<version>-linux-profile run model.gguf -p "hi" -n 10 \
     --log-perf --log-stages                       # + per-stage table
-./infer-1.14.0-linux-profile run model.gguf -p "hi" -n 10 \
+./infer-<version>-linux-profile run model.gguf -p "hi" -n 10 \
     --log-perf --log-stages --log-file perf.txt   # to a file
 ```
 
@@ -526,8 +594,8 @@ A profiling build prints **nothing** until asked:
 doing nothing:
 
 ```
---log-stages needs a build with -DINFER_PROFILE (make linux-profile /
-windows-profile / solaris-profile); this build has no stage timers
+--log-stages needs a build with -DINFER_PROFILE (make <target>
+PROFILE=1); this build has no stage timers
 compiled in
 ```
 
@@ -535,8 +603,8 @@ Without `-DINFER_PROFILE` every timer macro expands to nothing — not a
 branch, not an instruction:
 
 ```sh
-nm infer-1.14.0-linux         | grep -c prof_add    # 0
-nm infer-1.14.0-linux-profile | grep -c prof_add    # 1
+nm infer-<version>-linux         | grep -c prof_add    # 0
+nm infer-<version>-linux-profile | grep -c prof_add    # 1
 ```
 
 See [PROFILING.md](PROFILING.md) for how to read the output.
@@ -552,9 +620,9 @@ Tested against **Sun Studio 12.3** on UltraSPARC.
 
 ```sh
 make solaris              # Sun Studio, 64-bit    (recommended)
-make solaris-profile      # ...with stage timers
-make solaris-gcc          # GCC on Solaris, 64-bit
-make solaris-gcc-profile  # ...with stage timers
+make solaris PROFILE=1            # ...with stage timers
+make solaris TOOLCHAIN=gcc        # GCC instead of Sun Studio
+make solaris TOOLCHAIN=gcc PROFILE=1
 make solaris-test         # the test programs
 ```
 
@@ -563,7 +631,7 @@ make solaris-test         # the test programs
 ```sh
 cc -Xc -xc99=none -xO5 -xunroll=16 -m64 -xtarget=native \
    -DINFER_BIG_ENDIAN=1 \
-   -o infer-1.14.0-solaris \
+   -o infer-<version>-solaris \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
@@ -630,7 +698,7 @@ Two flags you may see recommended are **not** enabled by default:
 To try `-fast` anyway:
 
 ```sh
-make solaris-fast
+make solaris FAST=1
 ./build/t_backend model.gguf     # check rel-l2 against the ref column
 ```
 
@@ -643,12 +711,13 @@ A fourth backend using the Visual Instruction Set. Opt-in, exactly like
 MMX on x86.
 
 ```sh
-gmake solaris-vis            # Sun Studio
-gmake solaris-gcc-vis        # GCC
-gmake solaris-vis-profile    # with stage timers
+gmake solaris                     # Sun Studio, VIS included
+gmake solaris TOOLCHAIN=gcc       # GCC, VIS included
+gmake solaris PROFILE=1           # with stage timers
+gmake solaris NO_VIS=1            # leave VIS out
 ```
 
-`solaris-vis` adds `-xarch=sparcvis -xvis -DINFER_HAVE_VIS`; the GCC
+`make solaris` adds `-xarch=sparcvis -xvis -DINFER_HAVE_VIS`; the GCC
 target uses `-mcpu=ultrasparc -mvis`. The file supports both compilers:
 Sun Studio via `<vis_proto.h>`, GCC via `__builtin_vis_*`.
 
@@ -663,8 +732,8 @@ identity — `fmul8x16(w, x << 8) == w * x` exactly — that cancels the
 graphics scaling built into the instruction. Prove it on your machine:
 
 ```sh
-gmake solaris-vis-test       # Sun Studio
-gmake solaris-gcc-vis-test   # GCC
+gmake solaris-test                    # Sun Studio
+gmake solaris-test TOOLCHAIN=gcc      # GCC
 ./build/t_vis
 ```
 
@@ -722,7 +791,7 @@ make solaris SUNTARGET=ultra2      # build on a Blade 2500 for an Ultra 10
 ### Verify
 
 ```sh
-./infer-1.14.0-solaris --backend list
+./infer-<version>-solaris --backend list
 ```
 ```
 CPU: unknown  features:
@@ -761,13 +830,13 @@ Used for byte-order regression testing. Both need
 sudo apt-get install -y gcc-s390x-linux-gnu qemu-user-static
 
 s390x-linux-gnu-gcc -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter \
-   -O2 -static -o infer-1.14.0-s390x-linux \
+   -O2 -static -o infer-<version>-s390x-linux \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
    src/util.c src/prof.c src/net_posix.c src/sys_posix.c -lm
 
-qemu-s390x-static ./infer-1.14.0-s390x-linux run model.gguf \
+qemu-s390x-static ./infer-<version>-s390x-linux run model.gguf \
     -p "The capital of France is" -n 8 -t 0 --seed 1 -c 256
 ```
 
@@ -777,13 +846,13 @@ qemu-s390x-static ./infer-1.14.0-s390x-linux run model.gguf \
 sudo apt-get install -y gcc-sparc64-linux-gnu qemu-user-static
 
 sparc64-linux-gnu-gcc -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter \
-   -O2 -static -D_FILE_OFFSET_BITS=64 -o infer-1.14.0-sparc64-linux \
+   -O2 -static -D_FILE_OFFSET_BITS=64 -o infer-<version>-sparc64-linux \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
    src/util.c src/prof.c src/net_posix.c src/sys_posix.c -lm
 
-qemu-sparc64-static ./infer-1.14.0-sparc64-linux run model.gguf \
+qemu-sparc64-static ./infer-<version>-sparc64-linux run model.gguf \
     -p "The capital of France is" -n 8 -t 0 --seed 1 -c 256
 ```
 
@@ -875,10 +944,10 @@ echo "ALL TESTS PASSED"
 
 | target | output | key flags |
 |---|---|---|
-| `make linux` | `infer-1.14.0-linux` | `-std=gnu89 -m32 -march=i486 -mtune=geode -mmmx -DINFER_HAVE_MMX -D_FILE_OFFSET_BITS=64` |
-| `make linux-profile` | `infer-1.14.0-linux-profile` | as above `+ -DINFER_PROFILE` |
-| `make windows` | `infer-1.14.0-windows.exe` | as above, `-D_WIN32_WINNT=0x0501 -lws2_32`, win32 platform files |
-| `make windows-profile` | `infer-1.14.0-windows-profile.exe` | as above `+ -DINFER_PROFILE` |
+| `make linux` | `infer-<version>-linux` | `-std=gnu89 -m32 -march=i486 -mtune=geode -mmmx -DINFER_HAVE_MMX -D_FILE_OFFSET_BITS=64` |
+| `make linux PROFILE=1` | `infer-<version>-linux-profile` | as above `+ -DINFER_PROFILE` |
+| `make windows` | `infer-<version>-windows.exe` | as above, `-D_WIN32_WINNT=0x0501 -lws2_32`, win32 platform files |
+| `make windows PROFILE=1` | `infer-<version>-windows-profile.exe` | as above `+ -DINFER_PROFILE` |
 | `make all` | all four | |
 
 All four contain `mmx`, `i8` and `ref`, and all four are i486-baseline.
@@ -887,11 +956,11 @@ All four contain `mmx`, `i8` and `ref`, and all four are i486-baseline.
 
 | target | output | key flags |
 |---|---|---|
-| `make solaris` | `infer-1.14.0-solaris` | `-Xc -xc99=none -xO5 -xunroll=16 -m64 -xtarget=native -DINFER_BIG_ENDIAN=1 -lsocket -lnsl` |
-| `make solaris-profile` | `infer-1.14.0-solaris-profile` | as above `+ -DINFER_PROFILE` |
-| `make solaris-gcc` | `infer-1.14.0-solaris` | GCC equivalent, `-m64 -lsocket -lnsl` |
-| `make solaris-gcc-profile` | `infer-1.14.0-solaris-profile` | as above `+ -DINFER_PROFILE` |
-| `make solaris-fast` | `infer-1.14.0-solaris` | `+ -fast` — non-IEEE float, opt-in, verify with `t_backend` |
+| `make solaris` | `infer-<version>-solaris` | `-Xc -xc99=none -xO5 -xunroll=16 -m64 -xtarget=native -DINFER_BIG_ENDIAN=1 -lsocket -lnsl` |
+| `make solaris PROFILE=1` | `infer-<version>-solaris-profile` | as above `+ -DINFER_PROFILE` |
+| `make solaris TOOLCHAIN=gcc` | `infer-<version>-solaris` | GCC equivalent, `-m64 -lsocket -lnsl` |
+| `make solaris TOOLCHAIN=gcc PROFILE=1` | `infer-<version>-solaris-profile` | as above `+ -DINFER_PROFILE` |
+| `make solaris FAST=1` | `infer-<version>-solaris` | `+ -fast` — non-IEEE float, opt-in, verify with `t_backend` |
 | `make solaris-test` | `build/t_*` | test programs, Sun Studio |
 
 ### Utility
@@ -901,7 +970,7 @@ All four contain `mmx`, `i8` and `ref`, and all four are i486-baseline.
 | `make test` | eight test programs into `build/` |
 | `make bench` | just `build/t_backend` |
 | `make help` | the target list |
-| `make version` | prints `1.14.0` |
+| `make version` | prints `<version>` |
 | `make checkversion` | asserts the Makefile matches `src/infer.h` |
 | `make clean` | removes every build product, including other versions |
 
@@ -909,7 +978,7 @@ All four contain `mmx`, `i8` and `ref`, and all four are i486-baseline.
 
 | variable | default | use |
 |---|---|---|
-| `SUFFIX` | `-1.14.0` | `make SUFFIX= linux` for an unversioned scratch build |
+| `SUFFIX` | `-<version>` | `make SUFFIX= linux` for an unversioned scratch build |
 | `SUNOPT` | `-xO5 -xunroll=16` | Sun Studio optimisation flags |
 | `SUNTARGET` | `native` | `make solaris SUNTARGET=ultra2` to cross-build |
 | `SUNBITS` | `-m64` | do not change unless you know why (see section 6) |
@@ -947,33 +1016,33 @@ Everything below runs on the binary, not the source.
 
 ```sh
 # 1. it is the architecture you expect
-file infer-1.14.0-linux
+file infer-<version>-linux
 
 # 2. version
-./infer-1.14.0-linux --version
+./infer-<version>-linux --version
 
 # 3. which kernels are compiled in, and which the CPU can use
-./infer-1.14.0-linux --backend list
+./infer-<version>-linux --backend list
 
 # 4. no post-486 instructions
-objdump -d infer-1.14.0-linux --no-show-raw-insn \
+objdump -d infer-<version>-linux --no-show-raw-insn \
   | grep -oE '^\s+[0-9a-f]+:\s+[a-z0-9.]+' | awk '{print $2}' | sort -u \
   | grep -cE '^(cmov[a-z]*|pmaddwd|paddd|punpck[a-z]+|movq|emms)$'      # want 0
 
 # 5. no CMOV in our code
-objdump -d infer-1.14.0-linux --no-show-raw-insn \
+objdump -d infer-<version>-linux --no-show-raw-insn \
   | grep -cE '^\s+[0-9a-f]+:\s+cmov[a-z]+'                              # want 0
 
 # 6. MMX constants 8-byte aligned (run on the target machine)
 make test && ./build/t_align                    # "all MMX constants correctly aligned"
-readelf -S infer-1.14.0-linux | grep -A1 '\.rodata'   # last column >= 8
+readelf -S infer-<version>-linux | grep -A1 '\.rodata'   # last column >= 8
 
 # 7. Windows: three DLLs
-i686-w64-mingw32-objdump -p infer-1.14.0-windows.exe | grep -c 'DLL Name'   # want 3
+i686-w64-mingw32-objdump -p infer-<version>-windows.exe | grep -c 'DLL Name'   # want 3
 
 # 8. both backends agree bit-for-bit (greedy decoding)
-./infer-1.14.0-linux run model.gguf -p "test" -n 20 -t 0 --seed 1 --backend mmx
-./infer-1.14.0-linux run model.gguf -p "test" -n 20 -t 0 --seed 1 --backend i8
+./infer-<version>-linux run model.gguf -p "test" -n 20 -t 0 --seed 1 --backend mmx
+./infer-<version>-linux run model.gguf -p "test" -n 20 -t 0 --seed 1 --backend i8
 ```
 
 ---
@@ -1006,7 +1075,7 @@ sudo update-alternatives --config i686-w64-mingw32-gcc
 
 **Undefined `socket`, `bind`, `gethostbyname` on Solaris**
 
-Missing `-lsocket -lnsl`. Use `make solaris` or `make solaris-gcc`,
+Missing `-lsocket -lnsl`. Use `make solaris` or `make solaris TOOLCHAIN=gcc`,
 which pass them.
 
 **`#error "cannot determine byte order"`**

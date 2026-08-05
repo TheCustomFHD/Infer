@@ -82,9 +82,10 @@ SPARC / SOLARIS
 Not shipped as a binary: building one needs a Solaris toolchain that
 cannot be redistributed. Build from source, it is one command:
 
-    gmake solaris              Sun Studio, 64-bit
-    gmake solaris-profile      ...with per-stage timers
-    gmake solaris-gcc          GCC on Solaris, 64-bit
+    gmake solaris                        Sun Studio, 64-bit
+    gmake solaris PROFILE=1              ...with per-stage timers
+    gmake solaris TOOLCHAIN=gcc          GCC instead of Sun Studio
+    gmake solaris NO_VIS=1               leave the VIS kernels out
 
 These are deliberately separate from the x86 targets -- different
 compiler, different flags, big-endian, 64-bit, no MMX. The i8 backend
@@ -98,10 +99,15 @@ BUILDING THE X86 TARGETS YOURSELF
 ---------------------------------
 
     make linux
-    make linux-profile
     make windows
-    make windows-profile
     make all
+
+    Flags: PROFILE=1 (stage timers), NATIVE=1 (-march=native, runs
+    only on the build machine), BITS=64 (64-bit Linux), and
+    NO_MMX=1 / NO_SSE2=1 / NO_AVX2=1 to leave a kernel out.
+
+    make linux PROFILE=1
+    make linux BITS=64 NATIVE=1
 
     make help          the full list
     make test          the unit tests

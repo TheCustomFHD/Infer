@@ -130,32 +130,6 @@ int bk_cpu_has_3dnow(void) { probe_cpu(); return cpu_3dnow; }
 int bk_cpu_has_cmov(void)  { probe_cpu(); return cpu_cmov; }
 const char *bk_cpu_vendor(void) { probe_cpu(); return cpu_vendor_s; }
 
-/* ------------------------------------------------------------------ */
-/* Nibble lookup tables                                                */
-/*                                                                     */
-/* The inner loop of every 4-bit kernel needs both nibbles of a packed  */
-/* byte. Computing them costs an AND and a SHIFT per weight. A pair of  */
-/* 256-byte tables turns that into two loads that hit L1 permanently    */
-/* (512 bytes total, versus the 486's 8 KB and the Geode's 64 KB).      */
-/*                                                                     */
-/* Measured on a 486-targeted build this is ~2.4x on the Q4_K inner     */
-/* loop -- by far the largest single win available to the portable      */
-/* backend, and it needs no SIMD at all.                                */
-/* ------------------------------------------------------------------ */
-
-static unsigned char nib_lo[256];
-static unsigned char nib_hi[256];
-static int nib_ready = 0;
-
-static void nib_init(void) {
-    int i;
-    if (nib_ready) return;
-    for (i = 0; i < 256; i++) {
-        nib_lo[i] = (unsigned char) (i & 0x0F);
-        nib_hi[i] = (unsigned char) (i >> 4);
-    }
-    nib_ready = 1;
-}
 
 /* ------------------------------------------------------------------ */
 /* Activation quantisation                                             */
@@ -174,7 +148,6 @@ const bk_qx *bk_quantize_x(const float *x, long n) {
     long nb = (n + 31) / 32;
     long i, b;
 
-    nib_init();
 
     if (n > xq_cap) {
         xq_cap    = n + 256;
@@ -296,11 +269,13 @@ static float i8_dot_q4_K(const unsigned char *b, const bk_qx *xq, long ncols) {
             get_scale_min_k4(j * 2,     sc, &s1, &m1);
             get_scale_min_k4(j * 2 + 1, sc, &s2, &m2);
 
-            for (l = 0; l < 32; l++) {
-                int w = qs[l];
-                acc1 += (w & 0xF) * x1[l];
-                acc2 += (w >> 4)  * x2[l];
-            }
+            /* Split the two nibble streams into separate loops.
+             * Interleaved, each iteration has two independent chains
+             * competing for the same load slot; separated, each loop
+             * is a clean reduction the compiler can unroll and (where
+             * the target allows) vectorise. (Finding 31.) */
+            for (l = 0; l < 32; l++) acc1 += (qs[l] & 0xF) * x1[l];
+            for (l = 0; l < 32; l++) acc2 += (qs[l] >> 4)  * x2[l];
 
             sum += xq->d[blk] *
                    ((float) acc1 * d * (float) s1 -
@@ -342,15 +317,44 @@ static float i8_dot_q5_K(const unsigned char *b, const bk_qx *xq, long ncols) {
             get_scale_min_k4(j * 2 + 1, sc, &s2, &m2);
 
             /* branch-free hi-bit term: (h >> sh) & 1, shifted to 16.
-             * A per-lane branch costs a pipeline flush on a 486. */
+             * A per-lane branch costs a pipeline flush on a 486.
+             *
+             * The nibbles are computed, not looked up. A table lookup
+             * is a gather, which no vectoriser can handle, and it was
+             * measured slower even scalar. (Finding 32.)
+             *
+             * Two shapes, and which one wins depends on whether the
+             * compiler may vectorise. Interleaved, one loop reads both
+             * planes once. Split, each loop is a clean reduction the
+             * vectoriser can take, but both planes get re-read.
+             *
+             *   scalar (i486 165 -> 170 instrs, sparc64 147 -> 160):
+             *       interleaved wins
+             *   SSE2 (Q5_K matvec 3.489s -> 1.853s, 1.88x):
+             *       split wins, by a lot
+             *
+             * Same reassociation either way -- proven integer-exact
+             * over 200000 random sub-rows on x86-64, i486, SSE2 and
+             * big-endian sparc64. (Finding 35.) */
+#if defined(__SSE2__) || defined(__AVX2__)
+            for (l = 0; l < 32; l++) {
+                acc1 += ((int) (qs[l] & 0x0F) +
+                         (((qh[l] >> sh1) & 1) << 4)) * x1[l];
+            }
+            for (l = 0; l < 32; l++) {
+                acc2 += ((int) (qs[l] >> 4) +
+                         (((qh[l] >> sh2) & 1) << 4)) * x2[l];
+            }
+#else
             for (l = 0; l < 32; l++) {
                 unsigned char v = qs[l];
                 int h = qh[l];
-                int w1 = (int) nib_lo[v] + (((h >> sh1) & 1) << 4);
-                int w2 = (int) nib_hi[v] + (((h >> sh2) & 1) << 4);
+                int w1 = (int) (v & 0x0F) + (((h >> sh1) & 1) << 4);
+                int w2 = (int) (v >> 4)   + (((h >> sh2) & 1) << 4);
                 acc1 += w1 * x1[l];
                 acc2 += w2 * x2[l];
             }
+#endif
 
             sum += xq->d[blk] *
                    ((float) acc1 * d * (float) s1 -
@@ -540,6 +544,25 @@ static const bk_backend backends[] = {
 
 static const bk_backend *cur = NULL;
 
+/* Is the portable i8 path itself compiled with SIMD?
+ *
+ * The backend table is a static priority list, which assumes a
+ * hand-written kernel always beats portable C. That stops being true
+ * the moment the compiler is allowed to vectorise: in a
+ * `make linux NATIVE=1` build on a modern x86, autovectorised i8
+ * measured 3.27 tok/s against the hand-written MMX kernel's 2.46 --
+ * so picking `mmx` first cost 33%.
+ *
+ * __SSE2__ / __AVX2__ are defined by the compiler only when it is
+ * actually allowed to emit those instructions, which is exactly the
+ * condition under which i8 gets vectorised. The default i486 build
+ * defines neither and is unaffected. (Finding 33.) */
+#if defined(__AVX2__) || defined(__SSE2__)
+#define I8_IS_VECTORISED 1
+#else
+#define I8_IS_VECTORISED 0
+#endif
+
 static void ensure_selected(void) {
     if (!cur) {
 #ifdef INFER_BACKEND
@@ -554,6 +577,18 @@ int bk_select(const char *name) {
     int i;
 
     if (!name || !name[0] || strcmp(name, "auto") == 0) {
+        /* When the compiler vectorised the portable path, prefer it
+         * over the hand-written 64-bit-SIMD kernels. See the comment
+         * on I8_IS_VECTORISED. */
+        if (I8_IS_VECTORISED) {
+            for (i = 0; i < N_BACKENDS; i++) {
+                if (strcmp(backends[i].name, "i8") == 0 &&
+                    backends[i].available()) {
+                    cur = &backends[i];
+                    return 0;
+                }
+            }
+        }
         /* first entry that this CPU supports; the table is ordered
          * fastest-first */
         for (i = 0; i < N_BACKENDS; i++) {
@@ -597,7 +632,7 @@ void bk_print_list(FILE *f) {
     }
 #if !defined(INFER_HAVE_MMX) && !defined(INFER_HAVE_VIS)
     fprintf(f, "\n  (this binary has no SIMD backend compiled in;\n"
-               "   rebuild with `make linux` (MMX) or `make solaris-vis`)\n");
+               "   it was built with NO_MMX=1 / NO_VIS=1)\n");
 #endif
 }
 

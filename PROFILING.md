@@ -25,9 +25,9 @@ instrumentation at all.
 ## Quick start (what I'd like you to run)
 
 ```sh
-make profile-geode                       # or profile-i486 / profile-windows
+make linux PROFILE=1
 
-./infer-geode-profile run model.gguf \
+./infer-<version>-linux-profile run model.gguf \
     -p "What is the capital of France?" \
     -n 10 -t 0 -c 512 \
     --log-perf --log-stages --log-file perf-geode.txt
@@ -38,18 +38,33 @@ Then send me `perf-geode.txt`. That is the whole thing.
 On Windows XP:
 
 ```
-infer-profile.exe run model.gguf -p "What is the capital of France?" -n 10 -t 0 -c 512 --log-perf --log-stages --log-file perf-xp.txt
+make windows PROFILE=1
+
+infer-<version>-windows-profile.exe run model.gguf -p "What is the capital of France?" -n 10 -t 0 -c 512 --log-perf --log-stages --log-file perf-xp.txt
+```
+
+On Solaris/SPARC:
+
+```sh
+gmake solaris PROFILE=1
+./infer-<version>-solaris-profile run model.gguf -p "..." -n 10 -t 0 -c 512 \
+    --log-perf --log-stages --log-file perf-sparc.txt
 ```
 
 Use `-t 0` (greedy) so the run is deterministic and comparable. `-n 10`
 is enough — at 30 s/token that is already a five-minute run, and the
 per-stage percentages stabilise after two or three tokens.
 
+**Run the versions you are comparing back to back, in one session.** A
+log taken hours apart on a different machine state is not comparable:
+one such pair showed `rms norms`, which no version had touched, running
+4.3x slower, which invalidated every absolute number in it.
+
 If you have the patience, a second run with `--backend i8` would let me
-see exactly what MMX is buying you on real silicon:
+see exactly what the SIMD kernels are buying on real silicon:
 
 ```sh
-./infer-geode-profile run model.gguf -p "..." -n 10 -t 0 -c 512 \
+./infer-<version>-linux-profile run model.gguf -p "..." -n 10 -t 0 -c 512 \
     --backend i8 --log-perf --log-stages --log-file perf-geode-i8.txt
 ```
 
@@ -57,16 +72,17 @@ see exactly what MMX is buying you on real silicon:
 
 ## Build targets
 
+There are three targets and `PROFILE=1`:
+
 ```sh
-make profile           # native
-make profile-i486      # 32-bit, 486-safe, no MMX
-make profile-geode     # 32-bit, MMX backend
-make profile-windows   # Win32 .exe, MMX backend  -> infer-profile.exe
+make linux PROFILE=1      # -> infer-<version>-linux-profile
+make windows PROFILE=1    # -> infer-<version>-windows-profile.exe
+make solaris PROFILE=1    # -> infer-<version>-solaris-profile
 ```
 
-These produce **separate binaries** (`infer-profile`,
-`infer-geode-profile`, ...). The existing `make`, `make geode` etc. are
-untouched and still build clean, uninstrumented binaries.
+`PROFILE=1` appends `-DINFER_PROFILE` and renames the binary, so a
+profiling build can never overwrite a normal one. Without it the timers
+are not compiled in at all — every `PROF_*` macro expands to nothing.
 
 ---
 

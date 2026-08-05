@@ -26,22 +26,31 @@ mistakes agents make here come from applying modern-toolchain habits.
 ## Build it
 
 ```sh
-make linux              # Linux/x86        -> infer-<version>-linux
-make linux-profile      # ...with profiler
-make windows            # Windows XP/x86   -> infer-<version>-windows.exe
-make windows-profile    # ...with profiler
-make all                # all four
-make help               # the list
+make linux              # Linux/x86     -> infer-<version>-linux
+make windows            # Windows/x86   -> infer-<version>-windows.exe
+make solaris            # Solaris/SPARC -> infer-<version>-solaris
+make all                # all six shipping artifacts
+make help               # targets and flags
 make test               # unit tests into build/
 ```
 
-There are **only four x86 targets**. Every one contains all three
-compute backends (`mmx`, `i8`, `ref`) and picks the fastest at run time.
-Every one uses an i486 baseline. Do not add "an MMX build" or "a 486
-build" — one binary already covers both.
+**There are exactly three build targets.** Everything else is a flag:
 
-Solaris/SPARC is separate: `make solaris`, `make solaris-gcc`. Different
-compiler, different flags, big-endian, 64-bit.
+| flag | effect |
+|---|---|
+| `PROFILE=1` | per-stage timers, binary named `...-profile` |
+| `NATIVE=1` | `-march=native`; runs only on the build machine |
+| `BITS=64` | 64-bit Linux, named `...-linux64` (default 32) |
+| `TOOLCHAIN=gcc` | Solaris via GCC instead of Sun Studio |
+| `NO_MMX=1` `NO_VIS=1` | leave a kernel out |
+| `NO_SSE2=1` `NO_AVX2=1` | reserved for the dedicated SSE2/AVX2 kernels (not yet written) |
+
+Every binary contains **every kernel it could use** and picks one at run
+time after a CPUID / feature probe: `mmx`, `i8`, `ref` on x86; `vis`, `i8`, `ref` on SPARC. The x86 builds use an i486
+baseline, so one binary runs on a 486 and accelerates on anything newer.
+
+**Do not add targets.** No "MMX build", no "486 build", no
+"`-profile` target". If you think you need one, it is a flag.
 
 ### First, in a fresh sandbox
 
@@ -166,8 +175,8 @@ a GitHub Release using the binaries that build already verified.
 
 ```sh
 # bump BOTH, they must agree
-#   src/infer.h   #define INFER_VERSION "1.12.2"
-#   Makefile      VERSION = 1.12.2
+#   src/infer.h   #define INFER_VERSION "X.Y.Z"
+#   Makefile      VERSION = X.Y.Z
 make checkversion
 
 git commit -am "1.12.2"     # commit BEFORE tagging: git archive packages the commit

@@ -1,9 +1,9 @@
 # `src/backend_mmx.c` — MMX kernels
 
 **~850 lines.** The only file in the project using inline assembly, and
-the only one that is not strictly conforming ANSI C. Compiled solely for
-`make geode` / `make windows-mmx` (`-DINFER_HAVE_MMX`), and selected at
-run time only when CPUID reports MMX.
+the only one that is not strictly conforming ANSI C. Compiled into every
+x86 build (`-DINFER_HAVE_MMX`, omit with `make linux NO_MMX=1`), and
+selected at run time only when CPUID reports MMX.
 
 ## The alignment bug — read this before touching the constants
 

@@ -111,24 +111,57 @@ $ infer run model.gguf --port 9090
 
 ## Build targets
 
+Three targets. Everything else is a flag.
+
 ```sh
-make linux              # Linux/x86        -> infer-1.14.0-linux
-make linux-profile      # ...with profiler -> infer-1.14.0-linux-profile
-make windows            # Windows XP/x86   -> infer-1.14.0-windows.exe
-make windows-profile    # ...with profiler -> infer-1.14.0-windows-profile.exe
-make all                # all four
+make linux              # Linux/x86    -> infer-<version>-linux
+make windows            # Windows/x86  -> infer-<version>-windows.exe
+make solaris            # Solaris/SPARC-> infer-<version>-solaris
+make all                # all six shipping artifacts
 
-make solaris            # Solaris/SPARC, Sun Studio, 64-bit
-make solaris-gcc        # Solaris/SPARC, GCC, 64-bit
-
-make test               # eight test programs
+make test               # the test suite
 ```
 
-**All four x86 builds contain all three backends** — `mmx`, `i8`, `ref` —
-and select the fastest the CPU supports at run time. All four use an
-**i486 baseline**, so one binary runs on a 486 and accelerates on
-anything with MMX. The only choice is whether you want the profiler
-(~2% slower, prints nothing unless asked).
+**Every accelerated kernel is compiled in and chosen at run time** after
+a CPUID / feature probe. The x86 binaries carry `mmx`, `i8` and `ref`; the Solaris binary
+carries `vis`, `i8` and `ref`. One
+binary per platform: `make linux` runs on a 486 and accelerates on
+anything newer.
+
+Runtime selection costs one indirect call per matrix *row* — measured at
+the noise floor on both x86-64 and an i486-targeted build.
+
+### Flags
+
+| flag | effect |
+|---|---|
+| `PROFILE=1` | per-stage timers; names the binary `...-profile` |
+| `NATIVE=1` | `-march=native`; **only runs on the build machine** |
+| `BITS=64` | 64-bit Linux build, named `...-linux64` (default 32-bit) |
+| `TOOLCHAIN=gcc` | build Solaris with GCC instead of Sun Studio |
+| `NO_MMX=1` `NO_VIS=1` | leave a kernel out |
+| `NO_SSE2=1` `NO_AVX2=1` | reserved for the dedicated SSE2/AVX2 kernels (not yet written) |
+
+```sh
+make linux PROFILE=1            # timers
+make linux BITS=64 NATIVE=1     # fastest on this machine only
+make solaris TOOLCHAIN=gcc      # GCC instead of Sun Studio
+```
+
+`make all` builds the six shipping artifacts — 32-bit and 64-bit Linux
+and 32-bit Windows, each with and without timers. `NATIVE=1` is
+excluded on purpose: it only runs on the machine that built it.
+
+Which backend each one picks is decided at run time:
+
+| artifact | picks | why |
+|---|---|---|
+| `-linux`, `-windows.exe` | `mmx` | i486 baseline, no SSE2 available |
+| `-linux64` | `i8` | x86-64 implies SSE2, so the compiler vectorises `i8` past the hand-written MMX kernel |
+
+The profiler stays a **compile-time** choice: its timers sit inside the
+per-layer path, so a runtime test would tax every build, including the
+slow machines this project exists for.
 
 Solaris/SPARC is deliberately separate: different compiler, different
 flags, big-endian, 64-bit.
