@@ -1300,6 +1300,68 @@ no check, because it fails at the moment you most want a release.
 The tag itself was fine — rebuilding v1.16.1 locally with `universe`
 available produces all six artifacts and passes every assertion.
 
+## 40. Two CI faults: a Recommends, and a second workflow
+
+### The SPARC step failed because a dependency is only *recommended*
+
+`gcc-sparc64-linux-gnu` does not depend on `libc6-dev-sparc64-cross`;
+it only **Recommends** it. Without that package there is no `libc.a`,
+so `-static` quietly produces a dynamic binary and qemu then fails at
+load time, not at compile time:
+
+```
+qemu-sparc64-static: Could not open '/lib64/ld-linux.so.2'
+```
+
+The step compiled fine and died running the first test, which made it
+look like a kernel bug rather than a missing package.
+
+Fixed by installing the cross libc explicitly and, more usefully, by
+**proving the toolchain works before trusting it**: build and run a
+static `int main(void){return 0;}` and only then set `have=yes`. A
+capability check beats an installation check, because it fails for the
+right reason and in one place.
+
+The test loop also swallowed which test failed. `for t in ...; do
+qemu $t; done` returns the status of the last iteration only; it now
+reports the failing test by name and exits.
+
+### The release was published by a workflow nobody was looking at
+
+`build.yml` gates its release job correctly:
+
+```yaml
+release:
+  needs: build
+  if: github.ref_type == 'tag'
+```
+
+`needs:` alone is sufficient — a failed `build` skips `release`, and
+the v1.17.0 run confirms it: build failed, release ran 0s, no release
+was created.
+
+But at v1.15.1 the repository still contained a **second** workflow,
+`release.yml`, left over from before the two were merged:
+
+```yaml
+on:
+  push:
+    tags: ['v*']
+jobs:
+  release:          # needs: (none)   if: (none)
+```
+
+Same trigger, no dependency on anything. It rebuilt from scratch and
+published regardless of whether `build.yml` had passed — which is why
+a release appeared for a tag whose checks were red, and why the
+published binaries were not the ones CI verified.
+
+It was deleted in 1.16.0, so this is already fixed on `main`; the
+symptom was visible on older tags.
+
+**The rule:** one publisher. Two workflows on the same trigger is not
+redundancy, it is a race in which the careless one usually wins.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.17.1 — CI fixes for the SPARC step and the stray publisher
+
+Everything in 1.17.0, plus the two CI faults that run #24 exposed.
+
+**IF YOU UPDATE BY COPYING THIS TREE OVER YOUR CHECKOUT, DELETE THIS
+FILE BY HAND:**
+
+```sh
+git rm .github/workflows/release.yml
+```
+
+Copying files over a checkout cannot remove anything. That workflow is
+the second publisher described below, and it will keep publishing
+unverified releases until it is gone.
+
+### The SPARC step failed on a missing package, not a bug
+
+`gcc-sparc64-linux-gnu` only *Recommends* `libc6-dev-sparc64-cross`, so
+`libc.a` may be absent. `-static` then produces a dynamic binary and
+qemu dies at load time:
+
+```
+qemu-sparc64-static: Could not open '/lib64/ld-linux.so.2'
+```
+
+The cross libc is now installed explicitly, and the step **proves the
+toolchain can build and run a static sparc64 binary** before enabling
+the SPARC checks — a capability test rather than an installation test.
+The qemu loop also reports which test failed; `for t in ...; do qemu
+$t; done` had been returning only the last iteration's status.
+
+### A release could be published for a failed build
+
+`build.yml` gates this correctly and always has:
+
+```yaml
+release:
+  needs: build
+  if: github.ref_type == 'tag'
+```
+
+Run #24 confirms it — build failed, release ran 0s, nothing published.
+
+The culprit was `.github/workflows/release.yml`: a second workflow on
+the same `v*` tag trigger with **no `needs:` and no `if:`**, left over
+from before the two were merged. It rebuilt from scratch and published
+regardless. That is how v1.15.1 got a release from a red build, and it
+means the binaries on releases up to that tag are not the ones CI
+verified.
+
+Deleted in 1.16.0 — but only in this tree. See the note at the top.
+
 ## 1.17.0 — per-format kernel selection, and a benchmark that runs on your machine
 
 `--backend` picks one kernel for every weight format. That is a good
@@ -79,6 +131,25 @@ isolation" — the question that previously needed a rebuild. Confirm
 with `--log-perf` on the real model before trusting the combination.
 This is also why it is opt-in and not run at startup: automatic
 selection would have made this host slower. See finding 38.
+
+### CI fix: the SPARC step, and a stray publisher
+
+**SPARC tests failed under qemu.** `gcc-sparc64-linux-gnu` only
+*Recommends* `libc6-dev-sparc64-cross`, so `libc.a` may be absent;
+`-static` then yields a dynamic binary and qemu dies with `Could not
+open '/lib64/ld-linux.so.2'`. The cross libc is now installed
+explicitly, and the step proves it can build **and run** a static
+sparc64 binary before enabling the SPARC checks. The test loop also
+reports which test failed instead of returning only the last one's
+status.
+
+**A release could be published for a failed build.** `build.yml` gates
+this correctly (`needs: build`), and the v1.17.0 run proves it — build
+failed, release ran 0s, nothing published. The culprit was
+`.github/workflows/release.yml`, a second workflow on the same `v*`
+tag trigger with no `needs:` at all, which rebuilt and published
+independently. It was deleted in 1.16.0; older tags show the symptom.
+See finding 40.
 
 ### CI fix: v1.16.1 could not build
 

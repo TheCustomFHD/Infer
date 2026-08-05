@@ -231,13 +231,27 @@ jobs:
       # under qemu. It catches endianness and VIS breakage, which is
       # what has actually gone wrong on that target historically.
       # -------------------------------------------------------------
+      # libc6-dev-sparc64-cross is only a *Recommends* of the compiler,
+      # so it is not guaranteed to come along. Without it there is no
+      # libc.a, -static silently produces a dynamic binary, and
+      # qemu-sparc64 then dies with "Could not open /lib64/ld-linux.so.2".
+      # Install it explicitly and prove a static hello-world runs before
+      # claiming the SPARC steps are usable.
       - name: install the SPARC cross-compiler
         id: sparc
         run: |
-          if sudo apt-get install -y gcc-sparc64-linux-gnu; then
+          if ! sudo apt-get install -y gcc-sparc64-linux-gnu \
+                                       libc6-dev-sparc64-cross; then
+            echo "::warning::SPARC cross-toolchain unavailable; skipping SPARC checks"
+            echo "have=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'int main(void){return 0;}\n' > /tmp/hello.c
+          if sparc64-linux-gnu-gcc -static -o /tmp/hello /tmp/hello.c 2>/dev/null \
+             && qemu-sparc64-static /tmp/hello; then
             echo "have=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::gcc-sparc64-linux-gnu unavailable; skipping SPARC checks"
+            echo "::warning::cannot build/run a static sparc64 binary; skipping SPARC checks"
             echo "have=no" >> "$GITHUB_OUTPUT"
           fi
 
@@ -259,7 +273,10 @@ jobs:
                GNUCC="sparc64-linux-gnu-gcc -static" SOLLIBS=-lm
           for t in t_vis t_viskern t_vissat t_endian; do
             echo "== $t =="
-            qemu-sparc64-static build/$t
+            if ! qemu-sparc64-static build/$t; then
+              echo "::error::SPARC test $t failed under qemu"
+              exit 1
+            fi
           done
           make clean >/dev/null
 
