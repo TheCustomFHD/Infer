@@ -102,4 +102,48 @@ typedef struct {
 const bk_qx *bk_quantize_x(const float *x, long n);
 void         bk_free_scratch(void);
 
+/* ------------------------------------------------------------------ */
+/* Per-format kernel selection                                         */
+/*                                                                     */
+/* `--backend` chooses one kernel for every weight format. That is the */
+/* right default, but it is not always the fastest arrangement: the    */
+/* formats have different shapes and a kernel that wins on one can     */
+/* lose on another. Q6_K on UltraSPARC is the worked example -- the    */
+/* VIS kernel cuts instructions 3.1x and measured 0.8% (finding 30).   */
+/*                                                                     */
+/* All kernels are bit-identical to each other on every format, so     */
+/* mixing them is a pure performance choice with no numerical effect.  */
+/* Asserted by tests/t_ident.c.                                        */
+/*                                                                     */
+/*   --kernel q4k=mmx        pin one format                            */
+/*   --kernel bench          measure on THIS machine and use the       */
+/*                           winner for each format                    */
+/*   --kernel list           show the current assignment               */
+/* ------------------------------------------------------------------ */
+
+/* Formats worth distinguishing. Anything else falls back to whatever
+ * --backend selected. */
+enum {
+    BK_F_Q4_K = 0,
+    BK_F_Q5_K,
+    BK_F_Q6_K,
+    BK_F_Q8_0,
+    BK_F_NFORMATS
+};
+
+/* Pin one format to one backend. Returns 0, -1 on an unknown format or
+ * backend name, -2 if the backend exists but this CPU cannot run it. */
+int  bk_kernel_set(const char *format, const char *backend);
+
+/* Parse a --kernel argument: "q4k=mmx", "bench", "list", or "auto". */
+int  bk_kernel_arg(const char *arg);
+
+/* Time every available kernel on every format and pin the winners.
+ * Uses synthetic blocks, so it needs no model and touches no weights.
+ * Prints a table when verbose. */
+void bk_kernel_bench(int verbose);
+
+/* Print the current per-format assignment. */
+void bk_kernel_list(FILE *f);
+
 #endif /* INFER_BACKEND_H */

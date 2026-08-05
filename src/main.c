@@ -284,12 +284,36 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* --kernel runs AFTER --backend, so an explicit backend is the
+     * baseline a benchmark or a pin refines. `bench` measures on this
+     * machine; everything else is a fixed choice. */
+    if (o.kernel) {
+        int rck = bk_kernel_arg(o.kernel);
+        if (rck == 1) return 0;              /* `list` printed and done */
+        if (rck == -1) {
+            inf_log("bad --kernel '%s'; expected q4k|q5k|q6k|q8_0=<backend>, "
+                    "or `bench`, `list`, `auto`", o.kernel);
+            return 1;
+        }
+        if (rck == -2) {
+            inf_log("--kernel '%s': that backend is not supported by this CPU "
+                    "(try --backend list)", o.kernel);
+            return 1;
+        }
+        /* `infer --kernel ...` with no model is a query about this
+         * machine; show the result and stop. */
+        if (!o.model_path) {
+            bk_kernel_list(stdout);
+            return 0;
+        }
+    }
+
     /* Report an unusable --log-stages before doing any work: loading a
      * 500 MB model only to say "that flag does nothing" wastes the
      * user's time, and if the path is wrong they never see it at all. */
     if (o.log_stages && !PROF_ENABLED) {
         inf_log("--log-stages needs a build with -DINFER_PROFILE "
-                "(make linux-profile / windows-profile / solaris-profile); "
+                "(make <target> PROFILE=1); "
                 "this build has no stage timers compiled in");
         o.log_stages = 0;
     }

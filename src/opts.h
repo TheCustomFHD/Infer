@@ -59,6 +59,7 @@ typedef struct {
 
     /* diagnostics */
     const char *backend;
+    const char *kernel;
     const char *log_file;
     int         log_perf;
     int         log_stages;      /* --log-stages, needs a profile build */

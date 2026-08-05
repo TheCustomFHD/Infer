@@ -131,6 +131,20 @@ anything newer.
 Runtime selection costs one indirect call per matrix *row* — measured at
 the noise floor on both x86-64 and an i486-targeted build.
 
+### Per-format kernels
+
+`--backend` sets one kernel for everything. If a different kernel wins
+on a particular weight format on your hardware, measure it and pin it:
+
+```sh
+infer --kernel bench -v     # time every kernel here, use the winners
+infer --kernel list         # show the current assignment
+infer --kernel q6k=i8       # pin one format
+```
+
+`bench` needs no model and takes a second or two. All kernels are
+bit-identical on every format, so this is purely a speed choice.
+
 ### Flags
 
 | flag | effect |

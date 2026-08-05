@@ -1191,6 +1191,115 @@ of development and attributes it to instruction sets.
   different costume produced the 1.15.1 "regression" (finding 30) --
   two runs, fifteen hours apart, treated as comparable.
 
+## 38. A per-format benchmark, and the limits of a synthetic one
+
+`--kernel bench` times every available kernel on every weight format
+using synthetic super-blocks, then pins the winner per format. It needs
+no model, scales its repeat count to the host (~40 ms per measurement,
+so a 440 MHz Ultra and a modern x86 spend similar wall time), and takes
+a second or two.
+
+The dispatch cost is nothing. One table lookup per matrix row-block --
+about 113,000 weights of work -- measured against a build with the
+table compiled out, interleaved, six samples each:
+
+```
+  table=2.210  bypass=2.384
+  table=2.407  bypass=2.393
+  table=2.373  bypass=2.410
+  table=2.450  bypass=2.415
+  table=2.382  bypass=2.248
+  table=2.423  bypass=2.350
+```
+
+Fully overlapping; the table wins three of six.
+
+**The interesting part is where it disagrees with reality.** On the
+64-bit build the benchmark produced a genuinely mixed assignment that
+no single `--backend` could express:
+
+```
+  q4k   i8      q5k   mmx      q6k   i8      q8_0  i8
+```
+
+End to end, that mix measured **3.316 tok/s against 3.334** for plain
+`auto`. Slightly *worse*, not better.
+
+The synthetic benchmark runs one format at a time, on freshly written
+buffers, with the activation vector hot. Real inference interleaves
+formats across 24 layers, streams ~344 MB of weights per forward pass,
+and evicts constantly. A kernel that wins in isolation can lose in
+that traffic -- the same reason the isolated i8 nibble LUT measured
+2.46x and delivered 0.97x (finding 28), and the reason instruction
+counts have pointed the wrong way four times in this project.
+
+So `bench` is **a measurement tool, not an optimiser**. It answers "which
+kernel is faster on this machine for this format, in isolation", which
+is exactly the question that could not be answered before without
+rebuilding. It does not promise that the winning combination is faster
+end to end, and on the one host tested it was not. Pin what it finds
+only after confirming with `--log-perf` on the real model.
+
+That is also why it stays opt-in rather than running at startup: an
+automatic version would have silently made this machine slower.
+
+## 39. `universe` is not enabled on GitHub's runners
+
+The v1.16.1 tag failed CI in 15 seconds, at step 3, exit code 100 —
+before a single line was compiled. The step was the toolchain install,
+and the cause was one package added for the new SPARC checks:
+
+```
+sudo apt-get install -y ... gcc-sparc64-linux-gnu ...
+```
+
+`gcc-sparc64-linux-gnu` exists in Ubuntu 24.04, but in **universe**,
+which `ubuntu-latest` does not enable by default. `apt-get` exits 100
+for the whole command, so every package in the list fails together and
+the build never starts.
+
+Two things worth noting:
+
+- **`qemu-user-static` and `gcc-mingw-w64-i686-win32` are also in
+  universe.** They had been installing fine only because the runner
+  image happens to pre-install mingw and its dependencies. That is an
+  accident of the image, not a guarantee, and the same failure was one
+  image refresh away.
+- The pre-existing s390x step installs its toolchain **inline, where it
+  is used**, which is why it never hit this. New cross-toolchains
+  should follow that pattern.
+
+Fixed by enabling the repository once, up front:
+
+```yaml
+sudo add-apt-repository -y universe
+sudo apt-get update
+```
+
+and by making the SPARC toolchain install non-fatal:
+
+```yaml
+- name: install the SPARC cross-compiler
+  id: sparc
+  run: |
+    if sudo apt-get install -y gcc-sparc64-linux-gnu; then
+      echo "have=yes" >> "$GITHUB_OUTPUT"
+    else
+      echo "::warning::gcc-sparc64-linux-gnu unavailable; skipping SPARC checks"
+      echo "have=no" >> "$GITHUB_OUTPUT"
+    fi
+```
+
+with the three SPARC steps gated on `steps.sparc.outputs.have == 'yes'`.
+
+**The rule:** a cross-target check is a bonus, not a gate. If its
+toolchain disappears from the archive, the x86 release must still
+build. An optional check that can fail the whole pipeline is worse than
+no check, because it fails at the moment you most want a release.
+
+The tag itself was fine — rebuilding v1.16.1 locally with `universe`
+available produces all six artifacts and passes every assertion.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

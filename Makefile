@@ -97,7 +97,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.16.1
+VERSION = 1.17.0
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -489,11 +489,16 @@ vis-shim-test: tests/t_viskern.c $(VISSRC)
 		$(STEST_DEPS) -lm
 	@echo "run: ./$(BUILD)/t_viskern_sun   then   ./$(BUILD)/t_viskern_gcc"
 
-i8-split-test: tests/t_i8split.c tests/t_q5split.c
+i8-split-test: tests/t_i8split.c tests/t_q5split.c tests/t_ident.c
 	@mkdir -p $(BUILD)
 	$(CC) -std=gnu89 -Wall -Wextra -O2 -o $(BUILD)/t_i8split tests/t_i8split.c
 	$(CC) -std=gnu89 -Wall -Wextra -O2 -o $(BUILD)/t_q5split tests/t_q5split.c
-	@echo "run: ./$(BUILD)/t_i8split   then   ./$(BUILD)/t_q5split"
+	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) -I$(SRCDIR) \
+		-o $(BUILD)/t_ident tests/t_ident.c \
+		$(SRCDIR)/backend.c $(USE_MMXSRC) $(SRCDIR)/quant.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/gguf.c \
+		$(SRCDIR)/sys_posix.c $(LDLIBS)
+	@echo "run: ./$(BUILD)/t_i8split  ./$(BUILD)/t_q5split  ./$(BUILD)/t_ident"
 
 # =====================================================================
 #  Tests

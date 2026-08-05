@@ -29,6 +29,7 @@
 #include "infer.h"
 #include "backend.h"
 #include "prof.h"
+#include "sys.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -636,6 +637,226 @@ void bk_print_list(FILE *f) {
 #endif
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Per-format kernel selection                                         */
+/*                                                                     */
+/* An override table, empty by default. When a slot is NULL the format */
+/* uses whatever --backend chose, so the default behaviour and the     */
+/* default cost are both exactly what they were.                       */
+/* ------------------------------------------------------------------ */
+
+static const bk_backend *fmt_kernel[BK_F_NFORMATS];
+
+static const struct { const char *name; int slot; int type; } fmt_names[] = {
+    { "q4k",  BK_F_Q4_K, GGML_TYPE_Q4_K },
+    { "q5k",  BK_F_Q5_K, GGML_TYPE_Q5_K },
+    { "q6k",  BK_F_Q6_K, GGML_TYPE_Q6_K },
+    { "q8_0", BK_F_Q8_0, GGML_TYPE_Q8_0 }
+};
+#define N_FMT_NAMES ((int) (sizeof(fmt_names) / sizeof(fmt_names[0])))
+
+static int fmt_slot_of_type(int type) {
+    int i;
+    for (i = 0; i < N_FMT_NAMES; i++) {
+        if (fmt_names[i].type == type) return fmt_names[i].slot;
+    }
+    return -1;
+}
+
+int bk_kernel_set(const char *format, const char *backend) {
+    int i, j;
+    if (!format || !backend) return -1;
+    for (i = 0; i < N_FMT_NAMES; i++) {
+        if (strcmp(fmt_names[i].name, format) != 0) continue;
+        if (strcmp(backend, "auto") == 0) {
+            fmt_kernel[fmt_names[i].slot] = NULL;   /* follow --backend */
+            return 0;
+        }
+        for (j = 0; j < N_BACKENDS; j++) {
+            if (strcmp(backends[j].name, backend) != 0) continue;
+            if (!backends[j].available()) return -2;
+            fmt_kernel[fmt_names[i].slot] = &backends[j];
+            return 0;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+void bk_kernel_list(FILE *f) {
+    int i;
+    ensure_selected();
+    fprintf(f, "per-format kernels (--backend %s is the default):\n",
+            cur->name);
+    for (i = 0; i < N_FMT_NAMES; i++) {
+        const bk_backend *k = fmt_kernel[fmt_names[i].slot];
+        fprintf(f, "  %-5s %-5s %s\n", fmt_names[i].name,
+                k ? k->name : cur->name,
+                k ? "(pinned)" : "(follows --backend)");
+    }
+}
+
+/* ---- the benchmark ----
+ *
+ * Synthetic super-blocks, not model weights: this has to run before a
+ * model is open, and it must not depend on one being present. The
+ * quantised values are arbitrary -- every kernel does the same amount
+ * of work regardless of what the bits say -- but the fp16 scales are
+ * kept in a sane range so nothing denormalises.                        */
+
+static long bench_rowbytes(int type, long ncols) {
+    long nb = ncols / QK_K;
+    switch (type) {
+        case GGML_TYPE_Q4_K: return nb * 144;
+        case GGML_TYPE_Q5_K: return nb * 176;
+        case GGML_TYPE_Q6_K: return nb * 210;
+        case GGML_TYPE_Q8_0: return (ncols / 32) * 34;
+        default:             return 0;
+    }
+}
+
+static unsigned long bench_rs = 20260805UL;
+static unsigned int bench_rnd(void) {
+    bench_rs = bench_rs * 1103515245UL + 12345UL;
+    return (unsigned int) ((bench_rs >> 16) & 0xFFFFU);
+}
+
+void bk_kernel_bench(int verbose) {
+    /* One 3584-column row is 14 super-blocks -- the widest row in the
+     * 0.8B model, so the cache behaviour resembles the real thing. */
+    const long ncols = 3584;
+    const int  nrows = 4;
+    unsigned char *w;
+    float *x, *y;
+    long bytes, i;
+    int fi, bi, r, reps;
+
+    ensure_selected();
+
+    x = (float *) malloc((size_t) ncols * sizeof(float));
+    y = (float *) malloc((size_t) nrows * sizeof(float));
+    if (!x || !y) { free(x); free(y); return; }
+    for (i = 0; i < ncols; i++) {
+        x[i] = ((float) (int) (bench_rnd() & 0x1FF) - 256.0f) / 128.0f;
+    }
+
+    if (verbose) {
+        inf_log("measuring kernels on this machine "
+                "(%ld columns x %d rows)...", ncols, nrows);
+    }
+
+    for (fi = 0; fi < N_FMT_NAMES; fi++) {
+        int type = fmt_names[fi].type;
+        const bk_backend *best = NULL;
+        double best_t = 0.0;
+
+        bytes = bench_rowbytes(type, ncols);
+        if (bytes <= 0) continue;
+        w = (unsigned char *) malloc((size_t) (bytes * nrows));
+        if (!w) break;
+        for (i = 0; i < bytes * nrows; i++) {
+            w[i] = (unsigned char) (bench_rnd() & 0xFF);
+        }
+        /* fp16 scales: exponent field kept small and positive */
+        for (r = 0; r < nrows; r++) {
+            long nb, k;
+            nb = (type == GGML_TYPE_Q8_0) ? ncols / 32 : ncols / QK_K;
+            for (k = 0; k < nb; k++) {
+                long o = r * bytes + k *
+                    (type == GGML_TYPE_Q4_K ? 144 :
+                     type == GGML_TYPE_Q5_K ? 176 :
+                     type == GGML_TYPE_Q6_K ? 210 : 34);
+                if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+                    w[o] = (unsigned char) (bench_rnd() & 0xFF); w[o + 1] = 0x2C;
+                    w[o + 2] = (unsigned char) (bench_rnd() & 0xFF); w[o + 3] = 0x2B;
+                } else if (type == GGML_TYPE_Q6_K) {
+                    w[o + 208] = (unsigned char) (bench_rnd() & 0xFF);
+                    w[o + 209] = 0x2C;
+                } else {
+                    w[o] = (unsigned char) (bench_rnd() & 0xFF); w[o + 1] = 0x2C;
+                }
+            }
+        }
+
+        for (bi = 0; bi < N_BACKENDS; bi++) {
+            double t0, t1, dt, bestrun = 0.0;
+            int pass;
+            if (!backends[bi].available()) continue;
+            /* `ref` is the correctness reference, never the fast path;
+             * benchmarking it wastes seconds on a slow machine. */
+            if (strcmp(backends[bi].name, "ref") == 0) continue;
+
+            backends[bi].matvec(type, w, x, y, ncols, nrows);  /* warm */
+
+            /* Scale the repeat count to the machine: one timed pass
+             * first, then enough passes to cover ~40 ms. A 440 MHz
+             * Ultra and a modern x86 both end up spending about the
+             * same wall time here. */
+            t0 = sys_time_sec();
+            backends[bi].matvec(type, w, x, y, ncols, nrows);
+            t1 = sys_time_sec();
+            dt = t1 - t0;
+            reps = (dt > 0.0) ? (int) (0.040 / dt) : 20;
+            if (reps < 1) reps = 1;
+            if (reps > 200) reps = 200;
+
+            for (pass = 0; pass < 3; pass++) {
+                int k;
+                t0 = sys_time_sec();
+                for (k = 0; k < reps; k++) {
+                    backends[bi].matvec(type, w, x, y, ncols, nrows);
+                }
+                t1 = sys_time_sec();
+                dt = (t1 - t0) / (double) reps;
+                if (pass == 0 || dt < bestrun) bestrun = dt;
+            }
+
+            if (verbose) {
+                inf_log("  %-5s %-5s %8.3f ms/row-block",
+                        fmt_names[fi].name, backends[bi].name,
+                        bestrun * 1000.0);
+            }
+            if (!best || bestrun < best_t) { best = &backends[bi]; best_t = bestrun; }
+        }
+
+        if (best) {
+            fmt_kernel[fmt_names[fi].slot] = best;
+            if (verbose) {
+                inf_log("  %-5s -> %s", fmt_names[fi].name, best->name);
+            }
+        }
+        free(w);
+    }
+
+    free(x);
+    free(y);
+}
+
+int bk_kernel_arg(const char *arg) {
+    char buf[64];
+    char *eq;
+    size_t n;
+
+    if (!arg || !arg[0]) return -1;
+
+    if (strcmp(arg, "bench") == 0) { bk_kernel_bench(inf_verbose); return 0; }
+    if (strcmp(arg, "list")  == 0) { bk_kernel_list(stdout); return 1; }
+    if (strcmp(arg, "auto")  == 0) {
+        int i;
+        for (i = 0; i < BK_F_NFORMATS; i++) fmt_kernel[i] = NULL;
+        return 0;
+    }
+
+    n = strlen(arg);
+    if (n >= sizeof(buf)) return -1;
+    memcpy(buf, arg, n + 1);
+    eq = strchr(buf, '=');
+    if (!eq) return -1;
+    *eq = '\0';
+    return bk_kernel_set(buf, eq + 1);
+}
+
 /* ------------------------------------------------------------------ */
 /* Public dispatcher used by the engine                                */
 /* ------------------------------------------------------------------ */
@@ -646,7 +867,14 @@ void q_matvec(int type, const unsigned char *w, const float *x,
     ensure_selected();
 
     PROF_START(pt);
-    cur->matvec(type, w, x, y, ncols, nrows);
+    {
+        /* One predictable branch per matrix row-block, against a table
+         * that is empty unless someone asked for an override. */
+        int slot_ = fmt_slot_of_type(type);
+        const bk_backend *k_ = (slot_ >= 0) ? fmt_kernel[slot_] : NULL;
+        if (k_) k_->matvec(type, w, x, y, ncols, nrows);
+        else    cur->matvec(type, w, x, y, ncols, nrows);
+    }
 
 #ifdef INFER_PROFILE
     {

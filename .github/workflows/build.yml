@@ -62,13 +62,16 @@ jobs:
 
       - name: install toolchains
         run: |
+          # `universe` is not enabled by default on the runners, and
+          # gcc-sparc64-linux-gnu lives there. Without this the whole
+          # step exits 100 before anything is built.
+          sudo add-apt-repository -y universe
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
             gcc-multilib \
             gcc-mingw-w64-i686-win32 \
             binutils-mingw-w64-i686 \
-            gcc-sparc64-linux-gnu \
             qemu-user-static
 
       # Everything below refers to $LINUX / $WIN instead of a literal
@@ -228,7 +231,18 @@ jobs:
       # under qemu. It catches endianness and VIS breakage, which is
       # what has actually gone wrong on that target historically.
       # -------------------------------------------------------------
+      - name: install the SPARC cross-compiler
+        id: sparc
+        run: |
+          if sudo apt-get install -y gcc-sparc64-linux-gnu; then
+            echo "have=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::gcc-sparc64-linux-gnu unavailable; skipping SPARC checks"
+            echo "have=no" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: SPARC cross-build (big-endian, VIS in and out)
+        if: steps.sparc.outputs.have == 'yes'
         run: |
           for f in "" "NO_VIS=1" "PROFILE=1"; do
             echo "== solaris $f =="
@@ -239,6 +253,7 @@ jobs:
           make clean >/dev/null
 
       - name: SPARC kernels are bit-exact under qemu
+        if: steps.sparc.outputs.have == 'yes'
         run: |
           make solaris-test TOOLCHAIN=gcc \
                GNUCC="sparc64-linux-gnu-gcc -static" SOLLIBS=-lm
@@ -249,6 +264,7 @@ jobs:
           make clean >/dev/null
 
       - name: SPARC binary runs without VIS on a CPU that lacks it
+        if: steps.sparc.outputs.have == 'yes'
         run: |
           # A no-VIS build must still select a working backend rather
           # than falling over -- that is the "gated" half of generic.
@@ -258,9 +274,19 @@ jobs:
               --backend list
           make clean >/dev/null
 
+      - name: --kernel selection works and stays exact
+        run: |
+          ./"$LINUX" --kernel list
+          ./"$LINUX" --kernel bench -v
+          ./"$LINUX" --kernel q6k=i8 | grep -q 'q6k'
+          # bad input must be reported, never silently accepted
+          ! ./"$LINUX" --kernel nope=i8 2>&1 | grep -q 'bad --kernel' && exit 1
+          ! ./"$LINUX" --kernel q4k=nosuch >/dev/null 2>&1 || exit 1
+
       - name: host-side kernel exactness (no model needed)
         run: |
-          make i8-split-test && ./build/t_i8split
+          make i8-split-test && ./build/t_i8split && ./build/t_q5split \
+            && ./build/t_ident
           make vis-shim-test && ./build/t_viskern_sun && ./build/t_viskern_gcc
           make clean >/dev/null
           make all

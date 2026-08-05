@@ -1,5 +1,108 @@
 # Changelog
 
+## 1.17.0 — per-format kernel selection, and a benchmark that runs on your machine
+
+`--backend` picks one kernel for every weight format. That is a good
+default and a poor assumption: the formats have different shapes, and a
+kernel that wins on one can lose on another. Q6_K on UltraSPARC is the
+worked example — its VIS kernel cuts instructions 3.1x and measured
+**0.8%** (finding 30), so it ships off, based on measurements from one
+machine.
+
+Now the machine can decide for itself:
+
+```sh
+infer --kernel bench -v        # measure here, pin the winners
+infer --kernel list            # show the current assignment
+infer --kernel q6k=i8          # pin one format by hand
+infer --kernel auto            # back to following --backend
+```
+
+`bench` needs **no model** — it builds synthetic super-blocks, so it
+works before you have downloaded anything, and it never touches real
+weights. It scales its repeat count to the host, targeting ~40 ms per
+measurement, so a 440 MHz Ultra 10 and a modern x86 spend about the
+same wall time. Three timed passes per kernel, best taken.
+
+```
+$ infer --kernel bench -v
+measuring kernels on this machine (3584 columns x 4 rows)...
+  q4k   mmx      0.029 ms/row-block
+  q4k   i8       0.032 ms/row-block
+  q4k   -> mmx
+  ...
+```
+
+### Why this is safe
+
+Mixing kernels per format is only legitimate if the kernels agree
+numerically. They do, on every format, bit for bit — `tests/t_ident.c`
+compares with `memcmp`, not a tolerance, and CI runs it. If that ever
+fails, `--kernel` becomes a correctness hazard rather than a
+performance knob, and the test says so.
+
+### Cost
+
+The dispatcher gained one table lookup per matrix row-block. Measured
+against a build with the table compiled out, interleaved A/B, six
+samples each:
+
+```
+  table=2.210  bypass=2.384
+  table=2.407  bypass=2.393
+  table=2.373  bypass=2.410
+  table=2.450  bypass=2.415
+  table=2.382  bypass=2.248
+  table=2.423  bypass=2.350
+```
+
+Fully overlapping — the table wins three of six. The lookup happens
+once per row-block, which is ~113,000 weights of work, so it is far
+below the noise floor. The table is empty unless you ask for something,
+in which case the code path is exactly what it was.
+
+### It is a measurement tool, not an optimiser
+
+On the 64-bit build the benchmark picked a mixed assignment no single
+`--backend` could express (`q5k=mmx`, everything else `i8`) — and that
+mix measured **3.316 tok/s against 3.334** for plain `auto`. Slightly
+worse.
+
+The synthetic benchmark runs one format at a time with everything hot.
+Real inference interleaves formats across 24 layers and streams ~344 MB
+per forward pass. A kernel that wins in isolation can lose in that
+traffic — the same effect that made the isolated i8 nibble LUT measure
+2.46x and deliver 0.97x (finding 28).
+
+So `bench` answers "which kernel is faster here, for this format, in
+isolation" — the question that previously needed a rebuild. Confirm
+with `--log-perf` on the real model before trusting the combination.
+This is also why it is opt-in and not run at startup: automatic
+selection would have made this host slower. See finding 38.
+
+### CI fix: v1.16.1 could not build
+
+The v1.16.1 tag failed in 15 seconds at the toolchain install, exit
+code 100, before compiling anything. `gcc-sparc64-linux-gnu` — added
+for the new SPARC checks — is in Ubuntu's **universe**, which the
+runners do not enable, and `apt-get` fails the whole command when one
+package is missing.
+
+`universe` is now enabled up front, and the SPARC toolchain install is
+non-fatal: if it is unavailable the three SPARC steps skip with a
+warning instead of failing the release. `qemu-user-static` and the
+mingw packages are also in universe and were working only by accident
+of the runner image.
+
+The v1.16.1 tag itself was sound — rebuilt locally it produces all six
+artifacts and passes every assertion. See finding 39.
+
+### Also
+
+- `--log-stages` now names the right build command (`make <target>
+  PROFILE=1`) instead of three targets removed in 1.16.0
+- new test `t_ident`, wired into `make i8-split-test` and CI
+
 ## 1.16.1 — everything since 1.14.2
 
 The last release on GitHub is **1.14.2**. This rolls up five versions of

@@ -25,7 +25,7 @@ enum {
     O_CTX, O_PREDICT, O_TEMP, O_TOPP, O_TOPK, O_REPEAT, O_SEED,
     O_PROMPT, O_SYSTEM, O_THINK, O_RAW, O_TEMPLATE,
     O_MCP, O_TOOLROUNDS, O_QUIETTOOLS,
-    O_BACKEND, O_LOGPERF, O_LOGSTAGES, O_LOGFILE,
+    O_BACKEND, O_KERNEL, O_LOGPERF, O_LOGSTAGES, O_LOGFILE,
     O_VERBOSE, O_HELP, O_VERSION,
     O_COUNT
 };
@@ -144,6 +144,9 @@ static const opt_def opts[] = {
   "                          carry no profiling code at all." },
 { O_LOGFILE, "--log-file", NULL, "<file>", 0, MODE_ALL,   G_PERF,
   "write the log to <file> instead of stderr" },
+
+{ O_KERNEL, "--kernel", NULL, "<f=b>", 0, MODE_ALL,   G_PERF,
+  "per-format kernel: q4k=mmx, or `bench` to measure, or `list`" },
 
 { O_VERBOSE, "--verbose", "-v", NULL, 0, MODE_ALL,   G_OTHER,
   "log progress and each request" },
@@ -290,6 +293,24 @@ int opts_parse(infer_opts *o, int argc, char **argv) {
         inf_log("usage: infer --backend list");
         return -1;
     }
+    /* `infer --kernel bench|list` likewise: both are about this
+     * machine, not about a model, and forcing a model path on them
+     * would make the benchmark useless before you have one. */
+    if (strcmp(cmd, "--kernel") == 0) {
+        if (argc >= 3) {
+            o->kernel = argv[2];
+            o->mode = MODE_INFO;
+            o->model_path = NULL;
+            /* -v after the argument still enables the table */
+            if (argc >= 4 && (strcmp(argv[3], "-v") == 0 ||
+                              strcmp(argv[3], "--verbose") == 0)) {
+                inf_verbose = 1;
+            }
+            return 0;
+        }
+        inf_log("usage: infer --kernel bench|list|<format>=<backend>");
+        return -1;
+    }
 
     if      (strcmp(cmd, "serve") == 0) { o->mode = MODE_SERVE; i = 3; }
     else if (strcmp(cmd, "chat")  == 0) { o->mode = MODE_CHAT;  i = 3; }
@@ -374,6 +395,7 @@ int opts_parse(infer_opts *o, int argc, char **argv) {
             case O_TOOLROUNDS: o->tool_rounds = atoi(val); break;
             case O_QUIETTOOLS: o->show_tools = 0; break;
             case O_BACKEND:  o->backend = val; break;
+            case O_KERNEL:   o->kernel = val; break;
             case O_LOGPERF:  o->log_perf = 1; break;
             case O_LOGSTAGES: o->log_stages = 1; break;
             case O_LOGFILE:  o->log_file = val; break;

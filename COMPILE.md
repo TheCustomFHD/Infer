@@ -95,6 +95,23 @@ zero SSE/AVX, but because modern glibc's startup uses CMOV. A genuine
 The Geode is unaffected: it is a 486-class core *with* MMX and behaves
 as `pentium2` and up.
 
+### Choosing kernels at run time
+
+Build-time flags decide what is *compiled in*; `--backend` and
+`--kernel` decide what runs:
+
+```sh
+infer --backend list        # what this binary carries, and what it picked
+infer --kernel bench -v     # measure each kernel on each format, here
+infer --kernel q6k=i8       # pin one format
+```
+
+The Q6_K VIS kernel is the reason `--kernel` exists: it is correct and
+uses 3.1x fewer instructions, and on an UltraSPARC IIi it measured
+0.8% faster, so it defaults off (finding 30). On a different SPARC the
+answer may differ — `--kernel bench` is how you find out without
+rebuilding.
+
 ### Flags, not targets
 
 | flag | effect |
