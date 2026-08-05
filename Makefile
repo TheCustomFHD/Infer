@@ -48,6 +48,7 @@
 
 CC      ?= cc
 WINCC   ?= i686-w64-mingw32-gcc
+WINCC64 ?= x86_64-w64-mingw32-gcc
 LDLIBS  ?= -lm
 
 SRCDIR  = src
@@ -97,7 +98,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.17.5
+VERSION = 1.18.0
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -109,11 +110,19 @@ BIN     = $(TARGET)$(SUFFIX)
 # The timers stay compile-time rather than a runtime flag on purpose.
 # PROF_STOP sits inside the per-layer path, so a runtime test would put
 # a load-and-branch in the hot loop of every build, on machines where
-# that is measurable. The binary is named -profile so the two cannot be
-# confused.
+# that is measurable.
+#
+# Every SHIPPED binary is now built with PROFILE=1: the overhead was
+# not measurable (2.443-2.477 tok/s profiled against 2.430-2.466 plain,
+# overlapping ranges) and the logging is opt-in at run time anyway, so
+# shipping a second timer-less copy of each variant bought nothing but
+# confusion. PROFSUF is therefore empty by default -- the release
+# artifacts are named for their ISA, not for the timers. Set
+# PROFSUF=-profile if you want both kinds side by side in one
+# directory.
 PROFILE   =
 PROFFLAGS = $(PROFILE:1=-DINFER_PROFILE)
-PROFSUF   = $(PROFILE:1=-profile)
+PROFSUF   =
 
 # ---------------------------------------------------------------------
 # Opt-OUT flags. Every accelerated kernel is compiled in by default and
@@ -180,6 +189,57 @@ NATSUF       = $(NATSUF_$(NATIVE))
 SOLNATGCC_   =
 SOLNATGCC_1  = -mcpu=native
 
+# ---------------------------------------------------------------------
+# ISA level. Selects the FLOOR the compiler may target -- what it is
+# allowed to emit for ordinary portable C, which is what decides whether
+# the i8 kernel gets autovectorised (finding 33).
+#
+#     make windows                 i486 baseline, MMX kernel  (default)
+#     make windows ISA=sse2        Pentium 4 and later
+#     make windows BITS=64 ISA=avx2   Haswell and later
+#
+# This is NOT the same as the NO_SSE2 / NO_AVX2 opt-outs above. Those
+# choose which hand-written kernels are COMPILED IN and gated at run
+# time. ISA changes the baseline for everything, so an ISA=avx2 binary
+# will fault on a CPU without AVX2 -- it is a separate download, not a
+# runtime choice.
+#
+# There is deliberately no 32-bit avx2: no 32-bit-only x86 CPU has AVX2.
+# Every AVX2-capable part (Haswell and later, AMD Excavator and later)
+# is x86-64, so a 32-bit AVX2 build would have no hardware to run on.
+#
+# On x86-64, SSE2 is part of the architecture, so ISA=sse2 and the
+# plain 64-bit build are the same compiler target; only ISA=avx2 adds
+# anything there.
+ISA        = base
+ISASUF_base =
+ISASUF_sse2 = -sse2
+ISASUF_avx2 = -avx2
+ISASUF      = $(ISASUF_$(ISA))
+
+# 32-bit: the baseline is a real choice. -mfpmath=sse matters as much
+# as -msse2 -- it moves scalar float work off the x87 stack.
+ISA32_base = -march=i486 -mtune=geode -mno-sse -mno-sse2 -mfpmath=387
+ISA32_sse2 = -march=pentium4 -mtune=generic -msse2 -mfpmath=sse
+ISA32_avx2 = -march=haswell -mtune=generic -mavx2 -mfpmath=sse -ffp-contract=off
+# 64-bit: SSE2 is guaranteed by the ABI, so `base` already has it.
+ISA64_base = -mtune=generic
+ISA64_sse2 = -mtune=generic
+# -ffp-contract=off: -march=haswell lets GCC fuse a*b+c into a single
+# vfmadd, which keeps the product at full width instead of rounding it
+# to float first. That is MORE accurate, but it makes the AVX2 build
+# generate different text from every other build. Measured: 27 vfmadd
+# in quant.c, and greedy decoding diverged at token ~8 ("It serves as
+# the nation's political, cultural and economic center" against "...
+# largest city and the seat of its government"). Neither is wrong --
+# they are different roundings of the same maths.
+#
+# Turning contraction off costs 2.83 -> 2.75 tok/s (2.8%) and makes
+# the AVX2 build byte-identical to the SSE2 and 64-bit builds. A user
+# who switches binaries to go faster and gets different answers will
+# reasonably assume the fast one is broken, so reproducibility wins.
+ISA64_avx2 = -march=haswell -mtune=generic -mavx2 -ffp-contract=off
+
 BITS     = 32
 BITSUF_32 =
 BITSUF_64 = 64
@@ -188,9 +248,11 @@ BITSUF   = $(BITSUF_$(BITS))
 LFS_32   = -D_FILE_OFFSET_BITS=64
 LFS_64   =
 USE_LFS  = $(LFS_$(BITS))
-# The i486 baseline only means anything in a 32-bit build.
-ARCH_32  = -march=i486 -mtune=geode -mno-sse -mno-sse2 -mfpmath=387
-ARCH_64  = -mtune=generic
+# The i486 baseline only means anything in a 32-bit build. Both word
+# sizes now route through the ISA table above, so `ISA=base` reproduces
+# exactly what these two lines used to say.
+ARCH_32  = $(ISA32_$(ISA))
+ARCH_64  = $(ISA64_$(ISA))
 BASEARCH = $(ARCH_$(BITS))
 # NATIVE replaces the baseline outright. Appending -march=native after
 # -mno-sse does NOT work: the -mno-* flags are sticky and silently
@@ -213,33 +275,57 @@ TOOLCHAIN = studio
 # timers. NATIVE=1 is deliberately absent -- it only runs on the machine
 # that built it, so it is never a release artifact.
 #
+# Every shipped binary carries the per-stage timers. They measured at
+# the noise floor (finding: PROFILE=1 2.443-2.477 vs plain 2.430-2.466,
+# not distinguishable), and logging stays opt-in at run time via
+# --log-stages, so there is no reason to ship a second copy of each
+# variant without them. Anyone who wants the last fraction of a percent
+# can build without PROFILE=1.
+#
+# Windows gets the full ISA ladder because Windows users download
+# binaries; Linux users generally build their own.
+#
 #   infer-X.Y.Z-linux                 32-bit, i486 floor, mmx
-#   infer-X.Y.Z-linux-profile         ...with stage timers
 #   infer-X.Y.Z-linux64               64-bit, i8 autovectorised (SSE2)
-#   infer-X.Y.Z-linux64-profile       ...with stage timers
-#   infer-X.Y.Z-windows.exe           32-bit, i486 floor, mmx
-#   infer-X.Y.Z-windows-profile.exe   ...with stage timers
+#   infer-X.Y.Z-windows.exe           32-bit, i486 floor, mmx  (XP)
+#   infer-X.Y.Z-windows-sse2.exe      32-bit, Pentium 4 floor
+#   infer-X.Y.Z-windows64.exe         64-bit, SSE2 by definition
+#   infer-X.Y.Z-windows64-avx2.exe    64-bit, Haswell and later
+#
+# There is no 32-bit AVX2 build on purpose: every AVX2-capable x86 part
+# is 64-bit, so it would have no hardware to run on.
 all:
-	@$(MAKE) linux
 	@$(MAKE) linux PROFILE=1
-	@$(MAKE) linux BITS=64
 	@$(MAKE) linux BITS=64 PROFILE=1
-	@$(MAKE) windows
 	@$(MAKE) windows PROFILE=1
+	@$(MAKE) windows ISA=sse2 PROFILE=1
+	@$(MAKE) windows BITS=64 PROFILE=1
+	@$(MAKE) windows BITS=64 ISA=avx2 PROFILE=1
 
 help:
 	@echo "TARGETS"
 	@echo "  make linux              Linux/x86  -- mmx + i8 + ref"
 	@echo "  make windows            Windows/x86 (XP and later), same set"
 	@echo "  make solaris            Solaris/SPARC -- vis + i8 + ref"
-	@echo "  make all                linux + windows"
+	@echo "  make all                the 6 shipped binaries"
 	@echo ""
 	@echo "Every accelerated kernel is compiled in and picked at RUN TIME"
-	@echo "after a CPUID / feature probe. One binary per platform."
+	@echo "after a CPUID / feature probe. ISA= is different -- it moves the"
+	@echo "compiler's BASELINE, so an ISA build only runs on that CPU."
+	@echo ""
+	@echo "SHIPPED BINARIES (make all)"
+	@echo "  infer-X.Y.Z-linux                32-bit, i486 floor, mmx"
+	@echo "  infer-X.Y.Z-linux64              64-bit"
+	@echo "  infer-X.Y.Z-windows.exe          32-bit, i486 floor -- XP, Geode"
+	@echo "  infer-X.Y.Z-windows-sse2.exe     32-bit, Pentium 4 and later"
+	@echo "  infer-X.Y.Z-windows64.exe        64-bit (SSE2 by definition)"
+	@echo "  infer-X.Y.Z-windows64-avx2.exe   64-bit, Haswell and later"
 	@echo ""
 	@echo "FLAGS (combine freely)"
-	@echo "  PROFILE=1               per-stage timers, names the binary -profile"
-	@echo "  BITS=64                 64-bit Linux build (default 32, runs on a 486)"
+	@echo "  ISA=base|sse2|avx2      compiler baseline. base = i486 on 32-bit."
+	@echo "                          No 32-bit avx2: no such CPU exists."
+	@echo "  PROFILE=1               per-stage timers (all shipped builds have them)"
+	@echo "  BITS=64                 64-bit build (default 32, runs on a 486)"
 	@echo "  TOOLCHAIN=gcc           build Solaris with GCC instead of Sun Studio"
 	@echo "  NATIVE=1                -march=native; runs ONLY on this machine"
 	@echo "  FAST=1                  Solaris non-IEEE float; verify with t_backend"
@@ -283,14 +369,25 @@ X86FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
 
 linux: $(CORE) $(POSIX) $(HDRS)
 	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) $(PROFFLAGS) \
-		-o $(BIN)-linux$(BITSUF)$(NATSUF)$(PROFSUF) \
+		-o $(BIN)-linux$(BITSUF)$(ISASUF)$(NATSUF)$(PROFSUF) \
 		$(CORE) $(POSIX) $(USE_MMXSRC) $(LDLIBS)
 
 # -D_WIN32_WINNT=0x0501 pins the Windows API surface to XP, so the
 # compiler refuses anything newer and the import table stays clean.
+# That pin is kept for the 64-bit builds too: XP x64 is 5.02, and
+# nothing in this program needs a later API.
+#
+#   make windows                     32-bit, i486 floor  -> -windows.exe
+#   make windows ISA=sse2            32-bit, P4 floor    -> -windows-sse2.exe
+#   make windows BITS=64             64-bit              -> -windows64.exe
+#   make windows BITS=64 ISA=avx2    64-bit, Haswell     -> -windows64-avx2.exe
+WINCC_32 = $(WINCC)
+WINCC_64 = $(WINCC64)
+USE_WINCC = $(WINCC_$(BITS))
+
 windows: $(CORE) $(WIN32) $(HDRS)
-	$(WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 $(PROFFLAGS) \
-		-o $(BIN)-windows$(NATSUF)$(PROFSUF).exe \
+	$(USE_WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 $(PROFFLAGS) \
+		-o $(BIN)-windows$(BITSUF)$(ISASUF)$(NATSUF)$(PROFSUF).exe \
 		$(CORE) $(WIN32) $(USE_MMXSRC) -lws2_32
 
 # =====================================================================

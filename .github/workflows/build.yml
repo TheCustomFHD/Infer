@@ -203,11 +203,11 @@ jobs:
           V=$(make version)
           echo "version=$V"                         >> "$GITHUB_OUTPUT"
           echo "LINUX=infer-$V-linux"               >> "$GITHUB_ENV"
-          echo "LINUX_P=infer-$V-linux-profile"     >> "$GITHUB_ENV"
           echo "WIN=infer-$V-windows.exe"           >> "$GITHUB_ENV"
-          echo "WIN_P=infer-$V-windows-profile.exe" >> "$GITHUB_ENV"
+          echo "WIN_SSE2=infer-$V-windows-sse2.exe"  >> "$GITHUB_ENV"
+          echo "WIN64=infer-$V-windows64.exe"        >> "$GITHUB_ENV"
+          echo "WIN64_AVX2=infer-$V-windows64-avx2.exe" >> "$GITHUB_ENV"
           echo "LINUX64=infer-$V-linux64" >> "$GITHUB_ENV"
-          echo "LINUX64_P=infer-$V-linux64-profile" >> "$GITHUB_ENV"
 
       - name: Makefile VERSION matches src/infer.h
         run: make checkversion
@@ -241,7 +241,7 @@ jobs:
       - name: build all four x86 targets
         run: |
           make all
-          ls -l "$LINUX" "$LINUX_P" "$WIN" "$WIN_P"
+          ls -l "$LINUX" "$LINUX64" "$WIN" "$WIN_SSE2" "$WIN64" "$WIN64_AVX2"
           ./"$LINUX" --version
 
       - name: unit tests
@@ -251,6 +251,53 @@ jobs:
           ./build/t_agent
           ./build/t_endian
           ./build/t_jinja
+
+      # Each Windows tier must actually be the ISA it claims. A build
+      # that silently fell back to the baseline would ship as "avx2"
+      # and be no faster, and one that gained SSE2 by accident would
+      # fault on the Geode. Assert the instruction mix directly.
+      - name: each Windows ISA tier is really that ISA
+        run: |
+          o32=i686-w64-mingw32-objdump
+          o64=x86_64-w64-mingw32-objdump
+          n() { $1 -d "$2" --no-show-raw-insn | grep -cE "$3" || true; }
+
+          # 32-bit baseline: no SSE, no AVX, MMX present, no CMOV of ours
+          x=$(n $o32 "$WIN" '%xmm|%ymm');   echo "windows.exe xmm/ymm: $x"; test "$x" -eq 0
+          m=$(n $o32 "$WIN" 'pmaddwd|punpcklbw'); echo "  mmx: $m"; test "$m" -gt 100
+
+          # 32-bit sse2: xmm required, ymm forbidden
+          x=$(n $o32 "$WIN_SSE2" '%xmm'); echo "windows-sse2 xmm: $x"; test "$x" -gt 100
+          y=$(n $o32 "$WIN_SSE2" '%ymm'); echo "  ymm: $y"; test "$y" -eq 0
+
+          # 64-bit base: xmm yes, ymm no
+          x=$(n $o64 "$WIN64" '%xmm'); echo "windows64 xmm: $x"; test "$x" -gt 100
+          y=$(n $o64 "$WIN64" '%ymm'); echo "  ymm: $y"; test "$y" -eq 0
+
+          # 64-bit avx2: ymm required
+          y=$(n $o64 "$WIN64_AVX2" '%ymm'); echo "windows64-avx2 ymm: $y"; test "$y" -gt 50
+
+          # and every one of them is still XP-era clean
+          for f in "$WIN" "$WIN_SSE2"; do
+            test "$($o32 -p "$f" | grep -c 'DLL Name')" -eq 3
+          done
+          for f in "$WIN64" "$WIN64_AVX2"; do
+            test "$($o64 -p "$f" | grep -c 'DLL Name')" -eq 3
+          done
+
+      # The whole point of the ladder is that a faster download gives
+      # the SAME answer. GCC will fuse a*b+c into vfmadd under
+      # -march=haswell, which keeps the product at full width and made
+      # the AVX2 build diverge at token ~8. -ffp-contract=off pins it.
+      # Guard the flag so nobody removes it for the 2.8% it costs.
+      - name: AVX2 build does not contract floats away from the others
+        run: |
+          grep -q 'ISA64_avx2.*-ffp-contract=off' Makefile
+          grep -q 'ISA32_avx2.*-ffp-contract=off' Makefile
+          n=$(x86_64-w64-mingw32-objdump -d "$WIN64_AVX2" --no-show-raw-insn \
+              | grep -cE 'vfmadd|vfmsub' || true)
+          echo "fused multiply-adds in the avx2 exe: $n (want 0)"
+          test "$n" -eq 0
 
       # Our objects must be 486-clean even though the linked binary
       # needs a Pentium II (glibc's _dl_aux_init uses CMOV -- see
@@ -488,8 +535,9 @@ jobs:
           # and must do so before touching the model.
           ./"$LINUX" run /nonexistent.gguf --log-stages 2>&1 \
             | grep -q 'INFER_PROFILE'
-          # the profile build must stay silent unless asked
-          ! ./"$LINUX_P" run /nonexistent.gguf 2>&1 | grep -q 'STAGE PROFILE'
+          # every shipped build has the timers, and must stay silent
+          # unless they are asked for
+          ! ./"$LINUX" run /nonexistent.gguf 2>&1 | grep -q 'STAGE PROFILE'
 
       - name: no bundled chat template (third-party work is not vendored)
         run: |
@@ -503,11 +551,11 @@ jobs:
           if-no-files-found: error
           path: |
             infer-*-linux
-            infer-*-linux-profile
             infer-*-linux64
-            infer-*-linux64-profile
             infer-*-windows.exe
-            infer-*-windows-profile.exe
+            infer-*-windows-sse2.exe
+            infer-*-windows64.exe
+            infer-*-windows64-avx2.exe
 
   # -------------------------------------------------------------------
   # Only for tags. Publishes what `build` already verified -- it does
@@ -579,12 +627,27 @@ jobs:
             echo
             echo "| file | notes |"
             echo "|---|---|"
-            echo "| \`infer-$VER-windows.exe\` | Windows, 32-bit -- Pentium II and later |"
-            echo "| \`infer-$VER-windows-profile.exe\` | ...with per-stage timers |"
-            echo "| \`infer-$VER-linux\` | Linux, 32-bit -- i486 baseline, picks \\\`mmx\\\` |"
-            echo "| \`infer-$VER-linux-profile\` | ...with per-stage timers |"
-            echo "| \`infer-$VER-linux64\` | Linux, 64-bit -- picks the SSE2-vectorised \\\`i8\\\` |"
-            echo "| \`infer-$VER-linux64-profile\` | ...with per-stage timers |"
+            echo "| \`infer-$VER-windows.exe\` | Windows 32-bit -- **i486 baseline**, picks \\\`mmx\\\`. XP, Geode, Pentium II+ |"
+            echo "| \`infer-$VER-windows-sse2.exe\` | Windows 32-bit -- **Pentium 4 and later**, vectorised \\\`i8\\\` |"
+            echo "| \`infer-$VER-windows64.exe\` | Windows 64-bit -- SSE2 by definition |"
+            echo "| \`infer-$VER-windows64-avx2.exe\` | Windows 64-bit -- **Haswell and later**, fastest |"
+            echo "| \`infer-$VER-linux\` | Linux 32-bit -- i486 baseline, picks \\\`mmx\\\` |"
+            echo "| \`infer-$VER-linux64\` | Linux 64-bit -- picks the vectorised \\\`i8\\\` |"
+            echo
+            echo "**Which Windows build?** Newest your CPU supports:"
+            echo "\`windows64-avx2\` (2013+) > \`windows64\` (any x64) >"
+            echo "\`windows-sse2\` (P4/Athlon 64+) > \`windows\` (anything older)."
+            echo "An ISA build does **not** fall back -- it faults on a CPU"
+            echo "that lacks the instructions. Note AVX needs Windows 7 SP1"
+            echo "or later even on capable silicon: XP never saved \`ymm\`"
+            echo "state across a context switch."
+            echo
+            echo "Measured on one Xeon, 20 tokens, greedy: 1.61 / 2.01 /"
+            echo "2.27 / 2.90 tok/s for the four Windows tiers in the order"
+            echo "above -- **1.80x** from the 32-bit baseline to AVX2."
+            echo
+            echo "All builds ship with the per-stage timers compiled in"
+            echo "(overhead not measurable); enable with \`--log-stages\`."
             echo
             echo "Every binary carries **all** the x86 kernels (\`mmx\`, \`i8\`,"
             echo "\`ref\`) and picks one at run time after a CPUID probe."

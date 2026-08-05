@@ -1532,6 +1532,74 @@ confusing one several steps later. And when guarding against a package
 manager, assert the end state *after* every package operation — not
 once at the beginning.
 
+## 44. Raising the ISA baseline changed the output, and FMA was why
+
+Adding an SSE2/AVX2 ladder for Windows (1.18.0) produced a clean
+speed ladder on one Xeon, 20 tokens, greedy, best of 3:
+
+| baseline | tok/s | vs 32-bit | `auto` picks |
+|---|---|---|---|
+| i486 + x87 | 1.61 | 1.00× | `mmx` |
+| Pentium 4 / SSE2 | 2.01 | 1.25× | `i8` |
+| x86-64 | 2.27 | 1.41× | `i8` |
+| Haswell / AVX2 | 2.90 | **1.80×** | `i8` |
+
+No new kernel was written. This is finding 33 paying out: once the
+compiler may emit SSE2 it vectorises the portable `i8` path, and `auto`
+correctly stops preferring the hand-written MMX kernel.
+
+**But the AVX2 build generated different text.** Greedy, fixed seed,
+diverging at about token 8:
+
+```
+...Paris. It serves as the nation's political, cultural, and economic center.
+...Paris. It serves as the nation's largest city and the seat of its government,
+```
+
+`tests/t_ident` still reported every integer kernel bit-identical, so
+it was not the kernels. The cause is float contraction: `-march=haswell`
+lets GCC fuse `a*b+c` into one `vfmadd` — 27 of them in `quant.c` alone
+— which keeps the product at full internal width instead of rounding it
+to `float` first. Strictly *more* accurate, and different from every
+other build.
+
+Confirmed by construction, in both directions:
+
+- rebuilding the AVX2 target with `-ffp-contract=off` reproduces the
+  SSE2/64-bit output **exactly** (same md5);
+- rebuilding the 32-bit target with `-mfpmath=sse` reproduces it too —
+  proving the remaining 32-bit difference is x87's 80-bit intermediates
+  and not a bug.
+
+Cost of pinning it: **2.83 → 2.75 tok/s, 2.8%**. Taken. A user who
+downloads a faster binary and gets different answers will reasonably
+conclude the fast one is broken, and "both roundings are valid" is not
+a satisfying reply. CI now greps the Makefile for the flag *and* counts
+`vfmadd` in the shipped exe.
+
+The 32-bit x87 build keeps its own answer, unavoidably — you cannot
+have an i486 baseline and SSE rounding at the same time.
+
+**The rule:** changing the instruction baseline is a numerical change,
+not just a speed change. Any build matrix that spans x87, SSE and FMA
+needs an output-equivalence check across tiers, or the fastest binary
+quietly becomes the odd one out.
+
+### Aside: what actually stops the 32-bit binaries on a 486
+
+Re-verified while auditing the ladder, because it is easy to
+misremember. Our objects are genuinely 486-clean — 0 CMOV, 0 xmm/ymm,
+under both `gcc -m32` and mingw. The *runtime* is not:
+
+- **Linux:** `ld.so` faults before `main`. Traced under
+  `qemu-i386 -cpu 486`: `cmovnel %edi,%ecx` inside the loader.
+- **Windows:** the mingw CRT contains 36 CMOV, but all of them are in
+  `strtod` / `pow` / `ldexp` / `*_D2A` helpers — none on the startup
+  path.
+
+So the floor is a Pentium II for reasons outside our code, exactly as
+finding 34 said. Nothing regressed; the MMX build is byte-identical.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

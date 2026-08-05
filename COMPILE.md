@@ -585,9 +585,12 @@ make solaris PROFILE=1
 make solaris TOOLCHAIN=gcc PROFILE=1
 ```
 
-`PROFILE=1` appends `-DINFER_PROFILE` and renames the output to
-`...-profile`, so a profiling build can never overwrite a normal one.
-The `*-profile` targets still exist and are now one-line aliases.
+`PROFILE=1` appends `-DINFER_PROFILE`. Every **shipped** binary is now
+built with it: the overhead was not measurable (2.443–2.477 tok/s
+profiled against 2.430–2.466 plain — overlapping ranges) and the
+logging is opt-in at run time via `--log-stages`, so a second
+timer-less copy of each variant bought nothing but confusion. Set
+`PROFSUF=-profile` if you want both kinds side by side.
 
 The timers remain a **compile-time** choice on purpose. `PROF_STOP` sits
 inside the per-layer path; making it a runtime test would put a load and
@@ -599,11 +602,11 @@ enough for that to show up.
 A profiling build prints **nothing** until asked:
 
 ```sh
-./infer-<version>-linux-profile run model.gguf -p "hi" -n 10 \
+./infer-<version>-linux run model.gguf -p "hi" -n 10 \
     --log-perf                                    # throughput only
-./infer-<version>-linux-profile run model.gguf -p "hi" -n 10 \
+./infer-<version>-linux run model.gguf -p "hi" -n 10 \
     --log-perf --log-stages                       # + per-stage table
-./infer-<version>-linux-profile run model.gguf -p "hi" -n 10 \
+./infer-<version>-linux run model.gguf -p "hi" -n 10 \
     --log-perf --log-stages --log-file perf.txt   # to a file
 ```
 
@@ -621,7 +624,7 @@ branch, not an instruction:
 
 ```sh
 nm infer-<version>-linux         | grep -c prof_add    # 0
-nm infer-<version>-linux-profile | grep -c prof_add    # 1
+nm infer-<version>-linux | grep -c prof_add    # 1
 ```
 
 See [PROFILING.md](PROFILING.md) for how to read the output.
@@ -957,17 +960,25 @@ echo "ALL TESTS PASSED"
 
 ## 9. Every target, every flag
 
-### The four you normally want
+### The six `make all` builds
 
-| target | output | key flags |
+| target | output | baseline |
 |---|---|---|
-| `make linux` | `infer-<version>-linux` | `-std=gnu89 -m32 -march=i486 -mtune=geode -mmmx -DINFER_HAVE_MMX -D_FILE_OFFSET_BITS=64` |
-| `make linux PROFILE=1` | `infer-<version>-linux-profile` | as above `+ -DINFER_PROFILE` |
-| `make windows` | `infer-<version>-windows.exe` | as above, `-D_WIN32_WINNT=0x0501 -lws2_32`, win32 platform files |
-| `make windows PROFILE=1` | `infer-<version>-windows-profile.exe` | as above `+ -DINFER_PROFILE` |
-| `make all` | all four | |
+| `make linux` | `infer-<version>-linux` | i486, `-mno-sse -mfpmath=387`, picks `mmx` |
+| `make linux BITS=64` | `infer-<version>-linux64` | x86-64, picks vectorised `i8` |
+| `make windows` | `infer-<version>-windows.exe` | i486 — XP, Geode |
+| `make windows ISA=sse2` | `infer-<version>-windows-sse2.exe` | Pentium 4 |
+| `make windows BITS=64` | `infer-<version>-windows64.exe` | x86-64 |
+| `make windows BITS=64 ISA=avx2` | `infer-<version>-windows64-avx2.exe` | Haswell |
 
-All four contain `mmx`, `i8` and `ref`, and all four are i486-baseline.
+All six contain `mmx`, `i8` and `ref` and pick one at run time. `ISA=`
+is a different axis: it moves the **compiler baseline**, so those
+builds do not fall back — an `avx2` binary faults on a CPU without
+AVX2. Windows gets the full ladder because Windows users download
+binaries; Linux users generally build their own.
+
+There is deliberately no 32-bit AVX2 build: every AVX2-capable x86 part
+is 64-bit, so it would have no hardware to run on.
 
 ### Solaris / SPARC
 

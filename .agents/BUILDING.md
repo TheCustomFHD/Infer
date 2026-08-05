@@ -70,8 +70,8 @@ ls -1 infer-*
 ```
 ```
 infer-<version>-linux
-infer-<version>-linux-profile
-infer-<version>-windows-profile.exe
+infer-<version>-linux
+infer-<version>-windows.exe
 infer-<version>-windows.exe
 ```
 

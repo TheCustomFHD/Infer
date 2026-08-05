@@ -17,7 +17,7 @@ files are the detail behind it.
 ```sh
 sudo apt-get install -y build-essential gcc-multilib \
                         gcc-mingw-w64-i686-win32 binutils-mingw-w64-i686
-make all          # four binaries: linux, linux-profile, windows, windows-profile
+make all          # 6 binaries: linux, linux64, windows{,-sse2,64,64-avx2}
 make test && ./build/t_align && ./build/t_agent && ./build/t_endian
 ```
 

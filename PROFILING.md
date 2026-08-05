@@ -27,7 +27,7 @@ instrumentation at all.
 ```sh
 make linux PROFILE=1
 
-./infer-<version>-linux-profile run model.gguf \
+./infer-<version>-linux run model.gguf \
     -p "What is the capital of France?" \
     -n 10 -t 0 -c 512 \
     --log-perf --log-stages --log-file perf-geode.txt
@@ -40,7 +40,7 @@ On Windows XP:
 ```
 make windows PROFILE=1
 
-infer-<version>-windows-profile.exe run model.gguf -p "What is the capital of France?" -n 10 -t 0 -c 512 --log-perf --log-stages --log-file perf-xp.txt
+infer-<version>-windows.exe run model.gguf -p "What is the capital of France?" -n 10 -t 0 -c 512 --log-perf --log-stages --log-file perf-xp.txt
 ```
 
 On Solaris/SPARC:
@@ -64,7 +64,7 @@ If you have the patience, a second run with `--backend i8` would let me
 see exactly what the SIMD kernels are buying on real silicon:
 
 ```sh
-./infer-<version>-linux-profile run model.gguf -p "..." -n 10 -t 0 -c 512 \
+./infer-<version>-linux run model.gguf -p "..." -n 10 -t 0 -c 512 \
     --backend i8 --log-perf --log-stages --log-file perf-geode-i8.txt
 ```
 
@@ -75,8 +75,8 @@ see exactly what the SIMD kernels are buying on real silicon:
 There are three targets and `PROFILE=1`:
 
 ```sh
-make linux PROFILE=1      # -> infer-<version>-linux-profile
-make windows PROFILE=1    # -> infer-<version>-windows-profile.exe
+make linux PROFILE=1      # -> infer-<version>-linux
+make windows PROFILE=1    # -> infer-<version>-windows.exe
 make solaris PROFILE=1    # -> infer-<version>-solaris-profile
 ```
 

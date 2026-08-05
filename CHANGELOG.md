@@ -1,5 +1,91 @@
 # Changelog
 
+## 1.18.0 — Windows 64-bit, and an SSE2/AVX2 ladder
+
+Windows users download binaries; Linux users generally build their own.
+So Windows now gets the full matrix and Linux keeps two.
+
+| binary | baseline | runs on |
+|---|---|---|
+| `infer-X.Y.Z-windows.exe` | i486, x87 | anything, incl. Geode and XP |
+| `infer-X.Y.Z-windows-sse2.exe` | Pentium 4 | P4, Athlon 64 and later |
+| `infer-X.Y.Z-windows64.exe` | x86-64 | any 64-bit x86 |
+| `infer-X.Y.Z-windows64-avx2.exe` | Haswell | 2013 and later |
+| `infer-X.Y.Z-linux` | i486, x87 | anything |
+| `infer-X.Y.Z-linux64` | x86-64 | any 64-bit x86 |
+
+Measured on one Xeon, 20 tokens, greedy, best of 3:
+
+```
+32-bit i486 baseline   1.61 tok/s
+32-bit SSE2            2.01 tok/s   1.25x
+64-bit                 2.27 tok/s   1.41x
+64-bit AVX2            2.90 tok/s   1.80x
+```
+
+The gain is not a new kernel — it is finding 33 doing its job. Once the
+compiler may emit SSE2, it vectorises the portable `i8` path, `auto`
+notices and stops choosing the hand-written MMX kernel. Verified: the
+32-bit baseline selects `mmx`, all three higher tiers select `i8`.
+
+**`ISA=` is not `NO_SSE2=`.** The `NO_*` flags choose which kernels are
+compiled in and gated on CPUID at run time. `ISA=` moves the compiler's
+baseline for *all* code, so those builds have no fallback — an AVX2
+binary faults on a CPU without AVX2. That is why they are separate
+downloads rather than one binary.
+
+**No 32-bit AVX2 build**, deliberately: every AVX2-capable x86 part is
+64-bit, so it would have no hardware to run on.
+
+### The AVX2 build was giving different answers
+
+Greedy decoding with a fixed seed diverged at roughly token 8:
+
+```
+...Paris. It serves as the nation's political, cultural, and economic center.
+...Paris. It serves as the nation's largest city and the seat of its government,
+```
+
+Not a kernel bug — `tests/t_ident` still reports every integer kernel
+bit-identical. `-march=haswell` lets GCC contract `a*b+c` into a single
+`vfmadd` (27 of them in `quant.c` alone), which keeps the product at
+full width instead of rounding to float first. More accurate, and
+different from every other build.
+
+`-ffp-contract=off` costs **2.83 → 2.75 tok/s (2.8%)** and makes the
+AVX2 build byte-identical to the SSE2 and 64-bit builds. Taken: someone
+who switches binaries for speed and gets different text will reasonably
+conclude the fast one is broken. CI now asserts the flag is present and
+that zero `vfmadd` reach the shipped exe.
+
+The 32-bit baseline still differs, and that one is unavoidable — x87
+keeps 80-bit intermediates. Proven rather than assumed: rebuilding
+32-bit with `-mfpmath=sse` reproduces the 64-bit output exactly.
+
+### The i486 promise is untouched
+
+Byte-for-byte unchanged, re-verified: 0 CMOV, 0 xmm/ymm, 206 MMX
+instructions, selects `mmx`, runs under an emulated Pentium II. Our
+objects are 486-clean under both `gcc -m32` and mingw.
+
+To be precise about what that means, since it came up: the 32-bit
+binaries still need a **Pentium II**, and always did. Our code emits no
+CMOV, but the runtime does — on Linux `ld.so` faults first
+(`cmovnel` in `_dl_aux_init`, confirmed by tracing `-cpu 486`), and on
+Windows the mingw CRT has 36 CMOV, though all of them sit in
+`strtod`/`pow`/`ldexp` helpers rather than on the startup path.
+
+### Other
+
+- All shipped binaries now carry the per-stage timers. Overhead was not
+  measurable (2.443–2.477 profiled vs 2.430–2.466 plain, overlapping)
+  and logging is opt-in via `--log-stages`, so the separate `-profile`
+  artifacts are gone. `PROFSUF=-profile` restores the old naming.
+- `make all` builds six binaries; `make help` lists the matrix.
+- Two new CI steps: every Windows tier is asserted to really be that
+  ISA (baseline 0 xmm / sse2 >100 xmm 0 ymm / avx2 >50 ymm, all with
+  3 XP-era DLLs), and the float-contraction guard above.
+
 ## 1.17.5 — CI: the probe now compiles what the build compiles
 
 1.17.4 worked: the toolchains installed, and steps 1–9 passed for the

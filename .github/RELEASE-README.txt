@@ -1,18 +1,53 @@
 infer -- prebuilt binaries
 ===========================
 
-Four binaries. Two platforms, two options each: with or without the
-profiler. That is the whole matrix.
+Six binaries. Windows gets a four-step ISA ladder because Windows
+users download binaries; Linux users generally build their own.
 
-  infer-<version>-windows.exe            Windows XP and later
-  infer-<version>-windows-profile.exe    ...with per-stage timers
+  infer-<version>-windows.exe          32-bit, i486 floor -- XP, Geode
+  infer-<version>-windows-sse2.exe     32-bit, Pentium 4 and later
+  infer-<version>-windows64.exe        64-bit, any x64
+  infer-<version>-windows64-avx2.exe   64-bit, Haswell (2013) and later
 
-  infer-<version>-linux                  Linux, 32-bit x86
-  infer-<version>-linux-profile          ...with per-stage timers
+  infer-<version>-linux                32-bit, i486 floor
+  infer-<version>-linux64              64-bit
 
 
-ALL FOUR CONTAIN ALL THREE BACKENDS
------------------------------------
+WHICH WINDOWS BUILD?
+--------------------
+
+Take the newest your CPU supports:
+
+  windows64-avx2   Core i-series 4xxx / Ryzen and later   fastest
+  windows64        any 64-bit x86
+  windows-sse2     Pentium 4, Athlon 64 and later
+  windows          anything older, incl. 486 + MMX and Geode
+
+These do NOT fall back. An avx2 binary faults with an illegal
+instruction on a CPU without AVX2 -- that is the cost of a build
+with no runtime check in the hot loop.
+
+Two caveats worth knowing:
+
+  * AVX needs Windows 7 SP1 or later even on capable silicon.
+    Windows XP never saved the ymm registers across a context
+    switch, so the avx2 build is not an XP build.
+  * Only the plain `windows.exe` targets the i486 baseline. It is
+    the one to use on a Geode, and the only one we claim runs on
+    period hardware.
+
+Measured on one Xeon, 20 tokens, greedy decoding:
+
+  windows        1.61 tok/s
+  windows-sse2   2.01 tok/s   1.25x
+  windows64      2.27 tok/s   1.41x
+  windows64-avx2 2.90 tok/s   1.80x
+
+Your hardware will differ; the ordering should not.
+
+
+ALL SIX CONTAIN ALL THREE BACKENDS
+----------------------------------
 
   mmx   integer kernels with an MMX inner loop  (~2x faster)
   i8    integer kernels, portable C
@@ -58,14 +93,15 @@ THE PROFILER VARIANTS
 About 2% slower. They print nothing extra unless asked, so they are
 safe to use as everyday binaries:
 
-    infer-<version>-windows-profile.exe run model.gguf -p "hi" -n 10 \
+    infer-<version>-windows.exe run model.gguf -p "hi" -n 10 \
         --log-perf                      # tokens/sec, seconds/token
-    infer-<version>-windows-profile.exe run model.gguf -p "hi" -n 10 \
+    infer-<version>-windows.exe run model.gguf -p "hi" -n 10 \
         --log-perf --log-stages         # + where the time goes
-    infer-<version>-windows-profile.exe run model.gguf -p "hi" -n 10 \
+    infer-<version>-windows.exe run model.gguf -p "hi" -n 10 \
         --log-perf --log-stages --log-file perf.txt
 
-For timing runs you actually care about, prefer the non-profile binary.
+All binaries ship with the timers compiled in; they cost nothing
+measurable and stay silent unless you pass --log-stages.
 
 
 CHECKSUMS
