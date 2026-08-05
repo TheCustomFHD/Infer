@@ -1379,6 +1379,50 @@ failures. Emulated *execution* is advisory: it has value as a signal
 and none as a gate, for the same reason finding 30 gives — the emulator
 models semantics, not the machine.
 
+## 41. Installing a cross-toolchain can break a target that already built
+
+Four CI runs in a row failed on this workflow, each for a different
+reason, and the last one was the instructive one:
+
+```
+== solaris ==            (built fine)
+== solaris NO_VIS=1 ==   (built fine)
+== solaris PROFILE=1 ==  (built fine)
+cc ... -m32 ... src/net_posix.c
+/usr/include/linux/errno.h:1:10: fatal error: asm/errno.h: No such file
+```
+
+The 32-bit x86 build had succeeded minutes earlier in the same job. It
+broke because `gcc-sparc64-linux-gnu` and `libc6-dev-sparc64-cross`
+were installed *after* it, and that pulled a `linux-libc-dev` change
+which removed the i386 headers `gcc-multilib` depends on. `apt` did
+nothing wrong: asked to satisfy the SPARC packages alone, it had no
+reason to preserve an arch nobody in that transaction needed.
+
+**Three structural mistakes, not three bugs:**
+
+1. **Toolchains were installed in several steps.** apt can only
+   reconcile requirements it sees together. Everything now goes in one
+   transaction, with `libc6-dev-i386` named explicitly so the i386
+   headers are a stated requirement rather than an accident of
+   `gcc-multilib`'s dependency graph.
+2. **Availability was assumed, not tested.** A single `probe` step now
+   compiles and runs a trivial program for each target and records
+   `yes`/`no`. Later steps are gated on that. A capability check fails
+   once, in one place, with one message -- instead of surfacing three
+   steps later as a missing header.
+3. **Steps destroyed artifacts other steps needed.** `make clean` in
+   the flag matrix and the SPARC steps removed the x86 binaries that
+   every later step refers to by name, giving exit 127 on
+   `--kernel selection`. Each destructive step now ends with
+   `make all`.
+
+**The rule:** in CI, an environment change is a global side effect. Do
+them all at once, at the start, then verify what you actually have
+before depending on it. Anything optional -- a cross-compiler, an
+emulator -- must be probed and skipped, never assumed and never allowed
+to fail the pipeline for a platform it has nothing to do with.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

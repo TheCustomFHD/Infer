@@ -97,7 +97,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.17.2
+VERSION = 1.17.3
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 

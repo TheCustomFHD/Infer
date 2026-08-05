@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.17.2 — CI fixes: build artifacts, the SPARC step, and the stray publisher
+## 1.17.3 — CI fixes: one apt transaction, probed targets, surviving artifacts
 
 Everything in 1.17.0, plus the two CI faults that run #24 exposed.
 
@@ -14,6 +14,19 @@ git rm .github/workflows/release.yml
 Copying files over a checkout cannot remove anything. That workflow is
 the second publisher described below, and it will keep publishing
 unverified releases until it is gone.
+
+### CI: one apt transaction, then probe what exists
+
+The x86 build failed with `asm/errno.h: No such file` **after** having
+built successfully in the same job. Installing the SPARC cross-compiler
+mid-run pulled a `linux-libc-dev` change that removed the i386 headers
+`gcc-multilib` needs.
+
+Every toolchain is now installed in **one** apt transaction, with
+`libc6-dev-i386` named explicitly, and a new `probe` step compiles and
+runs a trivial program per target to record what is actually usable.
+SPARC and s390x steps are gated on that probe rather than on an
+assumption. See finding 41.
 
 ### CI: steps must not delete the artifacts later steps need
 

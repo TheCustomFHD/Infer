@@ -60,19 +60,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ONE transaction for every toolchain. Installing a cross-compiler
+      # in a later step can pull a linux-libc-dev change that drops the
+      # i386 headers gcc-multilib needs, and then a target that built
+      # fine an hour ago fails with "asm/errno.h: No such file". apt can
+      # only resolve that if it sees all the requirements at once.
+      #
+      # `universe` is not enabled on the runners and several of these
+      # live there; without it apt exits 100 for the whole command.
       - name: install toolchains
         run: |
-          # `universe` is not enabled by default on the runners, and
-          # gcc-sparc64-linux-gnu lives there. Without this the whole
-          # step exits 100 before anything is built.
           sudo add-apt-repository -y universe
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
             gcc-multilib \
+            libc6-dev-i386 \
             gcc-mingw-w64-i686-win32 \
             binutils-mingw-w64-i686 \
-            qemu-user-static
+            qemu-user-static \
+            gcc-sparc64-linux-gnu \
+            libc6-dev-sparc64-cross \
+            gcc-s390x-linux-gnu \
+          || echo "::warning::some cross-toolchains unavailable"
+
+      # Prove each target can actually compile before any step relies on
+      # it. A capability check fails in one place, with one message,
+      # instead of surfacing three steps later as a missing header.
+      - name: probe which targets are usable
+        id: probe
+        run: |
+          printf 'int main(void){return 0;}\n' > /tmp/p.c
+          ok() { echo "$1=yes" >> "$GITHUB_OUTPUT"; echo "  $1: yes"; }
+          no() { echo "$1=no"  >> "$GITHUB_OUTPUT"; echo "::warning::$1 unavailable"; }
+          cc -m32 -o /tmp/p32 /tmp/p.c 2>/dev/null && ok x86_32 || no x86_32
+          i686-w64-mingw32-gcc -o /tmp/p.exe /tmp/p.c 2>/dev/null && ok win32 || no win32
+          if sparc64-linux-gnu-gcc -static -o /tmp/psp /tmp/p.c 2>/dev/null \
+             && qemu-sparc64-static /tmp/psp; then ok sparc; else no sparc; fi
+          if s390x-linux-gnu-gcc -static -o /tmp/ps390 /tmp/p.c 2>/dev/null \
+             && qemu-s390x-static /tmp/ps390; then ok s390x; else no s390x; fi
 
       # Everything below refers to $LINUX / $WIN instead of a literal
       # version, so a VERSION bump cannot break the workflow.
@@ -167,7 +193,6 @@ jobs:
 
       - name: shipped binary runs on an emulated Pentium II
         run: |
-          sudo apt-get install -y qemu-user-static
           qemu-i386-static -cpu pentium2 ./"$LINUX" --backend list
           qemu-i386-static -cpu pentium2 ./"$LINUX" --backend list \
             | grep -q 'mmx.*selected'
@@ -233,32 +258,8 @@ jobs:
       # under qemu. It catches endianness and VIS breakage, which is
       # what has actually gone wrong on that target historically.
       # -------------------------------------------------------------
-      # libc6-dev-sparc64-cross is only a *Recommends* of the compiler,
-      # so it is not guaranteed to come along. Without it there is no
-      # libc.a, -static silently produces a dynamic binary, and
-      # qemu-sparc64 then dies with "Could not open /lib64/ld-linux.so.2".
-      # Install it explicitly and prove a static hello-world runs before
-      # claiming the SPARC steps are usable.
-      - name: install the SPARC cross-compiler
-        id: sparc
-        run: |
-          if ! sudo apt-get install -y gcc-sparc64-linux-gnu \
-                                       libc6-dev-sparc64-cross; then
-            echo "::warning::SPARC cross-toolchain unavailable; skipping SPARC checks"
-            echo "have=no" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          printf 'int main(void){return 0;}\n' > /tmp/hello.c
-          if sparc64-linux-gnu-gcc -static -o /tmp/hello /tmp/hello.c 2>/dev/null \
-             && qemu-sparc64-static /tmp/hello; then
-            echo "have=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::cannot build/run a static sparc64 binary; skipping SPARC checks"
-            echo "have=no" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: SPARC cross-build (big-endian, VIS in and out)
-        if: steps.sparc.outputs.have == 'yes'
+        if: steps.probe.outputs.sparc == 'yes'
         run: |
           for f in "" "NO_VIS=1" "PROFILE=1"; do
             echo "== solaris $f =="
@@ -272,7 +273,7 @@ jobs:
       # These run under emulation, so a failure can be OUR bug or the
       # emulator's. Print enough to tell the two apart before deciding.
       - name: SPARC kernels are bit-exact under qemu
-        if: steps.sparc.outputs.have == 'yes'
+        if: steps.probe.outputs.sparc == 'yes'
         continue-on-error: true
         run: |
           echo "--- toolchain ---"
@@ -298,7 +299,7 @@ jobs:
           exit $rc
 
       - name: SPARC binary runs without VIS on a CPU that lacks it
-        if: steps.sparc.outputs.have == 'yes'
+        if: steps.probe.outputs.sparc == 'yes'
         run: |
           # A no-VIS build must still select a working backend rather
           # than falling over -- that is the "gated" half of generic.
@@ -337,8 +338,8 @@ jobs:
           file "$WIN" | grep -q 'PE32 executable'
 
       - name: big-endian build and test (s390x under qemu)
+        if: steps.probe.outputs.s390x == 'yes'
         run: |
-          sudo apt-get install -y gcc-s390x-linux-gnu qemu-user-static
           s390x-linux-gnu-gcc -std=c89 -pedantic -Wall -Wextra \
             -Wno-unused-parameter -O2 -static -o t_endian_be \
             tests/t_endian.c src/gguf.c src/quant.c src/backend.c \
