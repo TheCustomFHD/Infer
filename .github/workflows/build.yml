@@ -222,6 +222,8 @@ jobs:
             make clean >/dev/null
             make linux $f
           done
+          # Restore the shipping artifacts: later steps and the upload
+          # both refer to $LINUX / $WIN by name.
           make clean >/dev/null
           make all
 
@@ -265,6 +267,7 @@ jobs:
                  SOLLIBS=-lm $f
           done
           make clean >/dev/null
+          make all
 
       # These run under emulation, so a failure can be OUR bug or the
       # emulator's. Print enough to tell the two apart before deciding.
@@ -281,9 +284,17 @@ jobs:
           rc=0
           for t in t_vis t_viskern t_vissat t_endian; do
             echo "== $t =="
-            qemu-sparc64-static build/$t || { rc=1; echo "::warning::SPARC test $t failed under qemu"; }
+            # Print the test's own output on failure: t_vis and
+            # t_viskern name the exact (weight, activation) pair or
+            # tensor that disagreed, which is what distinguishes an
+            # emulator artefact from a real kernel bug.
+            qemu-sparc64-static build/$t || {
+              rc=1
+              echo "::warning::SPARC test $t failed under qemu $(qemu-sparc64-static --version | head -1)"
+            }
           done
           make clean >/dev/null
+          make all
           exit $rc
 
       - name: SPARC binary runs without VIS on a CPU that lacks it
@@ -296,6 +307,7 @@ jobs:
           qemu-sparc64-static "$(make version | sed 's/^/infer-/')-solaris" \
               --backend list
           make clean >/dev/null
+          make all
 
       - name: --kernel selection works and stays exact
         run: |

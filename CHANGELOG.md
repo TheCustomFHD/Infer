@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.17.1 — CI fixes for the SPARC step and the stray publisher
+## 1.17.2 — CI fixes: build artifacts, the SPARC step, and the stray publisher
 
 Everything in 1.17.0, plus the two CI faults that run #24 exposed.
 
@@ -14,6 +14,22 @@ git rm .github/workflows/release.yml
 Copying files over a checkout cannot remove anything. That workflow is
 the second publisher described below, and it will keep publishing
 unverified releases until it is gone.
+
+### CI: steps must not delete the artifacts later steps need
+
+`--kernel selection` failed with exit 127 — command not found. The
+flag-matrix and SPARC steps end with `make clean`, which removes the
+x86 binaries that every later step refers to by name. Reproduced
+locally: build, `make clean`, then `./infer-X.Y.Z-linux` gives "No such
+file or directory".
+
+Every destructive step now ends with `make all`. Verified by replaying
+the whole step order: 6 artifacts built, 6 restored after the flag
+matrix, 6 after the SPARC steps, all present at the upload.
+
+The `windows exe imports` and `--think` steps had the same latent
+dependency and survived only because an intervening step happened to
+rebuild.
 
 ### The emulated SPARC run no longer gates the build
 
