@@ -1,0 +1,49 @@
+Updating a checkout from this zip
+=================================
+
+This zip is the complete tree: every file the repository should
+contain. Extract it over your checkout and push.
+
+ONE THING COPYING CANNOT DO
+---------------------------
+
+Copying files over a directory never REMOVES anything. One file has
+been deleted and must be removed by hand:
+
+    git rm .github/workflows/release.yml
+
+Why it matters: that workflow triggers on the same `v*` tags as
+build.yml but has no `needs:` and no `if:`. It rebuilds from scratch
+and publishes a GitHub Release whether or not the build job passed.
+That is how v1.15.1 got a release from a failed run, and why the
+binaries attached to releases up to that tag are not the ones CI
+verified.
+
+build.yml already contains the release job, correctly gated:
+
+    release:
+      needs: build                     # a failed build skips this
+      if: github.ref_type == 'tag'     # only tags publish
+
+CHECKING YOU GOT IT RIGHT
+-------------------------
+
+    ls .github/workflows/          # must show ONLY build.yml
+    make checkversion              # must print: version X.Y.Z ok
+    git status                     # review before committing
+
+TAGGING A RELEASE
+-----------------
+
+The version lives in two places and `make checkversion` asserts they
+agree. Commit BEFORE tagging -- the workflow verifies that the tagged
+commit carries the version, because `git archive` packages the commit,
+not your working tree.
+
+    git add -A
+    git commit -m "X.Y.Z"
+    git tag vX.Y.Z
+    git push && git push --tags
+
+CI lifts the newest section of CHANGELOG.md into the release body and
+fails the release if that section is not for the tag being built.

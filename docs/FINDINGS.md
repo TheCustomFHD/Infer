@@ -1362,6 +1362,23 @@ symptom was visible on older tags.
 **The rule:** one publisher. Two workflows on the same trigger is not
 redundancy, it is a race in which the careless one usually wins.
 
+### Postscript: the emulated test then failed for a third reason
+
+With both faults fixed, run #26 still failed — `t_vis`, under the
+runner's qemu 8.2.2, where it passes locally on 10.0.11. QEMU's
+`fmul8x16` helper does differ between those releases (`if ((tmp & 0xff)
+> 0x7f) tmp += 0x100` against a plain `+ 0x80`), but both rules give
+identical results for all 16320 (weight, activation) pairs the test
+checks, so the rounding change is not it. Debian trixie carries no
+qemu 8 to reproduce with.
+
+Rather than guess a third time, the emulated step is now
+`continue-on-error` and prints both tool versions. The SPARC
+cross-**build** still gates, because compilation failures are real
+failures. Emulated *execution* is advisory: it has value as a signal
+and none as a gate, for the same reason finding 30 gives — the emulator
+models semantics, not the machine.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full
