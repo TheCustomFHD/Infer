@@ -60,17 +60,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ONE transaction for every toolchain. Installing a cross-compiler
-      # in a later step can pull a linux-libc-dev change that drops the
-      # i386 headers gcc-multilib needs, and then a target that built
-      # fine an hour ago fails with "asm/errno.h: No such file". apt can
-      # only resolve that if it sees all the requirements at once.
+      # Two transactions, deliberately.
       #
-      # `universe` is not enabled on the runners and several of these
-      # live there; without it apt exits 100 for the whole command.
-      - name: install toolchains
+      # apt-get install is ATOMIC: if any single name on the line cannot
+      # be resolved, apt exits 100 and installs NOTHING -- not even the
+      # packages that were fine. Run #32 proved it. One optional
+      # cross-compiler was unavailable, the whole line aborted, and
+      # `|| echo ::warning::` turned "no compilers at all" into a green
+      # step. Four steps later the run died with exit 127 on
+      # `i686-w64-mingw32-gcc: not found`, which reads like a mingw
+      # problem and is not one.
+      #
+      # So: REQUIRED goes in its own transaction with no `||` at all --
+      # if the x86 toolchain is missing there is no useful run to have,
+      # and it must say so here rather than 127 later. OPTIONAL goes in
+      # a second transaction, one package at a time, so an unavailable
+      # sparc cross-compiler costs us sparc and nothing else.
+      #
+      # Both groups still install before any compile happens. That is
+      # what finding 41 needs: pulling a cross-toolchain in mid-run once
+      # dragged in a linux-libc-dev that dropped the i386 headers
+      # gcc-multilib wants, and a target that built an hour earlier
+      # failed with "asm/errno.h: No such file".
+      - name: install toolchains (required)
         run: |
-          sudo add-apt-repository -y universe
+          sudo add-apt-repository -y universe || true
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -78,23 +92,57 @@ jobs:
             libc6-dev-i386 \
             gcc-mingw-w64-i686-win32 \
             binutils-mingw-w64-i686 \
-            qemu-user-static \
-            gcc-sparc64-linux-gnu \
-            libc6-dev-sparc64-cross \
-            gcc-s390x-linux-gnu \
-          || echo "::warning::some cross-toolchains unavailable"
+            qemu-user-static
+
+      # Best-effort, and genuinely optional: SPARC and s390x only widen
+      # coverage. Installed individually so one missing package cannot
+      # take the others down with it.
+      - name: install toolchains (optional cross targets)
+        run: |
+          for p in gcc-sparc64-linux-gnu libc6-dev-sparc64-cross \
+                   gcc-s390x-linux-gnu; do
+            if sudo apt-get install -y "$p"; then
+              echo "  $p: installed"
+            else
+              echo "::warning::$p unavailable -- its target will be skipped"
+            fi
+          done
 
       # Prove each target can actually compile before any step relies on
       # it. A capability check fails in one place, with one message,
       # instead of surfacing three steps later as a missing header.
+      #
+      # x86_32 and win32 are REQUIRED: they are the shipped artifacts.
+      # If either is missing the run is worthless, so fail here with a
+      # sentence that names the cause. Previously every target was
+      # advisory, so a run with no compilers at all sailed past this
+      # step and died later on an unrelated-looking 127.
+      #
+      # sparc and s390x are advisory -- they gate their own steps.
       - name: probe which targets are usable
         id: probe
         run: |
           printf 'int main(void){return 0;}\n' > /tmp/p.c
           ok() { echo "$1=yes" >> "$GITHUB_OUTPUT"; echo "  $1: yes"; }
           no() { echo "$1=no"  >> "$GITHUB_OUTPUT"; echo "::warning::$1 unavailable"; }
-          cc -m32 -o /tmp/p32 /tmp/p.c 2>/dev/null && ok x86_32 || no x86_32
-          i686-w64-mingw32-gcc -o /tmp/p.exe /tmp/p.c 2>/dev/null && ok win32 || no win32
+
+          req=0
+          if cc -m32 -o /tmp/p32 /tmp/p.c 2>/tmp/e32; then ok x86_32; else
+            echo "::error::x86_32 unusable -- 'cc -m32' cannot build a"\
+                 "hello world. gcc-multilib/libc6-dev-i386 did not install."
+            sed 's/^/    /' /tmp/e32; req=1
+          fi
+          if i686-w64-mingw32-gcc -o /tmp/p.exe /tmp/p.c 2>/tmp/ewin; then ok win32; else
+            echo "::error::win32 unusable -- i686-w64-mingw32-gcc cannot"\
+                 "build a hello world. gcc-mingw-w64-i686-win32 did not install."
+            sed 's/^/    /' /tmp/ewin; req=1
+          fi
+          if [ "$req" -ne 0 ]; then
+            echo "::error::Required toolchains are missing. Stopping here"\
+                 "rather than failing later with a misleading error."
+            exit 1
+          fi
+
           if sparc64-linux-gnu-gcc -static -o /tmp/psp /tmp/p.c 2>/dev/null \
              && qemu-sparc64-static /tmp/psp; then ok sparc; else no sparc; fi
           if s390x-linux-gnu-gcc -static -o /tmp/ps390 /tmp/p.c 2>/dev/null \

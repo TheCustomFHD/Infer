@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.17.4 — CI: a failed toolchain install can no longer report success
+
+Run #32 failed at "confirm the win32 (not posix) mingw variant" with
+exit code 127 — `i686-w64-mingw32-gcc: not found`. mingw was not the
+problem. **No compiler was installed at all**, including plain
+`cc -m32`, and the run had already been green for four steps.
+
+Two mistakes combined, and 1.17.3 contained both.
+
+**`apt-get install` is atomic.** Given ten package names, if one cannot
+be resolved apt exits 100 and installs *none* of the other nine.
+1.17.3 put every toolchain — required and optional — on a single line
+and appended `|| echo "::warning::some cross-toolchains unavailable"`.
+That message was written for the case where a *cross* compiler is
+missing. In practice one unavailable optional package took out
+`gcc-multilib`, `libc6-dev-i386` and mingw too, and the `||` reported
+it as a warning.
+
+**The probe was advisory when it should have been decisive.** The next
+step correctly detected that all four targets were unusable and emitted
+four warnings — then let the run continue. The first step to actually
+invoke a compiler died on `command not found`, three steps and one
+misleading error message away from the cause.
+
+Fixed structurally, not by adding another package name:
+
+- **Required and optional toolchains are now separate transactions.**
+  The required set (`build-essential`, `gcc-multilib`,
+  `libc6-dev-i386`, `gcc-mingw-w64-i686-win32`,
+  `binutils-mingw-w64-i686`, `qemu-user-static`) has **no `||`** — if
+  the shipped artifacts cannot be built, the run says so at the step
+  that caused it.
+- **Optional cross targets install one package at a time**, so an
+  unavailable sparc64 compiler costs sparc64 and nothing else. Each
+  gets its own warning naming the package and the target it disables.
+- **The probe now fails the run** if `x86_32` or `win32` cannot compile
+  a hello world, and prints the compiler's own stderr plus a sentence
+  saying which package did not install. `sparc` and `s390x` stay
+  advisory — they gate their own steps.
+
+Both groups still install before anything is compiled, which is what
+finding 41 requires: pulling a cross-toolchain mid-run once dragged in
+a `linux-libc-dev` that removed the i386 headers `gcc-multilib` needs,
+breaking a target that had built an hour earlier.
+
+No source, Makefile or kernel change. `infer` itself is byte-identical
+to 1.17.3 apart from the version string.
+
 ## 1.17.3 — CI fixes: one apt transaction, probed targets, surviving artifacts
 
 Everything in 1.17.0, plus the two CI faults that run #24 exposed.

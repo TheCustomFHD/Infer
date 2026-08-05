@@ -1423,6 +1423,57 @@ before depending on it. Anything optional -- a cross-compiler, an
 emulator -- must be probed and skipped, never assumed and never allowed
 to fail the pipeline for a platform it has nothing to do with.
 
+## 42. `apt-get install` is atomic, and `|| true` on it hides everything
+
+Finding 41 said "do all the environment changes at once, at the start".
+Correct, and 1.17.3 implemented it as a single `apt-get install` with
+nine package names and a trailing
+`|| echo "::warning::some cross-toolchains unavailable"`.
+
+Run #32 failed at *"confirm the win32 (not posix) mingw variant"* with
+**exit 127** — `i686-w64-mingw32-gcc: not found`. mingw was not the
+problem. **Nothing had been installed**, `cc -m32` included.
+
+Two independent mistakes had to line up:
+
+**`apt-get install` is all-or-nothing.** If one name on the line cannot
+be resolved, apt exits 100 having installed *none* of the others.
+Reproduced directly:
+
+```
+$ apt-get install -y --dry-run coreutils definitely-not-a-real-package-xyz
+E: Unable to locate package definitely-not-a-real-package-xyz
+rc=100          # coreutils not installed either
+```
+
+So one unavailable *optional* cross-compiler silently took out
+`gcc-multilib`, `libc6-dev-i386` and mingw. The `||` was written for
+"a cross target is missing"; it actually caught "the entire toolchain
+is missing" and printed a warning.
+
+**The probe was advisory when it should have been decisive.** The very
+next step *did* detect the truth and emitted four warnings —
+`x86_32 unavailable`, `win32 unavailable`, `sparc`, `s390x` — and then
+let the run continue. Everything downstream assumed a compiler existed.
+The failure surfaced four steps later, pointing at the wrong component.
+
+Fixed by splitting on *criticality*, not by adding package names:
+
+| group | packages | failure mode |
+|---|---|---|
+| required | build-essential, gcc-multilib, libc6-dev-i386, mingw ×2, qemu-user-static | own transaction, **no `\|\|`** — fails the step |
+| optional | sparc64 gcc + libc, s390x gcc | **one `apt-get` per package** — warns, skips that target only |
+
+and by making the probe **fail the run** if `x86_32` or `win32` cannot
+compile a hello world, printing the compiler's own stderr and naming
+the package that did not install. `sparc`/`s390x` stay advisory.
+
+**The rule:** `cmd_that_installs_many_things || echo warning` is never
+right. Either the thing is required — then let it fail, loudly, at the
+step that caused it — or it is optional, and it must be attempted
+*individually* so its absence cannot take down anything else. A green
+step that installed nothing is worse than a red one.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full
