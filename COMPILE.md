@@ -960,25 +960,32 @@ echo "ALL TESTS PASSED"
 
 ## 9. Every target, every flag
 
-### The six `make all` builds
+### The four `make all` builds
 
-| target | output | baseline |
+| target | output | notes |
 |---|---|---|
-| `make linux` | `infer-<version>-linux` | i486, `-mno-sse -mfpmath=387`, picks `mmx` |
-| `make linux BITS=64` | `infer-<version>-linux64` | x86-64, picks vectorised `i8` |
-| `make windows` | `infer-<version>-windows.exe` | i486 — XP, Geode |
-| `make windows ISA=sse2` | `infer-<version>-windows-sse2.exe` | Pentium 4 |
-| `make windows BITS=64` | `infer-<version>-windows64.exe` | x86-64 |
-| `make windows BITS=64 ISA=avx2` | `infer-<version>-windows64-avx2.exe` | Haswell |
+| `make linux` | `infer-<version>-linux` | 32-bit, i486 baseline |
+| `make linux BITS=64` | `infer-<version>-linux64` | 64-bit |
+| `make windows` | `infer-<version>-windows.exe` | 32-bit, XP and later |
+| `make windows BITS=64` | `infer-<version>-windows64.exe` | 64-bit |
 
-All six contain `mmx`, `i8` and `ref` and pick one at run time. `ISA=`
-is a different axis: it moves the **compiler baseline**, so those
-builds do not fall back — an `avx2` binary faults on a CPU without
-AVX2. Windows gets the full ladder because Windows users download
-binaries; Linux users generally build their own.
+All four are compiled at the **i486 baseline** and contain every
+kernel — `avx2`, `mmx`, `i8`, `ref` — selected at run time after a
+CPUID probe (plus XGETBV for AVX2, since Windows XP never saved `ymm`
+state and must fall back rather than fault).
 
-There is deliberately no 32-bit AVX2 build: every AVX2-capable x86 part
-is 64-bit, so it would have no hardware to run on.
+`backend_avx2.c` is the only object built with `-mavx2`. It is
+compiled separately and linked in, exactly as `backend_mmx.c` has
+always been, so one file boots on a Geode and uses VPMADDUBSW on a
+Haswell. Compiling it in the same command as everything else would
+apply `-mavx2` project-wide and the binary would fault on a 486 before
+reaching `main()`.
+
+There is no `ISA=` flag any more. Choosing an instruction floor at
+build time made the user diagnose their own CPU, and a wrong download
+died with an illegal instruction instead of running slower. A
+hand-written SSE2 backend, when it exists, joins the runtime table the
+same way — it does not become another artifact.
 
 ### Solaris / SPARC
 

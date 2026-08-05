@@ -25,7 +25,7 @@ enum {
     O_CTX, O_PREDICT, O_TEMP, O_TOPP, O_TOPK, O_REPEAT, O_SEED,
     O_PROMPT, O_SYSTEM, O_THINK, O_RAW, O_TEMPLATE,
     O_MCP, O_TOOLROUNDS, O_QUIETTOOLS,
-    O_BACKEND, O_KERNEL, O_LOGPERF, O_LOGSTAGES, O_LOGFILE,
+    O_BACKEND, O_KERNEL, O_THREADS, O_LOGPERF, O_LOGSTAGES, O_LOGFILE,
     O_VERBOSE, O_HELP, O_VERSION,
     O_COUNT
 };
@@ -147,6 +147,9 @@ static const opt_def opts[] = {
 
 { O_KERNEL, "--kernel", NULL, "<f=b>", 0, MODE_ALL,   G_PERF,
   "per-format kernel: q4k=mmx, or `bench` to measure, or `list`" },
+
+{ O_THREADS, "--threads", "-T", "<n>", 0, MODE_ALL,   G_PERF,
+  "worker threads for matvec (default: one per core, 1 disables)" },
 
 { O_VERBOSE, "--verbose", "-v", NULL, 0, MODE_ALL,   G_OTHER,
   "log progress and each request" },
@@ -396,6 +399,7 @@ int opts_parse(infer_opts *o, int argc, char **argv) {
             case O_QUIETTOOLS: o->show_tools = 0; break;
             case O_BACKEND:  o->backend = val; break;
             case O_KERNEL:   o->kernel = val; break;
+            case O_THREADS:  o->threads = atoi(val); break;
             case O_LOGPERF:  o->log_perf = 1; break;
             case O_LOGSTAGES: o->log_stages = 1; break;
             case O_LOGFILE:  o->log_file = val; break;

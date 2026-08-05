@@ -36,6 +36,8 @@
 
 #include "infer.h"
 #include "prof.h"
+#include "backend.h"
+#include "tpool.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -142,7 +144,7 @@ struct qwen35_ctx {
     float *dn_out;   /* [value_dim]                        */
     float *betav;    /* [n_v_heads]                        */
     float *alphav;   /* [n_v_heads]                        */
-    float *kv_delta; /* [head_dim]                         */
+    float *kv_delta; /* [n_v_heads][head_dim] -- per-head scratch */
 
     /* recurrent state: one per delta-net layer */
     int    n_recr_layers;
@@ -429,7 +431,12 @@ qwen35_ctx *qwen35_ctx_create(qwen35_model *m, const qwen35_params *p) {
     c->dn_out   = (float *) xmalloc(sizeof(float) * (size_t) value_dim);
     c->betav    = (float *) xmalloc(sizeof(float) * (size_t) hp->ssm_dt_rank);
     c->alphav   = (float *) xmalloc(sizeof(float) * (size_t) hp->ssm_dt_rank);
-    c->kv_delta = (float *) xmalloc(sizeof(float) * (size_t) hd);
+    /* One [hd] scratch row PER VALUE HEAD, not one shared row: the
+     * recurrence heads run concurrently on the thread pool and each
+     * needs its own delta vector. */
+    c->kv_delta = (float *) xmalloc(sizeof(float) * (size_t) hd *
+                                    (size_t) (hp->ssm_dt_rank > 0 ?
+                                              hp->ssm_dt_rank : 1));
 
     /* slot maps */
     c->attn_slot = (int *) xmalloc(sizeof(int) * (size_t) hp->n_layer);
@@ -618,6 +625,74 @@ static void layer_attention(qwen35_ctx *c, layer *L, int il, int pos) {
 /* Gated DeltaNet layer                                                */
 /* ------------------------------------------------------------------ */
 
+
+/* One value head of the Gated DeltaNet recurrence. Split out of the
+ * head loop so the thread pool can run heads concurrently; the body is
+ * unchanged from the serial version. */
+typedef struct {
+    qwen35_ctx *c;
+    int    n_kh, hd;
+    long   key_dim;
+    float *st_base;
+    float  scale;
+} dn_rec_job;
+
+static void dn_recur_slice(void *argp, long lo, long hi) {
+    const dn_rec_job *J = (const dn_rec_job *) argp;
+    qwen35_ctx *c = J->c;
+    int hd = J->hd;
+    float scale = J->scale;
+    long h;
+
+    for (h = lo; h < hi; h++) {
+        int kh = (int) (h % J->n_kh);
+        const float *q = c->qkv + (size_t) kh * hd;
+        const float *k = c->qkv + J->key_dim + (size_t) kh * hd;
+        const float *v = c->qkv + 2 * J->key_dim + (size_t) h * hd;
+        float *S = J->st_base + (size_t) h * (size_t) hd * (size_t) hd;
+        float *o = c->dn_out + (size_t) h * hd;
+        float decay = (float) exp((double) c->alphav[h]);
+        float beta  = c->betav[h];
+        /* per-head scratch: kv_delta is shared, so each head needs its
+         * own slice or the threads would collide on it. */
+        float *kvd = c->kv_delta + (size_t) h * hd;
+        int i, j;
+
+        /* Each pass is a fused "update the row, then dot it" -- a
+         * read-modify-write feeding a reduction. GCC will not
+         * vectorise that on its own (verified: zero ymm in the
+         * generated code), and it was 10.9% of the forward pass, so
+         * the AVX2 form is written out. Both are guarded on __AVX2__
+         * and fall back to the scalar loops elsewhere. */
+/* The AVX2 body lives in backend_avx2.c -- this file is compiled at
+         * the i486 baseline. Returns 0 when AVX2 is unavailable. */
+        if (!bk_a2_dn_recur(S, k, q, v, kvd, o, hd, decay, beta, scale)) {
+            for (j = 0; j < hd; j++) {
+                float *row = S + (size_t) j * hd;
+                float s = 0.0f;
+                for (i = 0; i < hd; i++) {
+                    float e = row[i] * decay;
+                    row[i] = e;
+                    s += e * k[i];
+                }
+                kvd[j] = (v[j] - s) * beta;
+            }
+
+            for (j = 0; j < hd; j++) {
+                float *row = S + (size_t) j * hd;
+                float d = kvd[j];
+                float s = 0.0f;
+                for (i = 0; i < hd; i++) {
+                    float e = row[i] + d * k[i];
+                    row[i] = e;
+                    s += e * q[i];
+                }
+                o[j] = s * scale;
+            }
+        }
+    }
+}
+
 static void layer_deltanet(qwen35_ctx *c, layer *L, int il) {
     qwen35_model *m = c->m;
     hparams *hp = &m->hp;
@@ -688,55 +763,20 @@ static void layer_deltanet(qwen35_ctx *c, layer *L, int il) {
     }
 
     /* ---- recurrence, per value head ---- */
+    /* Heads are fully independent: each owns its own 128x128 S and
+     * writes a disjoint slice of dn_out. That makes the head loop the
+     * one non-matvec stage worth handing to the thread pool -- it was
+     * 11.5% of the forward pass once the kernels got fast, and it is
+     * pure serial float work.
+     *
+     * Bit-identical for the same reason the matvec split is: no partial
+     * result crosses a head, so no sum is reassociated. */
     PROF_START(pt);
-    for (h = 0; h < n_vh; h++) {
-        /* k-heads are shared across v-heads in groups */
-        int kh = h % n_kh;
-        const float *q = c->qkv + (size_t) kh * hd;
-        const float *k = c->qkv + key_dim + (size_t) kh * hd;
-        const float *v = c->qkv + 2 * key_dim + (size_t) h * hd;
-        float *S = st_base + (size_t) h * (size_t) hd * (size_t) hd;
-        float *o = c->dn_out + (size_t) h * hd;
-        float decay = (float) exp((double) c->alphav[h]);
-        float beta  = c->betav[h];
-
-        /* S is stored transposed: S[j*hd + i] == state[i][j], so row j is
-         * contiguous and every inner loop below is a unit-stride dot. */
-
-        /* S is 128x128 floats = 64 KB per head -- exactly the size of
-         * the Geode's L1 data cache. The four logical steps below used
-         * to be four separate full passes over S, so S was streamed
-         * through L1 four times per head and never stayed resident.
-         *
-         * Steps 1+2 are fused (decay a row, then immediately dot it
-         * with k) and steps 3+4 are fused (update a row, then dot it
-         * with q). That halves the traffic over S: two passes instead
-         * of four, and each row is touched while it is still hot. */
-
-        /* pass A: decay each row, then delta[j] = (v[j] - <row,k>)*beta */
-        for (j = 0; j < hd; j++) {
-            float *row = S + (size_t) j * hd;
-            float s = 0.0f;
-            for (i = 0; i < hd; i++) {
-                float e = row[i] * decay;
-                row[i] = e;
-                s += e * k[i];
-            }
-            c->kv_delta[j] = (v[j] - s) * beta;
-        }
-
-        /* pass B: rank-1 update, then readout o[j] = <row,q>/sqrt(hd) */
-        for (j = 0; j < hd; j++) {
-            float *row = S + (size_t) j * hd;
-            float d = c->kv_delta[j];
-            float s = 0.0f;
-            for (i = 0; i < hd; i++) {
-                float e = row[i] + d * k[i];
-                row[i] = e;
-                s += e * q[i];
-            }
-            o[j] = s * scale;
-        }
+    {
+        dn_rec_job job;
+        job.c = c; job.n_kh = n_kh; job.hd = hd;
+        job.key_dim = key_dim; job.st_base = st_base; job.scale = scale;
+        tp_parallel_for((long) n_vh, dn_recur_slice, &job);
     }
 
     PROF_STOP(pt, PF_DN_RECUR, (double) n_vh * hd * hd * 3.0);

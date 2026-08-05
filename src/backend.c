@@ -28,6 +28,7 @@
 
 #include "infer.h"
 #include "backend.h"
+#include "tpool.h"
 #include "prof.h"
 #include "sys.h"
 
@@ -46,6 +47,8 @@ static int   cpu_probed = 0;
 static int   cpu_mmx    = 0;
 static int   cpu_3dnow  = 0;
 static int   cpu_cmov   = 0;
+static int   cpu_sse2   = 0;
+static int   cpu_avx2   = 0;
 static char  cpu_vendor_s[16] = "unknown";
 
 #ifdef BK_X86_CPUID
@@ -91,6 +94,26 @@ static int bk_has_cpuid(void) {
     return res != 0;
 #endif
 }
+
+/* Read XCR0. AVX adds architectural state (the upper half of ymm), so
+ * the CPU feature bit alone is not enough: the OS must also have
+ * promised to save and restore it across a context switch. If it has
+ * not, the CPU raises #UD on the first VEX-encoded instruction.
+ *
+ * This is not hypothetical for this project. Windows XP never gained
+ * AVX support, so an XP machine on late silicon reports AVX2 in CPUID
+ * and still cannot run it. Checking OSXSAVE + XCR0 is the difference
+ * between selecting another backend and crashing.
+ *
+ * Only called once OSXSAVE (CPUID.1:ECX bit 27) is known set, so
+ * XGETBV itself is safe to execute here. */
+static unsigned long bk_xgetbv0(void) {
+    unsigned long eax, edx;
+    __asm__ __volatile__ (".byte 0x0f, 0x01, 0xd0"   /* xgetbv */
+                          : "=a" (eax), "=d" (edx) : "c" (0));
+    (void) edx;
+    return eax;
+}
 #endif /* BK_X86_CPUID */
 
 static void probe_cpu(void) {
@@ -110,9 +133,28 @@ static void probe_cpu(void) {
         cpu_vendor_s[12] = '\0';
 
         if (a >= 1) {
+            unsigned long maxleaf = a;
+            unsigned long c1, d1;
+
             bk_cpuid(1, &a, &b, &c, &d);
-            cpu_cmov = (d & (1UL << 15)) ? 1 : 0;
-            cpu_mmx  = (d & (1UL << 23)) ? 1 : 0;
+            c1 = c; d1 = d;
+            cpu_cmov = (d1 & (1UL << 15)) ? 1 : 0;
+            cpu_mmx  = (d1 & (1UL << 23)) ? 1 : 0;
+            cpu_sse2 = (d1 & (1UL << 26)) ? 1 : 0;
+
+            /* AVX2 needs four things to all agree:
+             *   CPUID.1:ECX.OSXSAVE (27)  OS enabled XSAVE
+             *   CPUID.1:ECX.AVX     (28)  CPU has AVX
+             *   XCR0 bits 1 and 2         OS saves xmm AND ymm
+             *   CPUID.7:EBX.AVX2    (5)   CPU has AVX2
+             * Miss the XCR0 check and an XP box with a Haswell chip
+             * takes #UD instead of falling back. */
+            if ((c1 & (1UL << 27)) && (c1 & (1UL << 28)) && maxleaf >= 7) {
+                if ((bk_xgetbv0() & 0x6UL) == 0x6UL) {
+                    bk_cpuid(7, &a, &b, &c, &d);
+                    cpu_avx2 = (b & (1UL << 5)) ? 1 : 0;
+                }
+            }
         }
 
         /* 3DNow! lives in the AMD extended leaves. */
@@ -129,6 +171,8 @@ static void probe_cpu(void) {
 int bk_cpu_has_mmx(void)   { probe_cpu(); return cpu_mmx; }
 int bk_cpu_has_3dnow(void) { probe_cpu(); return cpu_3dnow; }
 int bk_cpu_has_cmov(void)  { probe_cpu(); return cpu_cmov; }
+int bk_cpu_has_sse2(void)  { probe_cpu(); return cpu_sse2; }
+int bk_cpu_has_avx2(void)  { probe_cpu(); return cpu_avx2; }
 const char *bk_cpu_vendor(void) { probe_cpu(); return cpu_vendor_s; }
 
 
@@ -145,14 +189,136 @@ const char *bk_cpu_vendor(void) { probe_cpu(); return cpu_vendor_s; }
 static bk_qx  xq_buf;
 static long   xq_cap = 0;
 
+/* Explicit "already quantised" latch, NOT a content heuristic.
+ *
+ * Under the thread pool q_matvec quantises x once and then every
+ * worker calls bk_quantize_x again for the same vector. Racing writes
+ * to one shared buffer would be a genuine data race, so the repeats
+ * must become no-ops.
+ *
+ * Guessing whether x changed (pointer + a couple of sampled values)
+ * was the first attempt and it is unsafe: x lives in a scratch buffer
+ * that is rewritten in place, so a false hit silently computes with
+ * stale activations -- a wrong-answer bug that no test would reliably
+ * catch. Instead the caller states it explicitly: bk_quantize_hold()
+ * before the parallel region, bk_quantize_release() after. Outside
+ * that window every call recomputes exactly as before. */
+static int xq_held = 0;
+
+
+/* Build the Q8_K-style plane: one scale per 256 activations, plus
+ * per-16 sums. Only the AVX2 k-quant kernels need it, so it is built
+ * on first request and reused until the next bk_quantize_x.
+ *
+ * Why a second plane at all: those kernels fold the weight scale into
+ * an int32 accumulator that spans a whole 256-weight superblock and
+ * convert to float once. That is only valid if the activation scale is
+ * constant across the superblock, which the per-32 plane is not. */
+const bk_qx *bk_quantize_k(const float *x, long n) {
+    long nk, k, j;
+
+    /* Callable without bk_quantize_x having run: the AVX2 k-quant
+     * path uses this plane alone, so it owns the allocation and the
+     * validity bookkeeping. */
+    /* Only the hold latch may short-circuit this. A "has x changed?"
+     * guess based on the pointer is unsafe: x lives in a scratch
+     * buffer rewritten in place, so a false hit computes with stale
+     * activations -- a silent wrong answer. The latch is set
+     * explicitly by q_matvec around a parallel region and nowhere
+     * else. */
+    if (xq_held) return &xq_buf;
+
+    if (n > xq_cap) {
+        xq_cap    = n + 256;
+        xq_buf.q  = (short *) xrealloc(xq_buf.q, sizeof(short) * (size_t) xq_cap);
+        xq_buf.q8 = (signed char *) xrealloc(xq_buf.q8,
+                                             sizeof(signed char) * (size_t) xq_cap);
+        xq_buf.k8 = (signed char *) xrealloc(xq_buf.k8,
+                                             sizeof(signed char) * (size_t) xq_cap);
+        xq_buf.d  = (float *) xrealloc(xq_buf.d, sizeof(float) *
+                                       (size_t) (xq_cap / 32 + 2));
+        xq_buf.s  = (int *)   xrealloc(xq_buf.s, sizeof(int) *
+                                       (size_t) (xq_cap / 32 + 2));
+        xq_buf.s16 = (int *)  xrealloc(xq_buf.s16, sizeof(int) *
+                                       (size_t) (xq_cap / 16 + 2));
+        xq_buf.kd = (float *) xrealloc(xq_buf.kd, sizeof(float) *
+                                       (size_t) (xq_cap / 256 + 2));
+        xq_buf.ks16 = (int *) xrealloc(xq_buf.ks16, sizeof(int) *
+                                       (size_t) (xq_cap / 16 + 2));
+        xq_buf.n = xq_cap;
+    }
+
+    nk = (n + 255) / 256;
+    for (k = 0; k < nk; k++) {
+        long j0 = k * 256, j1 = j0 + 256;
+        float amax = 0.0f, kd, kid;
+        if (j1 > n) j1 = n;
+
+        for (j = 0; j < 16; j++) xq_buf.ks16[k * 16 + j] = 0;
+
+        /* The vectorised body lives in backend_avx2.c, the only object
+         * compiled with -mavx2. This file is compiled at the i486
+         * baseline so that ONE binary runs everywhere, so it may not
+         * contain AVX2 itself -- it calls through a runtime-gated
+         * pointer instead. bk_a2_* return 0 when unavailable. */
+        amax = 0.0f;
+        if (!bk_a2_amax(x + j0, j1 - j0, &amax)) {
+            for (j = j0; j < j1; j++) {
+                float a = x[j] < 0.0f ? -x[j] : x[j];
+                if (a > amax) amax = a;
+            }
+        }
+        if (amax == 0.0f) {
+            for (j = j0; j < j0 + 256 && j < xq_cap; j++) xq_buf.k8[j] = 0;
+            xq_buf.kd[k] = 0.0f;
+            continue;
+        }
+        kd  = amax / 127.0f;
+        kid = 127.0f / amax;
+        xq_buf.kd[k] = kd;
+/* Vectorised in backend_avx2.c (see above); scalar fallback here. */
+        if (!bk_a2_quant256(x + j0, j1 - j0, kid,
+                            xq_buf.k8 + j0, xq_buf.ks16 + k * 16)) {
+            for (j = j0; j < j1; j++) {
+                float v = x[j] * kid;
+                int   q = (int) (v + (v >= 0.0f ? 0.5f : -0.5f));
+                if (q >  127) q =  127;
+                if (q < -127) q = -127;
+                xq_buf.k8[j] = (signed char) q;
+                xq_buf.ks16[k * 16 + (j - j0) / 16] += q;
+            }
+        }
+        for (j = j1; j < j0 + 256 && j < xq_cap; j++) xq_buf.k8[j] = 0;
+    }
+    return &xq_buf;
+}
+
+void bk_quantize_hold(void)    { xq_held = 1; }
+void bk_quantize_release(void) { xq_held = 0; }
+
 const bk_qx *bk_quantize_x(const float *x, long n) {
     long nb = (n + 31) / 32;
     long i, b;
+
+    if (xq_held) return &xq_buf;
 
 
     if (n > xq_cap) {
         xq_cap    = n + 256;
         xq_buf.q  = (short *) xrealloc(xq_buf.q, sizeof(short) * (size_t) xq_cap);
+        /* Second copy of the same values as int8. VPMADDUBSW takes an
+         * s8 operand directly; widening to int16 first would halve the
+         * lane count and throw away the whole point of the
+         * instruction. 1 byte per activation, so ~4 KB for the widest
+         * row in this model -- cheap next to the weights. */
+        xq_buf.q8 = (signed char *) xrealloc(xq_buf.q8,
+                                             sizeof(signed char) * (size_t) xq_cap);
+        xq_buf.k8 = (signed char *) xrealloc(xq_buf.k8,
+                                             sizeof(signed char) * (size_t) xq_cap);
+        xq_buf.kd = (float *) xrealloc(xq_buf.kd, sizeof(float) *
+                                       (size_t) (xq_cap / 256 + 2));
+        xq_buf.ks16 = (int *) xrealloc(xq_buf.ks16, sizeof(int) *
+                                       (size_t) (xq_cap / 16 + 2));
         xq_buf.d  = (float *) xrealloc(xq_buf.d, sizeof(float) *
                                        (size_t) (xq_cap / 32 + 2));
         xq_buf.s  = (int *)   xrealloc(xq_buf.s, sizeof(int) *
@@ -178,8 +344,8 @@ const bk_qx *bk_quantize_x(const float *x, long n) {
         }
 
         if (amax == 0.0f) {
-            for (i = i0; i < i1; i++) xq_buf.q[i] = 0;
-            for (; i < i0 + 32; i++)  xq_buf.q[i] = 0;
+            for (i = i0; i < i1; i++) { xq_buf.q[i] = 0; xq_buf.q8[i] = 0; }
+            for (; i < i0 + 32; i++)  { xq_buf.q[i] = 0; xq_buf.q8[i] = 0; }
             xq_buf.d[b] = 0.0f;
             xq_buf.s[b] = 0;
             xq_buf.s16[2 * b]     = 0;
@@ -196,19 +362,28 @@ const bk_qx *bk_quantize_x(const float *x, long n) {
             int   q = (int) (v + (v >= 0.0f ? 0.5f : -0.5f));
             if (q >  127) q =  127;
             if (q < -127) q = -127;
-            xq_buf.q[i] = (short) q;
+            xq_buf.q[i]  = (short) q;
+            xq_buf.q8[i] = (signed char) q;
             sum += q;
             if (i - i0 < 16) sum16_0 += q;
             else             sum16_1 += q;
         }
         /* zero-pad a short tail so kernels can always read 32 */
-        for (i = i1; i < i0 + 32; i++) xq_buf.q[i] = 0;
+        for (i = i1; i < i0 + 32; i++) {
+            xq_buf.q[i]  = 0;
+            xq_buf.q8[i] = 0;
+        }
 
         xq_buf.d[b] = d;
         xq_buf.s[b] = sum;
         xq_buf.s16[2 * b]     = sum16_0;
         xq_buf.s16[2 * b + 1] = sum16_1;
     }
+
+    /* The Q8_K-style plane (one scale per 256) is NOT built here; the
+     * AVX2 k-quant kernels call bk_quantize_k() for it instead. Which
+     * plane gets built is a property of the KERNEL, not of the caller,
+     * so each builds only what it reads. */
 
     return &xq_buf;
 }
@@ -217,10 +392,19 @@ void bk_free_scratch(void) {
     if (xq_buf.q) free(xq_buf.q);
     if (xq_buf.d) free(xq_buf.d);
     if (xq_buf.s) free(xq_buf.s);
+    if (xq_buf.q8)  free(xq_buf.q8);
+    if (xq_buf.k8)  free(xq_buf.k8);
+    if (xq_buf.kd)  free(xq_buf.kd);
+    if (xq_buf.ks16) free(xq_buf.ks16);
     if (xq_buf.s16) free(xq_buf.s16);
     xq_buf.q = NULL;
     xq_buf.d = NULL;
     xq_buf.s = NULL;
+    xq_buf.q8  = NULL;
+    xq_buf.k8  = NULL;
+    xq_buf.kd  = NULL;
+    xq_buf.ks16 = NULL;
+    xq_held    = 0;
     xq_buf.s16 = NULL;
     xq_cap = 0;
 }
@@ -527,6 +711,20 @@ static int mmx_ok(void) { return bk_cpu_has_mmx(); }
 #endif
 
 static const bk_backend backends[] = {
+#ifdef INFER_HAVE_AVX2
+    /* First: 32 MACs per VPMADDUBSW against MMX's 4 and autovectorised
+     * i8's 16. Gated on CPUID *and* OS ymm state, so a machine that
+     * cannot run it simply falls through to the next entry.
+     *
+     * Registered on INFER_HAVE_AVX2 alone, NOT on __AVX2__. This file
+     * is compiled at the i486 baseline so one binary runs everywhere,
+     * so __AVX2__ is false here even though backend_avx2.c was built
+     * with -mavx2 and is linked in. Testing __AVX2__ here would
+     * silently drop the kernel from every shipped build -- which is
+     * exactly what happened once. */
+    { "avx2", "integer kernels with AVX2 VPMADDUBSW inner loop (Haswell+)",
+      bk_avx2_available, qmv_avx2 },
+#endif
 #ifdef INFER_HAVE_VIS
     { "vis", "integer kernels with VIS 1 inner loop (UltraSPARC)",
       bk_vis_available, bk_qmv_vis },
@@ -580,7 +778,23 @@ int bk_select(const char *name) {
     if (!name || !name[0] || strcmp(name, "auto") == 0) {
         /* When the compiler vectorised the portable path, prefer it
          * over the hand-written 64-bit-SIMD kernels. See the comment
-         * on I8_IS_VECTORISED. */
+         * on I8_IS_VECTORISED.
+         *
+         * EXCEPT where a hand-written kernel still beats the
+         * vectoriser. Finding 33 concluded "prefer i8 once the
+         * compiler can vectorise" from a table whose only SIMD
+         * alternative was MMX (4 MACs/instr). The AVX2 kernel does 32
+         * per VPMADDUBSW, an instruction GCC never emits from this C,
+         * so it is ahead of autovectorised i8 rather than behind it.
+         * Try it first; if the CPU or OS says no, fall through to the
+         * i8 preference exactly as before. */
+        for (i = 0; i < N_BACKENDS; i++) {
+            if (strcmp(backends[i].name, "avx2") == 0 &&
+                backends[i].available()) {
+                cur = &backends[i];
+                return 0;
+            }
+        }
         if (I8_IS_VECTORISED) {
             for (i = 0; i < N_BACKENDS; i++) {
                 if (strcmp(backends[i].name, "i8") == 0 &&
@@ -861,10 +1075,34 @@ int bk_kernel_arg(const char *arg) {
 /* Public dispatcher used by the engine                                */
 /* ------------------------------------------------------------------ */
 
+/* Row-slice descriptor for the thread pool. The kernels already take
+ * a row count, so a slice is just a shifted weight pointer and a
+ * shorter run -- no kernel changes were needed to parallelise. */
+typedef struct {
+    bk_matvec_fn  fn;
+    int           type;
+    const unsigned char *w;
+    const float  *x;
+    float        *y;
+    long          ncols;
+    long          rowbytes;
+} mv_job;
+
+static void mv_slice(void *argp, long lo, long hi) {
+    const mv_job *j = (const mv_job *) argp;
+    if (hi <= lo) return;
+    j->fn(j->type, j->w + lo * j->rowbytes, j->x, j->y + lo,
+          j->ncols, hi - lo);
+}
+
 void q_matvec(int type, const unsigned char *w, const float *x,
               float *y, long ncols, long nrows) {
     PROF_DECL(pt);
     ensure_selected();
+#ifdef INFER_SHAPE_LOG
+    { static FILE*sf=NULL; if(!sf) sf=fopen("/tmp/shapes.txt","w");
+      fprintf(sf,"%d %ld %ld\n",type,ncols,nrows); }
+#endif
 
     PROF_START(pt);
     {
@@ -872,8 +1110,37 @@ void q_matvec(int type, const unsigned char *w, const float *x,
          * that is empty unless someone asked for an override. */
         int slot_ = fmt_slot_of_type(type);
         const bk_backend *k_ = (slot_ >= 0) ? fmt_kernel[slot_] : NULL;
-        if (k_) k_->matvec(type, w, x, y, ncols, nrows);
-        else    cur->matvec(type, w, x, y, ncols, nrows);
+        bk_matvec_fn fn_ = k_ ? k_->matvec : cur->matvec;
+
+        /* Rows are independent, so they split across cores with no
+         * locking and no change to the arithmetic: each row is summed
+         * by the same code in the same order, just on another core.
+         * Bit-identity is asserted by tests/t_thread.c.
+         *
+         * Only worth the dispatch for matrices with enough rows to
+         * amortise it; below that the serial call is faster. The
+         * activation quantisation must also happen ONCE, before the
+         * split, or every thread would race to fill the same scratch
+         * buffer. */
+        long rb_ = gg_type_size(type, ncols);
+        if (tp_threads() > 1 && nrows >= 64 && rb_ > 0 &&
+            type != GGML_TYPE_F32 && type != GGML_TYPE_F16 &&
+            (ncols % 32) == 0) {
+            mv_job job;
+            /* Fill the shared scratch once, then latch it so the
+             * workers' own calls become no-ops instead of racing. */
+            bk_quantize_x(x, ncols);
+            /* The AVX2 k-quant kernels also read the Q8_K plane; build
+             * it here too so no worker races to create it. */
+            if (type != GGML_TYPE_Q8_0) bk_quantize_k(x, ncols);
+            bk_quantize_hold();
+            job.fn = fn_; job.type = type; job.w = w; job.x = x;
+            job.y = y; job.ncols = ncols; job.rowbytes = rb_;
+            tp_parallel_for(nrows, mv_slice, &job);
+            bk_quantize_release();
+        } else {
+            fn_(type, w, x, y, ncols, nrows);
+        }
     }
 
 #ifdef INFER_PROFILE

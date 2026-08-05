@@ -20,6 +20,7 @@
 #include "opts.h"
 #include "server.h"
 #include "backend.h"
+#include "tpool.h"
 #include "prof.h"
 #include "chat.h"
 #include "agent.h"
@@ -282,6 +283,15 @@ int main(int argc, char **argv) {
                     "(try --backend list)", o.backend);
             return 1;
         }
+    }
+
+    /* Start the worker pool before any model work. Rows of every
+     * matvec are handed out across it; results stay bit-identical
+     * because no partial sum ever crosses a thread. */
+    {
+        int nt = tp_start(o.threads);
+        if (inf_verbose)
+            inf_log("threads: %d (of %d logical CPUs)", nt, tp_cpu_count());
     }
 
     /* --kernel runs AFTER --backend, so an explicit backend is the

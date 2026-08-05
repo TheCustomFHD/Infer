@@ -60,6 +60,7 @@ typedef struct {
     /* diagnostics */
     const char *backend;
     const char *kernel;
+    int         threads;    /* 0 = auto (one per core), 1 = serial */
     const char *log_file;
     int         log_perf;
     int         log_stages;      /* --log-stages, needs a profile build */

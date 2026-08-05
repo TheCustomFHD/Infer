@@ -91,11 +91,29 @@ const unsigned char *sys_map_data(sys_map *m) {
 }
 
 void sys_map_advise_random(sys_map *m) {
-#ifdef MADV_RANDOM
-    if (m) madvise(m->base, m->maplen, MADV_RANDOM);
-#else
-    (void) m;
+    /* MADV_RANDOM was wrong for this workload and cost real
+     * throughput. Inference walks EVERY weight of every tensor in
+     * address order, once per token -- the most sequential access
+     * pattern there is. MADV_RANDOM tells the kernel to switch off
+     * readahead, so each page fault fetched one page instead of a
+     * run, and the streaming kernels stalled on faults they should
+     * never have seen.
+     *
+     * MADV_WILLNEED asks the kernel to start pulling the mapping in;
+     * MADV_SEQUENTIAL restores (and doubles) readahead. Neither
+     * forces residency, so a machine with less RAM than the model
+     * still works -- it just pages, which is the honest behaviour.
+     *
+     * The function keeps its name so callers do not change; what it
+     * advises is a property of the access pattern, and the pattern is
+     * sequential. */
+#if defined(MADV_SEQUENTIAL)
+    if (m) madvise(m->base, m->maplen, MADV_SEQUENTIAL);
 #endif
+#if defined(MADV_WILLNEED)
+    if (m) madvise(m->base, m->maplen, MADV_WILLNEED);
+#endif
+    (void) m;
 }
 
 void sys_map_close(sys_map *m) {

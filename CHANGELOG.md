@@ -1,5 +1,403 @@
 # Changelog
 
+## 1.21.0 — one binary per platform, with AVX2 inside the 486 build
+
+1.18.0 shipped an ISA ladder: separate `-sse2` and `-avx2` downloads
+whose baseline the compiler moved. That was the wrong shape and this
+removes it. **Four artifacts, each i486-baseline, each carrying every
+kernel:**
+
+```
+infer-1.21.0-linux         32-bit   runs on a 486, AVX2 on a Haswell
+infer-1.21.0-linux64       64-bit
+infer-1.21.0-windows.exe   32-bit   runs on XP / Geode, AVX2 on a Haswell
+infer-1.21.0-windows64.exe 64-bit
+```
+
+The ladder asked the user to diagnose their own CPU, and a wrong guess
+died with an illegal instruction rather than running slower. The
+compiler-vectorised SSE2 tier never earned its own download either.
+
+### How AVX2 gets into a 486 binary
+
+`backend_avx2.c` is now the **only** object compiled with `-mavx2`,
+into its own `.o`, linked with everything else built at the i486
+baseline. It is reached through the runtime gate it already had
+(CPUID + XGETBV). Exactly the arrangement `backend_mmx.c` has always
+used.
+
+That required moving the AVX2 code that had leaked into two
+baseline-compiled files:
+
+- `bk_quantize_k`'s vectorised amax and quantise loops
+  (`backend.c`) → `bk_a2_amax` / `bk_a2_quant256`
+- the Gated DeltaNet recurrence (`qwen35.c`) → `bk_a2_dn_recur`
+
+Each returns 0 when AVX2 is unusable and the caller runs its scalar
+loop, so the call sites need no `#ifdef`.
+
+One trap worth recording: the backend table gated registration on
+`__AVX2__`, which is **false** in `backend.c` now that it is compiled
+at the baseline — so the kernel linked in but was never offered. It is
+registered on `INFER_HAVE_AVX2` instead, and CI asserts the shipped
+32-bit binary lists `avx2`.
+
+Verified end to end, one binary, from `--backend list`:
+
+```
+qemu -cpu pentium2  -> mmx
+qemu -cpu pentium3  -> mmx
+qemu -cpu core2duo  -> mmx
+qemu -cpu Haswell   -> avx2
+```
+
+and every baseline object is still 0 CMOV / 0 SSE / 0 AVX, with
+MMX and AVX2 both present in all four shipped files.
+
+Measured single core, sandbox Xeon: 64-bit **12.84 tok/s** (unchanged
+from the dedicated avx2 build it replaces), 32-bit **9.96** — lower
+because 32-bit mode has eight ymm registers rather than sixteen.
+
+### CI
+
+Three new steps replace the per-tier ISA assertions:
+
+- **one binary, 486 baseline outside the gated AVX2 object** — every
+  artifact must have >100 ymm, ≥1 `vpmaddubsw`, ≥1 `xgetbv` *and*
+  >100 MMX instructions. If the two-stage compile ever collapses into
+  one command, one half of that fails.
+- **baseline objects contain no CMOV and no SSE/AVX** — every `src/*.c`
+  except the deliberately-gated `backend_avx2.c`.
+- **the shipped 32-bit binary offers avx2 and still runs on a P2** —
+  the emulated ladder above.
+
+`NO_THREADS=1` joined the build-flag matrix. `make all` builds four
+artifacts; `make help` and `RELEASE-README.txt` describe the single
+binary.
+
+## 1.20.0 — 6.3 → 13.5 tok/s single core (16.8 on two)
+
+1.19.0's AVX2 backend was worth 1.45× and I called that a result. It
+wasn't: llama.cpp does ~15 tok/s single core on this class of machine,
+so the gap was mine, not the hardware's. This closes most of it.
+
+Sandbox Xeon @2.6 GHz, Qwen3.5-0.8B-Q4_K_M, 40 tokens greedy:
+
+```
+                    1 core      2 cores
+1.19.0 as shipped    6.35         --
+1.20.0              13.53        16.84
+```
+
+Single-core is **2.13x**. The 15 tok/s single-core target is not met
+here; see "where the remaining gap is" below, which is measured rather
+than guessed.
+
+Eight changes, in the order they mattered.
+
+### 1. Threads (biggest single win: 5.77 → 9.10)
+
+There was **no threading at all** — one core of two, on every platform.
+Every matvec is a loop over independent output rows, so `q_matvec`
+now splits the row range across a persistent pool (`src/tpool.c`,
+~230 lines over pthreads / Win32 events, no new library).
+
+Bit-identical by construction: rows are split, never dot products, so
+each output is summed by the same code in the same order — just on a
+different core. `tests/t_thread.c` asserts that across thread counts
+and on row counts that don't divide evenly.
+
+`--threads N` / `-T N`; default is one per core, `-T 1` disables.
+`NO_THREADS=1` compiles the pool out entirely for the 486.
+
+The Gated DeltaNet recurrence is threaded the same way (heads are
+independent). It was 11.5% of the pass once the kernels got fast.
+
+### 2. The kernel shape was wrong (9.10 → 13.29)
+
+Reading llama.cpp's `ggml_vec_dot_q4_K_q8_K` showed the real
+difference, and it wasn't the instruction — it was everything around
+it. Per 256-weight superblock my kernel did **8 horizontal sums and
+~32 scalar float ops**; theirs does **one vector convert and one
+multiply-add**.
+
+Three structural fixes:
+
+- **A Q8_K-style activation plane** — one scale per 256 values instead
+  of per 32 (`xq->k8/kd/ks16`, built lazily since only these kernels
+  want it). Without a constant scale across the superblock, none of
+  the rest is possible.
+- **The weight scale applied in the integer domain**, folded into the
+  `VPMADDWD` that had to widen int16→int32 anyway. Scaling became free.
+- **One int32 accumulator per superblock**, converted to float once.
+  Per-superblock is also what keeps it *safe*: accumulating a
+  248320-column row in int32 would overflow; per superblock the worst
+  case (Q6_K) is 66× inside the limit.
+
+Then the disassembly showed 25 `vmulss` + 17 `vcvtsi2ss` left over —
+the k-quant minimum/bias correction. That is also integer, so it
+accumulates as an int and converts once per block too.
+
+### 3. Scale decoding and dependency chains (13.29 → 14.43)
+
+`a2_scale_min_k4` was called 8× per superblock and is branchy;
+`a2_scales8` decodes all eight pairs straight-line. Q6_K built a
+`setr_epi16` scale vector per plane; now four `blend_epi32` per
+half-block. And both halves of each group were accumulating into one
+register, serialising on a VPADDD chain — split into two accumulators.
+
+### 4. Prefetch distance, tuned not guessed
+
+Weights are streamed once and never revisited, so the hardware
+prefetcher has no history at a row boundary. The first attempt
+prefetched ONE superblock ahead -- about 26 ns of work against an
+80-100 ns DRAM latency, so the line arrived long after it was needed.
+Swept the distance: 2 -> 10.7, 4 -> 11.1, 8 -> 11.6, **24 -> 12.0**,
+48 -> 11.4 tok/s. Past ~24 the prefetches start evicting each other.
+
+### 5. MADV_RANDOM was the wrong advice
+
+`gguf.c` told the kernel `MADV_RANDOM` on the weight mapping. This
+workload walks every weight of every tensor in address order, once per
+token -- the most sequential pattern there is -- and that advice
+switches readahead OFF. Now `MADV_SEQUENTIAL` + `MADV_WILLNEED`.
+
+### 6. Activation quantisation was scalar
+
+`bk_quantize_k` runs ~186 times per forward pass. At 3584 activations
+it cost **31 us a call, 7.5% of the pass**. Vectorised (including the
+amax scan) it is **6.2 us** -- 5x. Rounding is bit-identical to the
+scalar path: `_mm256_cvtps_epi32` rounds half-to-even, so the +/-0.5
+bias is added explicitly and truncation used instead.
+
+### 7. Two rows at a time
+
+The activation plane is identical for every row of a matvec, so a
+one-row kernel re-loads it `nrows` times. Two-row kernels for Q4_K,
+Q5_K and Q6_K halve that and give the out-of-order engine two
+independent chains. Four rows was tried and is **worse** (register
+pressure: Q6_K 0.094 -> 0.097 ns/weight), so it was reverted.
+
+### 8. -O3
+
+Worth ~10% on the AVX2 build and changes nothing about the i486
+guarantees (still 0 CMOV, 0 xmm/ymm, 206 MMX instructions, selects
+`mmx`).
+
+### Where the remaining gap is
+
+This is the measurement that matters, and it says the kernels are
+close to done:
+
+```
+cache-resident (1024x64):    0.111 ns/weight
+streaming     (1024x248320): 0.072-0.103 ns/weight
+```
+
+**Streaming is no slower than cache-resident.** That is an
+issue-rate signature, not a bandwidth one -- the machine sustains
+11.3 GB/s aligned / 10.3 GB/s unaligned and the model only asks for
+~5.6 GB/s. So the limit is uops per weight in the inner loop, not
+memory, and the remaining work is instruction selection.
+
+One caution learned the hard way here: an isolated-bench win does not
+always survive. A Q5_K change that improved the kernel 0.103 -> 0.086
+ns/weight made the whole model *slower* (12.9 vs 13.3 tok/s) and was
+reverted. Every kernel edit in this release was A/B'd end to end.
+
+### Isolated kernel speedups (`tests/t_kbench.c`, 1024×3584)
+
+| format | vs portable i8 |
+|---|---|
+| Q4_K | 1.94× |
+| Q5_K | 3.08× |
+| Q6_K | **4.54×** |
+| Q8_0 | 1.05× |
+
+matvec throughput went 10.4 → 23.5 GFlop/s.
+
+### These kernels are no longer bit-identical — and that is deliberate
+
+Quantising activations per 256 rather than per 32, reassociating the
+sum across lanes, and scaling before the float conversion are all
+legitimate reorderings, but they change the last bits. `t_ident` no
+longer covers the AVX2 k-quant path.
+
+`tests/t_avx2acc.c` replaces it with a measurement: relative L2 error
+against the **float reference** kernel, requiring AVX2 to be no worse
+than portable `i8` is. Measured 2.2e-03 – 8.0e-03, i8 2.8e-03 –
+5.7e-03 — same order, and Q4_K at 1024 columns is *more* accurate than
+i8. The `mmx`, `i8` and `ref` backends remain bit-identical to each
+other.
+
+### New tooling
+
+- `tests/t_kbench.c` — isolated per-format ns/weight. The whole-model
+  profile hid a 4× kernel win behind memory effects; this is what a
+  kernel edit should be judged on.
+- `tests/t_avx2acc.c` — the accuracy bound above.
+- `tests/t_thread.c` — determinism across thread counts.
+- `tests/t_avx2sat.c` — extended to the new int32 accumulator bounds.
+
+### Unchanged
+
+The i486/MMX build: 0 CMOV, 0 xmm/ymm, no thread pool, still selects
+`mmx`. All four Windows tiers still import exactly 3 XP-era DLLs with
+no post-XP APIs — the Win32 pool uses `CreateThread` and events, not
+condition variables (Vista+).
+
+## 1.19.0 — a real AVX2 backend, built around VPMADDUBSW
+
+Finding 46 said the x86 hot path had received no kernel work since
+1.14.0 and named the specific instruction that was missing. This is
+that work.
+
+**New backend `avx2`** (`src/backend_avx2.c`, ~380 lines), compiled
+into the 64-bit AVX2 builds and selected at run time.
+
+The whole idea is one instruction:
+
+| | MACs per instruction |
+|---|---|
+| `PMADDWD` (MMX) | 4 |
+| `VPMADDWD` (what GCC autovectorised i8 into) | 16 |
+| **`VPMADDUBSW`** (this kernel) | **32** |
+
+Unpacked k-quant weights are *unsigned* small integers — Q4_K 0..15,
+Q5_K 0..31, Q6_K 0..63 — and the activations are already int8. That is
+exactly the `(u8, s8)` operand pair `VPMADDUBSW` wants. GCC never finds
+it because the portable C widens to `int` before multiplying; the
+shipped 1.18.x AVX2 binary contained **zero**. This one has 8, driving
+every k-quant format.
+
+Measured on the sandbox Xeon, same binary, `--backend` forced, 20
+tokens greedy, best of 3:
+
+```
+mmx    1.81 tok/s
+i8     2.65 tok/s   (autovectorised, what 1.18.x shipped)
+avx2   3.84 tok/s   1.45x over i8
+```
+
+Per format, from the profiler:
+
+| format | i8 | avx2 | speedup |
+|---|---|---|---|
+| Q4_K | 1.560 s | 1.344 s | 1.16× |
+| Q5_K | 1.501 s | 0.868 s | **1.73×** |
+| Q6_K | 1.535 s | 0.817 s | **1.88×** |
+| matvec | 7052 Mflop/s | 10695 Mflop/s | 1.52× |
+
+Q4_K gains least: its inner loop is a plain nibble mask that GCC
+already vectorises competently. The large wins are Q5_K and Q6_K,
+where merging the separate bit-planes defeats the vectoriser but is
+a few cheap shifts and masks by hand.
+
+An earlier revision reduced each 32-weight group on the spot and got
+only 1.12× on Q4_K — the horizontal sum cost as much as the multiply.
+Accumulating all eight groups of a block and reducing them together
+with two `VPHADDD` (`hsum4x8`) recovered that.
+
+### Correctness
+
+- **Bit-identical to `i8` and `mmx`** on all four formats
+  (`tests/t_ident.c`, memcmp), and on the real model: greedy output
+  from all three backends has the same md5. Every accumulator is an
+  int32 sum of the same integer products, and the float combination is
+  performed in the same order and types as `i8_dot_*`.
+- **`tests/t_avx2sat.c`** (new) proves `VPMADDUBSW`'s saturating int16
+  cannot be reached, exhaustively rather than by argument — the VIS
+  lane-budget work (findings 29, 35) is why that distinction matters.
+  Worst case is Q6_K at 16002 of 32767, **48.8%**.
+- **Run-time gate checks the OS, not just the CPU.** AVX2 needs CPUID
+  *and* `XGETBV` confirming the OS saves `ymm` state. Windows XP never
+  did, so an XP box on Haswell silicon reports AVX2 and takes `#UD` on
+  the first VEX instruction. Without the `XGETBV` check this backend
+  would crash rather than fall back.
+- **The i486 build is untouched.** `backend_avx2.c` guards its whole
+  body on `__AVX2__`, so it compiles to nothing there: 0 CMOV,
+  0 xmm/ymm, still selects `mmx`.
+
+`auto` now tries `avx2` before the `I8_IS_VECTORISED` preference from
+finding 33. That rule was derived when the only hand-written
+alternative was MMX at 4 MACs; at 32 the hand-written kernel is ahead
+of the vectoriser again.
+
+Three new CI steps: `VPMADDUBSW` is present in the AVX2 exe and absent
+from the others, the `XGETBV` gate is compiled in, and both new tests
+run.
+
+**Not yet measured on your i7** — these are sandbox numbers, and
+finding 46 is exactly the lesson that sandbox ratios run optimistic.
+The 1.45× is against i8 in the same binary, which is a fairer
+comparison than the cross-baseline ratio that misled me last time, but
+please run the ladder again when convenient.
+
+## 1.18.3 — real-hardware numbers for the Windows ladder (they are lower)
+
+The 1.18.0 Windows binaries have now been run on actual hardware for
+the first time — an i7-9750H, six logs from one session. The ladder
+holds up; my published speedup did not.
+
+| build | bits | backend | gen tok/s | prompt tok/s | matvec Mflop/s |
+|---|---|---|---|---|---|
+| `windows.exe` | 32 | mmx | 2.152 | 3.318 | 3691 |
+| `windows-sse2.exe` | 32 | i8 | 2.421 | 3.801 | 4263 |
+| `windows64.exe` | 64 | i8 | 2.550 | 4.298 | 4863 |
+| `windows64-avx2.exe` | 64 | i8 | **2.942** | **4.831** | **5684** |
+
+Monotonic, every tier a real gain — but **1.37×** end to end, where
+1.18.0 advertised **1.80×**. The 1.80× came from my sandbox Xeon,
+whose 32-bit baseline is unusually slow (1.61 tok/s against the i7's
+2.152), which inflated every ratio measured against it. Prompt
+processing, being more compute-bound, does reach 1.46×.
+
+The release notes and `RELEASE-README.txt` now quote the measured
+i7 figures instead of the sandbox ones.
+
+**Q5_K is 0.96× on the 32-bit SSE2 build** — the one regression in the
+matrix. Finding 35 chose the Q5_K split-loop shape on the strength of a
+1.88× microbenchmark win under SSE2; on real silicon, in the whole
+model, it is a small net loss at that tier and only pays off once AVX2
+is available. Documented as finding 46, not yet changed — it wants
+re-deriving per ISA tier rather than one `#if defined(__SSE2__)`
+covering both, and that is a kernel change deserving its own release.
+
+### 1.14.0 → 1.18.1 on the default Windows build: no measurable change
+
+A 1.14.0 log from the same session, same machine, same prompt, also
+32-bit MMX:
+
+| metric | 1.14.0 | 1.18.1 | delta |
+|---|---|---|---|
+| generation tok/s | 2.133 | 2.152 | +0.89% |
+| prompt tok/s | 3.311 | 3.318 | +0.21% |
+| matvec Mflop/s | 3672.7 | 3691.1 | +0.50% |
+
+Noise on this machine is ~1%, so every delta is inside it. Stated
+plainly: **four releases produced nothing measurable for a Windows
+user on the default download.**
+
+`git diff v1.14.0` explains it without ambiguity — `backend_mmx.c` and
+`quant.c` are byte-identical to v1.14.0. The changed files are
+`backend_vis.c` (SPARC only), the `--kernel` plumbing, and the version
+string. 1.15 was SPARC, 1.16 was the Makefile, 1.17 was `--kernel`
+followed by five consecutive releases of CI repair, and 1.18.0's gains
+are only reachable by downloading a *different* binary.
+
+That is not a regression, but "no regression" was the wrong way to
+report it, and this entry corrects that. If you run the default
+`windows.exe`, 1.18.1 is 1.14.0 with a better build system. Recorded
+as finding 46, including where the effort actually went.
+
+**Both halves of the backend-selection logic are confirmed right,**
+which is worth something: `--backend i8` forced on the 32-bit build
+gives 0.48× of mmx, matching finding 37's Geode ratio; and `auto`
+correctly switches to the vectorised i8 on every tier that has SSE2.
+
+No source change. `infer` is byte-identical to 1.18.1 apart from the
+version string.
+
 ## 1.18.1 — CI: the probe now derives its compiler list from the Makefile
 
 1.18.0 added the 64-bit Windows builds, which need a **second** mingw

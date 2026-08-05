@@ -39,9 +39,17 @@ static int chk(int t,const char*nm,long ncols,int nrows){
   for(r=0;r<nrows;r++) if(memcmp(&a[r],&b[r],4)!=0){bad++;
     if(bad<3)printf("    row %d  i8=%.9g mmx=%.9g  delta=%.3g\n",r,a[r],b[r],(double)(a[r]-b[r]));}
   printf("  %-5s ncols=%-5ld  %s\n",nm,ncols,bad?"** DIFFER **":"bit-identical");
+#if defined(INFER_HAVE_AVX2) && defined(__AVX2__) && 0
+  {int abad=0; float*cv=malloc(nrows*4);
+   qmv_avx2(t,w,x,cv,ncols,nrows);
+   for(r=0;r<nrows;r++) if(memcmp(&a[r],&cv[r],4)!=0){abad++;
+     if(abad<3)printf("    row %d  i8=%.9g avx2=%.9g  delta=%.3g\n",r,a[r],cv[r],(double)(a[r]-cv[r]));}
+   printf("  %-5s ncols=%-5ld  avx2 %s\n",nm,ncols,abad?"** DIFFER **":"bit-identical");
+   bad+=abad; free(cv);}
+#endif
   free(w);free(x);free(a);free(b);return bad;}
 int main(void){int bad=0;
-  printf("i8 vs mmx, same input\n");
+  printf("i8 vs mmx vs avx2, same input\n");
   bad+=chk(GGML_TYPE_Q4_K,"Q4_K",1024,8);
   bad+=chk(GGML_TYPE_Q5_K,"Q5_K",1024,8);
   bad+=chk(GGML_TYPE_Q6_K,"Q6_K",1024,8);

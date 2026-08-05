@@ -72,7 +72,9 @@ CORE = \
 	$(SRCDIR)/gguf.c \
 	$(SRCDIR)/json.c \
 	$(SRCDIR)/util.c \
-	$(SRCDIR)/prof.c
+	$(SRCDIR)/prof.c \
+	$(SRCDIR)/tpool.c \
+	$(SRCDIR)/backend_a2stub.c
 
 # Exactly one of each is linked in. Porting to a new OS means writing
 # these two files and nothing else.
@@ -98,7 +100,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.18.1
+VERSION = 1.21.0
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -141,6 +143,18 @@ PROFSUF   =
 # than ifeq, because this Makefile must also work with Solaris
 # /usr/ccs/bin/make, which has no conditionals.
 # ---------------------------------------------------------------------
+# Threads. Rows of every matvec are split across cores; the pool is
+# ~200 lines over pthreads / Win32 and adds no library beyond -lpthread.
+# NO_THREADS=1 compiles it out entirely, which is what a 486 wants --
+# there is nothing to parallelise onto.
+NO_THREADS =
+THRFLG_    = -DINFER_HAVE_THREADS
+THRFLG_1   =
+THRLIB_    = -lpthread
+THRLIB_1   =
+USE_THRFLG = $(THRFLG_$(NO_THREADS))
+USE_THRLIB = $(THRLIB_$(NO_THREADS))
+
 NO_MMX  =
 NO_SSE2 =
 NO_AVX2 =
@@ -154,6 +168,12 @@ SSE2FLG_  = -DINFER_HAVE_SSE2
 SSE2FLG_1 =
 AVX2FLG_  = -DINFER_HAVE_AVX2
 AVX2FLG_1 =
+# backend_avx2.c guards its whole body on __AVX2__ as well, so it
+# compiles to nothing unless the ISA actually allows AVX2. It can
+# therefore be listed unconditionally: no #if in the Makefile, and the
+# i486 build is unaffected.
+AVX2SRC_  = $(SRCDIR)/backend_avx2.c
+AVX2SRC_1 =
 VISSRC_   = $(SRCDIR)/backend_vis.c
 VISFLG_   = -DINFER_HAVE_VIS
 VISSRC_1  =
@@ -163,6 +183,7 @@ USE_MMXSRC  = $(MMXSRC_$(NO_MMX))
 USE_MMXFLG  = $(MMXFLG_$(NO_MMX))
 USE_SSE2FLG = $(SSE2FLG_$(NO_SSE2))
 USE_AVX2FLG = $(AVX2FLG_$(NO_AVX2))
+USE_AVX2SRC = $(AVX2SRC_$(NO_AVX2))
 USE_VISSRC  = $(VISSRC_$(NO_VIS))
 USE_VISFLG  = $(VISFLG_$(NO_VIS))
 
@@ -190,55 +211,21 @@ SOLNATGCC_   =
 SOLNATGCC_1  = -mcpu=native
 
 # ---------------------------------------------------------------------
-# ISA level. Selects the FLOOR the compiler may target -- what it is
-# allowed to emit for ordinary portable C, which is what decides whether
-# the i8 kernel gets autovectorised (finding 33).
+# AVX2 is compiled in, NOT compiled for.
 #
-#     make windows                 i486 baseline, MMX kernel  (default)
-#     make windows ISA=sse2        Pentium 4 and later
-#     make windows BITS=64 ISA=avx2   Haswell and later
+# backend_avx2.c is the only object built with -mavx2. Everything else
+# is built at the i486 baseline, and the AVX2 code is reached through a
+# runtime gate (CPUID + XGETBV). That is the same arrangement
+# backend_mmx.c has always used, and it means ONE binary per platform:
+# it starts on a 486 and uses VPMADDUBSW on a Haswell.
 #
-# This is NOT the same as the NO_SSE2 / NO_AVX2 opt-outs above. Those
-# choose which hand-written kernels are COMPILED IN and gated at run
-# time. ISA changes the baseline for everything, so an ISA=avx2 binary
-# will fault on a CPU without AVX2 -- it is a separate download, not a
-# runtime choice.
-#
-# There is deliberately no 32-bit avx2: no 32-bit-only x86 CPU has AVX2.
-# Every AVX2-capable part (Haswell and later, AMD Excavator and later)
-# is x86-64, so a 32-bit AVX2 build would have no hardware to run on.
-#
-# On x86-64, SSE2 is part of the architecture, so ISA=sse2 and the
-# plain 64-bit build are the same compiler target; only ISA=avx2 adds
-# anything there.
-ISA        = base
-ISASUF_base =
-ISASUF_sse2 = -sse2
-ISASUF_avx2 = -avx2
-ISASUF      = $(ISASUF_$(ISA))
-
-# 32-bit: the baseline is a real choice. -mfpmath=sse matters as much
-# as -msse2 -- it moves scalar float work off the x87 stack.
-ISA32_base = -march=i486 -mtune=geode -mno-sse -mno-sse2 -mfpmath=387
-ISA32_sse2 = -march=pentium4 -mtune=generic -msse2 -mfpmath=sse
-ISA32_avx2 = -march=haswell -mtune=generic -mavx2 -mfpmath=sse -ffp-contract=off
-# 64-bit: SSE2 is guaranteed by the ABI, so `base` already has it.
-ISA64_base = -mtune=generic
-ISA64_sse2 = -mtune=generic
-# -ffp-contract=off: -march=haswell lets GCC fuse a*b+c into a single
-# vfmadd, which keeps the product at full width instead of rounding it
-# to float first. That is MORE accurate, but it makes the AVX2 build
-# generate different text from every other build. Measured: 27 vfmadd
-# in quant.c, and greedy decoding diverged at token ~8 ("It serves as
-# the nation's political, cultural and economic center" against "...
-# largest city and the seat of its government"). Neither is wrong --
-# they are different roundings of the same maths.
-#
-# Turning contraction off costs 2.83 -> 2.75 tok/s (2.8%) and makes
-# the AVX2 build byte-identical to the SSE2 and 64-bit builds. A user
-# who switches binaries to go faster and gets different answers will
-# reasonably assume the fast one is broken, so reproducibility wins.
-ISA64_avx2 = -march=haswell -mtune=generic -mavx2 -ffp-contract=off
+# There is deliberately no ISA= ladder any more. A separate -sse2 or
+# -avx2 download was a worse deal for everyone: the user had to know
+# their CPU, a wrong guess crashed with an illegal instruction, and the
+# compiler-vectorised SSE2 tier was never worth its own artifact. A
+# hand-written SSE2 backend can be added later exactly like this one --
+# a gated object, not a build flag.
+AVX2ARCH = -march=haswell -mavx2 -ffp-contract=off
 
 BITS     = 32
 BITSUF_32 =
@@ -248,11 +235,10 @@ BITSUF   = $(BITSUF_$(BITS))
 LFS_32   = -D_FILE_OFFSET_BITS=64
 LFS_64   =
 USE_LFS  = $(LFS_$(BITS))
-# The i486 baseline only means anything in a 32-bit build. Both word
-# sizes now route through the ISA table above, so `ISA=base` reproduces
-# exactly what these two lines used to say.
-ARCH_32  = $(ISA32_$(ISA))
-ARCH_64  = $(ISA64_$(ISA))
+# The i486 baseline only means anything in a 32-bit build; on x86-64
+# SSE2 is part of the ABI and cannot be switched off.
+ARCH_32  = -march=i486 -mtune=generic -mno-sse -mno-sse2 -mfpmath=387
+ARCH_64  = -mtune=generic
 BASEARCH = $(ARCH_$(BITS))
 # NATIVE replaces the baseline outright. Appending -march=native after
 # -mno-sse does NOT work: the -mno-* flags are sticky and silently
@@ -276,55 +262,51 @@ TOOLCHAIN = studio
 # that built it, so it is never a release artifact.
 #
 # Every shipped binary carries the per-stage timers. They measured at
-# the noise floor (finding: PROFILE=1 2.443-2.477 vs plain 2.430-2.466,
-# not distinguishable), and logging stays opt-in at run time via
-# --log-stages, so there is no reason to ship a second copy of each
-# variant without them. Anyone who wants the last fraction of a percent
-# can build without PROFILE=1.
+# the noise floor and logging is opt-in at run time (--log-stages), so
+# there is no reason to ship a second timer-less copy of each.
 #
-# Windows gets the full ISA ladder because Windows users download
-# binaries; Linux users generally build their own.
+# FOUR artifacts, not six. Every one is i486-baseline and carries all
+# the kernels -- mmx, avx2, i8, ref -- selected at run time after a
+# CPUID (and, for AVX2, XGETBV) probe:
 #
-#   infer-X.Y.Z-linux                 32-bit, i486 floor, mmx
-#   infer-X.Y.Z-linux64               64-bit, i8 autovectorised (SSE2)
-#   infer-X.Y.Z-windows.exe           32-bit, i486 floor, mmx  (XP)
-#   infer-X.Y.Z-windows-sse2.exe      32-bit, Pentium 4 floor
-#   infer-X.Y.Z-windows64.exe         64-bit, SSE2 by definition
-#   infer-X.Y.Z-windows64-avx2.exe    64-bit, Haswell and later
+#   infer-X.Y.Z-linux            32-bit: runs on a 486, AVX2 on Haswell
+#   infer-X.Y.Z-linux64          64-bit
+#   infer-X.Y.Z-windows.exe      32-bit: runs on XP/Geode, AVX2 on Haswell
+#   infer-X.Y.Z-windows64.exe    64-bit
 #
-# There is no 32-bit AVX2 build on purpose: every AVX2-capable x86 part
-# is 64-bit, so it would have no hardware to run on.
+# The 1.18-1.20 ISA ladder (-sse2, -avx2 downloads) is gone. It made
+# the user diagnose their own CPU, a wrong guess died with an illegal
+# instruction, and the compiler-vectorised SSE2 tier never earned its
+# artifact. A hand-written SSE2 backend, when it exists, joins the
+# runtime table like AVX2 did -- it does not become a download.
 all:
 	@$(MAKE) linux PROFILE=1
 	@$(MAKE) linux BITS=64 PROFILE=1
 	@$(MAKE) windows PROFILE=1
-	@$(MAKE) windows ISA=sse2 PROFILE=1
 	@$(MAKE) windows BITS=64 PROFILE=1
-	@$(MAKE) windows BITS=64 ISA=avx2 PROFILE=1
 
 help:
 	@echo "TARGETS"
 	@echo "  make linux              Linux/x86  -- mmx + i8 + ref"
 	@echo "  make windows            Windows/x86 (XP and later), same set"
 	@echo "  make solaris            Solaris/SPARC -- vis + i8 + ref"
-	@echo "  make all                the 6 shipped binaries"
+
+	@echo "  make all                the 4 shipped binaries"
 	@echo ""
 	@echo "Every accelerated kernel is compiled in and picked at RUN TIME"
-	@echo "after a CPUID / feature probe. ISA= is different -- it moves the"
-	@echo "compiler's BASELINE, so an ISA build only runs on that CPU."
+	@echo "after a CPUID (and for AVX2, XGETBV) probe. One binary per"
+	@echo "platform: it starts on a 486 and uses AVX2 on a Haswell."
 	@echo ""
-	@echo "SHIPPED BINARIES (make all)"
-	@echo "  infer-X.Y.Z-linux                32-bit, i486 floor, mmx"
+	@echo "SHIPPED BINARIES (make all) -- all i486-baseline, all with AVX2"
+	@echo "  infer-X.Y.Z-linux                32-bit"
 	@echo "  infer-X.Y.Z-linux64              64-bit"
-	@echo "  infer-X.Y.Z-windows.exe          32-bit, i486 floor -- XP, Geode"
-	@echo "  infer-X.Y.Z-windows-sse2.exe     32-bit, Pentium 4 and later"
-	@echo "  infer-X.Y.Z-windows64.exe        64-bit (SSE2 by definition)"
-	@echo "  infer-X.Y.Z-windows64-avx2.exe   64-bit, Haswell and later"
+	@echo "  infer-X.Y.Z-windows.exe          32-bit -- XP, Geode"
+	@echo "  infer-X.Y.Z-windows64.exe        64-bit"
 	@echo ""
 	@echo "FLAGS (combine freely)"
-	@echo "  ISA=base|sse2|avx2      compiler baseline. base = i486 on 32-bit."
-	@echo "                          No 32-bit avx2: no such CPU exists."
+
 	@echo "  PROFILE=1               per-stage timers (all shipped builds have them)"
+	@echo "  NO_THREADS=1            single-threaded; compiles the pool away"
 	@echo "  BITS=64                 64-bit build (default 32, runs on a 486)"
 	@echo "  TOOLCHAIN=gcc           build Solaris with GCC instead of Sun Studio"
 	@echo "  NATIVE=1                -march=native; runs ONLY on this machine"
@@ -363,32 +345,64 @@ help:
 # accelerating on anything with MMX. Measured cost of the i486 baseline
 # versus letting the compiler use CMOV: 0.6%, in favour of the baseline.
 
-X86FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-           $(USE_ARCH) -mmmx \
-           $(USE_MMXFLG) $(USE_SSE2FLG) $(USE_AVX2FLG)
+# The separately-compiled AVX2 object. Empty (and not built) under
+# NO_AVX2=1, in which case backend_avx2.c compiles to stubs anyway.
+A2OBJ_     = $(BUILD)/backend_avx2.o
+A2OBJ_1    =
+A2_OBJ     = $(A2OBJ_$(NO_AVX2))
+# Tells backend_a2stub.c that the real helpers are in the link, so its
+# fallbacks compile away. Set exactly when A2_OBJ is non-empty.
+A2LINK_    = -DINFER_A2_LINKED
+A2LINK_1   =
+A2_LINKED  = $(A2LINK_$(NO_AVX2))
+A2CMD_     = $(CC) $(A2FLAGS) -m$(BITS) $(USE_LFS) $(PROFFLAGS) \
+                 -I$(SRCDIR) -c -o $(BUILD)/backend_avx2.o $(SRCDIR)/backend_avx2.c
+A2CMD_1    = @true
+A2_BUILD   = $(A2CMD_$(NO_AVX2))
+A2CMDW_    = $(USE_WINCC) $(A2FLAGS) -D_WIN32_WINNT=0x0501 $(PROFFLAGS) \
+                 -I$(SRCDIR) -c -o $(BUILD)/backend_avx2.o $(SRCDIR)/backend_avx2.c
+A2CMDW_1   = @true
+A2_BUILD_WIN = $(A2CMDW_$(NO_AVX2))
 
-linux: $(CORE) $(POSIX) $(HDRS)
+# Flags for that one object: the AVX2 arch REPLACES the i486 baseline.
+A2FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
+          $(AVX2ARCH) -mmmx $(USE_MMXFLG) $(USE_SSE2FLG) $(USE_AVX2FLG) \
+          $(USE_THRFLG)
+
+X86FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
+           $(USE_ARCH) -mmmx \
+           $(USE_MMXFLG) $(USE_SSE2FLG) $(USE_AVX2FLG) $(USE_THRFLG) \
+           $(A2_LINKED)
+
+# TWO-STAGE. backend_avx2.c is compiled on its own with -mavx2 into an
+# object, then linked with everything else built at the i486 baseline.
+# Compiling it in the same command would apply -mavx2 to every file and
+# the binary would fault on a 486 before reaching main().
+linux: $(CORE) $(POSIX) $(HDRS) $(USE_AVX2SRC)
+	@mkdir -p $(BUILD)
+	$(A2_BUILD)
 	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) $(PROFFLAGS) \
-		-o $(BIN)-linux$(BITSUF)$(ISASUF)$(NATSUF)$(PROFSUF) \
-		$(CORE) $(POSIX) $(USE_MMXSRC) $(LDLIBS)
+		-o $(BIN)-linux$(BITSUF)$(NATSUF)$(PROFSUF) \
+		$(CORE) $(POSIX) $(USE_MMXSRC) $(A2_OBJ) $(LDLIBS) $(USE_THRLIB)
 
 # -D_WIN32_WINNT=0x0501 pins the Windows API surface to XP, so the
 # compiler refuses anything newer and the import table stays clean.
 # That pin is kept for the 64-bit builds too: XP x64 is 5.02, and
 # nothing in this program needs a later API.
 #
-#   make windows                     32-bit, i486 floor  -> -windows.exe
-#   make windows ISA=sse2            32-bit, P4 floor    -> -windows-sse2.exe
-#   make windows BITS=64             64-bit              -> -windows64.exe
-#   make windows BITS=64 ISA=avx2    64-bit, Haswell     -> -windows64-avx2.exe
+#   make windows            32-bit, i486 floor -> -windows.exe
+#   make windows BITS=64    64-bit              -> -windows64.exe
+# Both carry the AVX2 kernel, gated at run time.
 WINCC_32 = $(WINCC)
 WINCC_64 = $(WINCC64)
 USE_WINCC = $(WINCC_$(BITS))
 
-windows: $(CORE) $(WIN32) $(HDRS)
+windows: $(CORE) $(WIN32) $(HDRS) $(USE_AVX2SRC)
+	@mkdir -p $(BUILD)
+	$(A2_BUILD_WIN)
 	$(USE_WINCC) $(X86FLAGS) -D_WIN32_WINNT=0x0501 $(PROFFLAGS) \
-		-o $(BIN)-windows$(BITSUF)$(ISASUF)$(NATSUF)$(PROFSUF).exe \
-		$(CORE) $(WIN32) $(USE_MMXSRC) -lws2_32
+		-o $(BIN)-windows$(BITSUF)$(NATSUF)$(PROFSUF).exe \
+		$(CORE) $(WIN32) $(USE_MMXSRC) $(A2_OBJ) -lws2_32
 
 # =====================================================================
 #  SPARC / Solaris
@@ -486,7 +500,7 @@ SOLLIBS   = -lm -lsocket -lnsl
 SOL_CC_studio    = $(SUNCC)
 SOL_CC_gcc       = $(GNUCC)
 SOL_FLAGS_studio = $(SUNFLAGS) $(SOLVIS_studio$(NO_VIS))
-SOL_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+SOL_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
                    -m64 -DINFER_BIG_ENDIAN=1 $(SOLVIS_gcc$(NO_VIS)) \
 
 SOLVIS_studio    = -xarch=sparcvis -xvis
@@ -535,12 +549,13 @@ USE_FAST = $(FASTFLG_$(TOOLCHAIN)$(FAST))
 STEST_CC_studio    = $(SUNCC)
 STEST_CC_gcc       = $(GNUCC)
 STEST_FLAGS_studio = $(SUNFLAGS) $(SOLVIS_studio$(NO_VIS))
-STEST_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+STEST_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
                      -m64 -DINFER_BIG_ENDIAN=1 $(SOLVIS_gcc$(NO_VIS))
 STEST_CC    = $(STEST_CC_$(TOOLCHAIN))
 STEST_FLAGS = $(STEST_FLAGS_$(TOOLCHAIN))
 STEST_DEPS  = $(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/util.c \
-              $(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/sys_posix.c
+              $(SRCDIR)/prof.c $(SRCDIR)/gguf.c $(SRCDIR)/tpool.c \
+              $(SRCDIR)/backend_a2stub.c $(SRCDIR)/sys_posix.c
 
 solaris-test: tests/t_vis.c tests/t_viskern.c tests/t_vissat.c
 	@mkdir -p $(BUILD)
@@ -570,12 +585,12 @@ vis-shim-test: tests/t_viskern.c $(VISSRC)
 	@echo "NOTE: runs on the HOST's byte order. Checks types and"
 	@echo "      arithmetic, NOT lane order. Use solaris-test on a"
 	@echo "      big-endian machine for that. (Finding 27.)"
-	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
 		-D__SUNPRO_C=0x5150 -Itests/vis_shim \
 		-DINFER_HAVE_VIS -I$(SRCDIR) \
 		-o $(BUILD)/t_viskern_sun tests/t_viskern.c $(VISSRC) \
 		$(STEST_DEPS) -lm
-	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
+	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
 		-D__builtin_vis_fmul8x16=shim_fmul8x16 \
 		-D__builtin_vis_fpadd16=shim_fpadd16 \
 		-D__builtin_vis_fpadd32=shim_fpadd32 \
@@ -586,16 +601,37 @@ vis-shim-test: tests/t_viskern.c $(VISSRC)
 		$(STEST_DEPS) -lm
 	@echo "run: ./$(BUILD)/t_viskern_sun   then   ./$(BUILD)/t_viskern_gcc"
 
-i8-split-test: tests/t_i8split.c tests/t_q5split.c tests/t_ident.c
+i8-split-test: $(USE_AVX2SRC) tests/t_i8split.c tests/t_q5split.c tests/t_ident.c tests/t_avx2sat.c \
+               tests/t_avx2acc.c tests/t_thread.c tests/t_kbench.c
 	@mkdir -p $(BUILD)
 	$(CC) -std=gnu89 -Wall -Wextra -O2 -o $(BUILD)/t_i8split tests/t_i8split.c
 	$(CC) -std=gnu89 -Wall -Wextra -O2 -o $(BUILD)/t_q5split tests/t_q5split.c
+	$(A2_BUILD)
 	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) -I$(SRCDIR) \
 		-o $(BUILD)/t_ident tests/t_ident.c \
-		$(SRCDIR)/backend.c $(USE_MMXSRC) $(SRCDIR)/quant.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/gguf.c \
+		$(SRCDIR)/backend.c $(USE_MMXSRC) $(A2_OBJ) $(SRCDIR)/quant.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tpool.c $(SRCDIR)/gguf.c \
 		$(SRCDIR)/sys_posix.c $(LDLIBS)
+	$(CC) -std=c89 -pedantic -Wall -Wextra -O3 \
+		-o $(BUILD)/t_avx2sat tests/t_avx2sat.c
+	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) -I$(SRCDIR) \
+		-o $(BUILD)/t_avx2acc tests/t_avx2acc.c \
+		$(SRCDIR)/backend.c $(USE_MMXSRC) $(A2_OBJ) $(SRCDIR)/quant.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/gguf.c \
+		$(SRCDIR)/tpool.c $(SRCDIR)/sys_posix.c $(LDLIBS) $(USE_THRLIB)
+	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) -I$(SRCDIR) \
+		-o $(BUILD)/t_thread tests/t_thread.c \
+		$(SRCDIR)/backend.c $(USE_MMXSRC) $(A2_OBJ) $(SRCDIR)/quant.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/gguf.c \
+		$(SRCDIR)/tpool.c $(SRCDIR)/sys_posix.c $(LDLIBS) $(USE_THRLIB)
+	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) -I$(SRCDIR) \
+		-o $(BUILD)/t_kbench tests/t_kbench.c \
+		$(SRCDIR)/backend.c $(USE_MMXSRC) $(A2_OBJ) $(SRCDIR)/quant.c \
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/gguf.c \
+		$(SRCDIR)/tpool.c $(SRCDIR)/sys_posix.c $(LDLIBS) $(USE_THRLIB)
 	@echo "run: ./$(BUILD)/t_i8split  ./$(BUILD)/t_q5split  ./$(BUILD)/t_ident"
+	@echo "     ./$(BUILD)/t_avx2sat  ./$(BUILD)/t_avx2acc  ./$(BUILD)/t_thread"
+	@echo "     ./$(BUILD)/t_kbench   (timing, not pass/fail)"
 
 # =====================================================================
 #  Tests
@@ -613,37 +649,39 @@ $(BUILD):
 $(BUILD)/t_quant: tests/t_quant.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_quant.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c \
+		$(SRCDIR)/sys_posix.c $(LDLIBS)
 
 $(BUILD)/t_tokenizer: tests/t_tokenizer.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_tokenizer.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
-		$(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c $(SRCDIR)/sys_posix.c $(LDLIBS)
 
 $(BUILD)/t_engine: tests/t_engine.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_engine.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
-		$(SRCDIR)/qwen35.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/qwen35.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c $(SRCDIR)/sys_posix.c $(LDLIBS)
 
 $(BUILD)/t_backend: tests/t_backend.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_backend.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c \
+		$(SRCDIR)/sys_posix.c $(LDLIBS)
 
 # Built with the MMX backend so it inspects the real constants.
 $(BUILD)/t_align: tests/t_align.c $(MMXSRC) | $(BUILD)
 	$(CC) -std=gnu89 -Wall -O2 -mmmx -DINFER_HAVE_MMX \
 		-o $@ tests/t_align.c $(MMXSRC) \
 		$(SRCDIR)/backend.c $(SRCDIR)/quant.c $(SRCDIR)/gguf.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c $(SRCDIR)/sys_posix.c $(LDLIBS)
 
 $(BUILD)/t_jinja: tests/t_jinja.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_jinja.c \
 		$(SRCDIR)/jinja.c $(SRCDIR)/jinja_eval.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/sys_posix.c $(SRCDIR)/prof.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c $(SRCDIR)/sys_posix.c $(SRCDIR)/prof.c $(LDLIBS)
 
 # Cross-mode option behaviour: proves chat, run and serve render the
 # same messages to the same prompt, and that the tool-call parser
@@ -653,7 +691,7 @@ $(BUILD)/t_agent: tests/t_agent.c | $(BUILD)
 		$(SRCDIR)/agent.c $(SRCDIR)/opts.c $(SRCDIR)/sampler.c \
 		$(SRCDIR)/jinja.c $(SRCDIR)/jinja_eval.c \
 		$(SRCDIR)/mcp.c $(SRCDIR)/json.c $(SRCDIR)/util.c \
-		$(SRCDIR)/net_posix.c $(SRCDIR)/sys_posix.c $(SRCDIR)/tokenizer.c \
+		$(SRCDIR)/net_posix.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c $(SRCDIR)/sys_posix.c $(SRCDIR)/tokenizer.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/prof.c $(LDLIBS)
 
@@ -662,14 +700,15 @@ $(BUILD)/t_agent: tests/t_agent.c | $(BUILD)
 $(BUILD)/t_endian: tests/t_endian.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_endian.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
-		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c \
+		$(SRCDIR)/sys_posix.c $(LDLIBS)
 
 # Prompt-prefix reuse must be exactly equivalent to recomputing.
 $(BUILD)/t_cache: tests/t_cache.c | $(BUILD)
 	$(CC) $(TESTFLAGS) -o $@ tests/t_cache.c \
 		$(SRCDIR)/gguf.c $(SRCDIR)/quant.c $(SRCDIR)/backend.c \
 		$(SRCDIR)/util.c $(SRCDIR)/prof.c $(SRCDIR)/tokenizer.c \
-		$(SRCDIR)/qwen35.c $(SRCDIR)/sys_posix.c $(LDLIBS)
+		$(SRCDIR)/qwen35.c $(SRCDIR)/tpool.c $(SRCDIR)/backend_a2stub.c $(SRCDIR)/sys_posix.c $(LDLIBS)
 
 bench: $(BUILD)/t_backend
 	@echo "run: ./$(BUILD)/t_backend <model.gguf>"

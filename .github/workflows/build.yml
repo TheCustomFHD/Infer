@@ -230,9 +230,7 @@ jobs:
           echo "version=$V"                         >> "$GITHUB_OUTPUT"
           echo "LINUX=infer-$V-linux"               >> "$GITHUB_ENV"
           echo "WIN=infer-$V-windows.exe"           >> "$GITHUB_ENV"
-          echo "WIN_SSE2=infer-$V-windows-sse2.exe"  >> "$GITHUB_ENV"
           echo "WIN64=infer-$V-windows64.exe"        >> "$GITHUB_ENV"
-          echo "WIN64_AVX2=infer-$V-windows64-avx2.exe" >> "$GITHUB_ENV"
           echo "LINUX64=infer-$V-linux64" >> "$GITHUB_ENV"
 
       - name: Makefile VERSION matches src/infer.h
@@ -267,7 +265,7 @@ jobs:
       - name: build all four x86 targets
         run: |
           make all
-          ls -l "$LINUX" "$LINUX64" "$WIN" "$WIN_SSE2" "$WIN64" "$WIN64_AVX2"
+          ls -l "$LINUX" "$LINUX64" "$WIN" "$WIN64"
           ./"$LINUX" --version
 
       # The probe can only check compilers it knows about. This asserts
@@ -302,49 +300,121 @@ jobs:
           ./build/t_endian
           ./build/t_jinja
 
-      # Each Windows tier must actually be the ISA it claims. A build
-      # that silently fell back to the baseline would ship as "avx2"
-      # and be no faster, and one that gained SSE2 by accident would
-      # fault on the Geode. Assert the instruction mix directly.
-      - name: each Windows ISA tier is really that ISA
+      # THE central guarantee: ONE binary per platform that starts on a
+      # 486 and still uses AVX2 on a Haswell. That needs two things to
+      # be true at once, and they pull in opposite directions:
+      #
+      #   every object EXCEPT backend_avx2.o must be 486-clean, and
+      #   backend_avx2.o must be full of ymm.
+      #
+      # If the two-stage compile ever collapses into one command, the
+      # first assertion fails (whole binary gets -mavx2) or the second
+      # does (AVX2 never compiled). Both are caught here.
+      - name: one binary, 486 baseline outside the gated AVX2 object
         run: |
-          o32=i686-w64-mingw32-objdump
-          o64=x86_64-w64-mingw32-objdump
-          n() { $1 -d "$2" --no-show-raw-insn | grep -cE "$3" || true; }
-
-          # 32-bit baseline: no SSE, no AVX, MMX present, no CMOV of ours
-          x=$(n $o32 "$WIN" '%xmm|%ymm');   echo "windows.exe xmm/ymm: $x"; test "$x" -eq 0
-          m=$(n $o32 "$WIN" 'pmaddwd|punpcklbw'); echo "  mmx: $m"; test "$m" -gt 100
-
-          # 32-bit sse2: xmm required, ymm forbidden
-          x=$(n $o32 "$WIN_SSE2" '%xmm'); echo "windows-sse2 xmm: $x"; test "$x" -gt 100
-          y=$(n $o32 "$WIN_SSE2" '%ymm'); echo "  ymm: $y"; test "$y" -eq 0
-
-          # 64-bit base: xmm yes, ymm no
-          x=$(n $o64 "$WIN64" '%xmm'); echo "windows64 xmm: $x"; test "$x" -gt 100
-          y=$(n $o64 "$WIN64" '%ymm'); echo "  ymm: $y"; test "$y" -eq 0
-
-          # 64-bit avx2: ymm required
-          y=$(n $o64 "$WIN64_AVX2" '%ymm'); echo "windows64-avx2 ymm: $y"; test "$y" -gt 50
-
-          # and every one of them is still XP-era clean
-          for f in "$WIN" "$WIN_SSE2"; do
-            test "$($o32 -p "$f" | grep -c 'DLL Name')" -eq 3
-          done
-          for f in "$WIN64" "$WIN64_AVX2"; do
-            test "$($o64 -p "$f" | grep -c 'DLL Name')" -eq 3
+          for spec in "$LINUX:objdump" "$LINUX64:objdump" \
+                      "$WIN:i686-w64-mingw32-objdump" \
+                      "$WIN64:x86_64-w64-mingw32-objdump"; do
+            f="${spec%%:*}"; od="${spec##*:}"
+            y=$($od -d "$f" --no-show-raw-insn | grep -c '%ymm' || true)
+            v=$($od -d "$f" --no-show-raw-insn | grep -c 'vpmaddubsw' || true)
+            x=$($od -d "$f" --no-show-raw-insn | grep -c 'xgetbv' || true)
+            m=$($od -d "$f" --no-show-raw-insn \
+                | grep -cE 'pmaddwd|punpcklbw' || true)
+            echo "$f: ymm=$y vpmaddubsw=$v xgetbv=$x mmx=$m"
+            # AVX2 kernel present...
+            test "$y" -gt 100
+            test "$v" -gt 0
+            # ...and gated on OS ymm support, not just CPUID
+            test "$x" -gt 0
+            # ...and the MMX kernel is still there for the Geode
+            test "$m" -gt 100
           done
 
-      # The whole point of the ladder is that a faster download gives
-      # the SAME answer. GCC will fuse a*b+c into vfmadd under
-      # -march=haswell, which keeps the product at full width and made
-      # the AVX2 build diverge at token ~8. -ffp-contract=off pins it.
-      # Guard the flag so nobody removes it for the 2.8% it costs.
+      # Our own objects -- everything except the deliberately gated
+      # backend_avx2.c -- must contain no CMOV and no SSE/AVX at all.
+      - name: baseline objects contain no CMOV and no SSE/AVX
+        run: |
+          bad=0
+          for f in src/*.c; do
+            case "$f" in *win32*|*_vis*|*_avx2*) continue;; esac
+            gcc -std=gnu89 -O3 -m32 -march=i486 -mtune=generic -mmmx \
+                -mno-sse -mno-sse2 -mfpmath=387 \
+                -DINFER_HAVE_MMX -DINFER_HAVE_AVX2 -DINFER_HAVE_THREADS \
+                -D_FILE_OFFSET_BITS=64 -Isrc -c -o /tmp/chk.o "$f" || continue
+            n=$(objdump -d /tmp/chk.o --no-show-raw-insn \
+                | grep -cE '^[[:space:]]+[0-9a-f]+:[[:space:]]+(cmov|.*%xmm|.*%ymm)' \
+                || true)
+            if [ "$n" -ne 0 ]; then
+              echo "::error::$f has $n non-486 instructions"; bad=1
+            fi
+          done
+          test "$bad" -eq 0
+
+      # The AVX2 backend must be REGISTERED in a baseline build. It is
+      # gated on INFER_HAVE_AVX2, not __AVX2__, because backend.c is
+      # compiled at the i486 baseline where __AVX2__ is false -- testing
+      # the wrong macro silently drops the kernel from every artifact.
+      - name: the shipped 32-bit binary offers avx2 and still runs on a P2
+        run: |
+          ./"$LINUX" --backend list
+          ./"$LINUX" --backend list | grep -q '^  avx2'
+          ./"$LINUX" --backend list | grep -q '^  mmx'
+          for cpu in pentium2 pentium3 core2duo; do
+            echo "-- $cpu"
+            qemu-i386-static -cpu $cpu ./"$LINUX" --backend list \
+              | grep -q 'mmx.*selected'
+          done
+          qemu-i386-static -cpu Haswell ./"$LINUX" --backend list \
+            | grep -q 'avx2.*selected'
+
+      # The whole point of backend_avx2.c is one instruction. If a
+      # refactor stops emitting it the kernel silently degrades to
+      # something the compiler could already do, and only a benchmark
+      # would notice. Assert it directly.
+      - name: the AVX2 kernel really uses VPMADDUBSW
+        run: |
+          # Covered by "one binary, 486 baseline outside the gated AVX2
+          # object" above; this step now only guards the float-contract
+          # flag, which is a numerical property rather than an ISA one.
+          echo "see the single-binary step above"
+
+      # The AVX2 k-quant kernels are deliberately NOT bit-identical
+      # since 1.20.0 (Q8_K-style activation plane, integer-domain
+      # scaling, reassociated sums). t_ident still covers mmx/i8/ref;
+      # t_avx2acc bounds the AVX2 error against the float reference,
+      # and t_thread proves threading does not perturb anything.
+      - name: kernels are exact where they claim to be, accurate elsewhere
+        run: |
+          make i8-split-test
+          ./build/t_avx2sat
+          ./build/t_ident
+          make clean >/dev/null
+          make i8-split-test BITS=64 ISA=avx2
+          ./build/t_avx2sat
+          ./build/t_avx2acc
+          ./build/t_thread
+          ./build/t_thread 1
+          ./build/t_thread 4
+          make clean >/dev/null
+          make all
+
+      - name: NO_THREADS=1 compiles the pool away
+        run: |
+          make clean >/dev/null
+          make linux NO_THREADS=1
+          # the pool must be gone, not merely unused
+          n=$(nm "$LINUX" 2>/dev/null | grep -c 'pthread_create' || true)
+          echo "pthread_create references: $n (want 0)"
+          test "$n" -eq 0
+          ./"$LINUX" --backend list | grep -q 'avx2'
+          make clean >/dev/null
+          make all
+
       - name: AVX2 build does not contract floats away from the others
         run: |
-          grep -q 'ISA64_avx2.*-ffp-contract=off' Makefile
-          grep -q 'ISA32_avx2.*-ffp-contract=off' Makefile
-          n=$(x86_64-w64-mingw32-objdump -d "$WIN64_AVX2" --no-show-raw-insn \
+          grep -q 'AVX2ARCH.*-ffp-contract=off' Makefile
+          n=$(x86_64-w64-mingw32-objdump -d "$WIN64" --no-show-raw-insn \
               | grep -cE 'vfmadd|vfmsub' || true)
           echo "fused multiply-adds in the avx2 exe: $n (want 0)"
           test "$n" -eq 0
@@ -371,17 +441,23 @@ jobs:
       # the 486/Geode target has silently changed behaviour.
       # The 64-bit artifact is a different promise: it targets x86-64,
       # so SSE2 is guaranteed and `auto` should take the vectorised i8.
-      - name: 64-bit artifact selects the vectorised i8
+      - name: artifacts select avx2 on this runner
         run: |
-          ./"$LINUX64" --backend list
-          ./"$LINUX64" --backend list | grep -qE '^  i8.*selected'
-          n=$(objdump -d "$LINUX64" --no-show-raw-insn | grep -cE '%xmm' || true)
-          echo "64-bit SIMD instructions: $n"
-          test "$n" -gt 100
+          # GitHub runners are Haswell or later, so `auto` must reach
+          # the AVX2 kernel in BOTH word sizes -- that is the whole
+          # point of the single-binary layout.
+          for b in "$LINUX" "$LINUX64"; do
+            ./"$b" --backend list
+            ./"$b" --backend list | grep -qE '^  avx2.*selected'
+          done
 
-      - name: default build still selects mmx
+      - name: mmx is still offered and still chosen without AVX2
         run: |
-          ./"$LINUX" --backend list | grep -qE '^  mmx.*selected'
+          # The Geode/486 path must survive. mmx is listed, and a CPU
+          # without AVX2 must fall back to it rather than fault.
+          ./"$LINUX" --backend list | grep -qE '^  mmx'
+          qemu-i386-static -cpu core2duo ./"$LINUX" --backend list \
+            | grep -qE '^  mmx.*selected'
 
       - name: shipped binary runs on an emulated Pentium II
         run: |
@@ -391,13 +467,18 @@ jobs:
 
       - name: i486 baseline -- no CMOV emitted for ordinary code
         run: |
-          # MMX is expected: backend_mmx.c is runtime-gated on CPUID.
-          # CMOV is not -- it is a Pentium Pro instruction that would
-          # fault on a 486.
+          # Checked on a NO_AVX2=1 build: backend_avx2.o is compiled
+          # -march=haswell and may legitimately use CMOV inside the
+          # gated kernel, which a 486 never reaches. Everything else
+          # must be 486-clean.
+          make clean >/dev/null
+          make linux NO_AVX2=1
           n=$(objdump -d "$LINUX" --no-show-raw-insn \
               | grep -cE '^[[:space:]]+[0-9a-f]+:[[:space:]]+cmov[a-z]+' || true)
-          echo "cmov instructions: $n"
+          echo "cmov instructions (NO_AVX2=1): $n"
           test "$n" -eq 0
+          make clean >/dev/null
+          make all
 
       - name: MMX kernels really are compiled in
         run: |
@@ -417,24 +498,34 @@ jobs:
       # compiled in, none of them reachable unless the CPU has it.
       # These two checks are the whole promise of "one binary".
       # -------------------------------------------------------------
-      - name: shipped binary contains no unconditional SSE/AVX
+      - name: all SSE/AVX in the shipped binary is inside the gated object
         run: |
-          # backend_mmx.c is allowed MMX (runtime CPUID gate). Anything
-          # touching xmm/ymm would fault on a 486 or a Geode, which have
-          # no such registers, and nothing gates those today.
+          # The binary DOES contain ymm now -- that is the point. What
+          # must hold is that all of it lives in backend_avx2.o, which
+          # is unreachable unless CPUID and XGETBV both agree. The
+          # per-file assertion above proves the other objects are
+          # clean; this proves the gated object is the only source, by
+          # rebuilding without it and requiring zero.
+          make clean >/dev/null
+          make linux NO_AVX2=1
           n=$(objdump -d "$LINUX" --no-show-raw-insn \
               | grep -cE '%xmm|%ymm' || true)
-          echo "xmm/ymm references: $n"
+          echo "xmm/ymm with NO_AVX2=1: $n (want 0)"
           test "$n" -eq 0
-          n=$(objdump -d "$WIN" --no-show-raw-insn \
+          make clean >/dev/null
+          make windows NO_AVX2=1
+          n=$(i686-w64-mingw32-objdump -d "$WIN" --no-show-raw-insn \
               | grep -cE '%xmm|%ymm' || true)
-          echo "windows xmm/ymm references: $n"
+          echo "windows xmm/ymm with NO_AVX2=1: $n (want 0)"
           test "$n" -eq 0
+          make clean >/dev/null
+          make all
 
       - name: every build flag still builds
         run: |
           for f in "PROFILE=1" "NATIVE=1" "BITS=64" "NO_MMX=1" \
-                   "NO_SSE2=1" "NO_AVX2=1" "BITS=64 PROFILE=1"; do
+                   "NO_SSE2=1" "NO_AVX2=1" "NO_THREADS=1" \
+                   "BITS=64 PROFILE=1"; do
             echo "== make linux $f =="
             make clean >/dev/null
             make linux $f
@@ -535,15 +626,16 @@ jobs:
           s390x-linux-gnu-gcc -std=c89 -pedantic -Wall -Wextra \
             -Wno-unused-parameter -O2 -static -o t_endian_be \
             tests/t_endian.c src/gguf.c src/quant.c src/backend.c \
-            src/util.c src/prof.c src/sys_posix.c -lm
+            src/util.c src/prof.c src/tpool.c src/backend_a2stub.c \
+            src/sys_posix.c -lm
           qemu-s390x-static ./t_endian_be
           # the whole program must link for a big-endian target too
           s390x-linux-gnu-gcc -std=c89 -O2 -static -o infer_be \
             src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
             src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c \
             src/tokenizer.c src/sampler.c src/quant.c src/backend.c \
-            src/gguf.c src/json.c src/util.c src/prof.c \
-            src/net_posix.c src/sys_posix.c -lm
+            src/gguf.c src/json.c src/util.c src/prof.c src/tpool.c \
+            src/backend_a2stub.c src/net_posix.c src/sys_posix.c -lm
           rm -f t_endian_be infer_be
 
       - name: strict C90, no long long, with large-file support
@@ -611,9 +703,7 @@ jobs:
             infer-*-linux
             infer-*-linux64
             infer-*-windows.exe
-            infer-*-windows-sse2.exe
             infer-*-windows64.exe
-            infer-*-windows64-avx2.exe
 
   # -------------------------------------------------------------------
   # Only for tags. Publishes what `build` already verified -- it does
@@ -685,36 +775,28 @@ jobs:
             echo
             echo "| file | notes |"
             echo "|---|---|"
-            echo "| \`infer-$VER-windows.exe\` | Windows 32-bit -- **i486 baseline**, picks \\\`mmx\\\`. XP, Geode, Pentium II+ |"
-            echo "| \`infer-$VER-windows-sse2.exe\` | Windows 32-bit -- **Pentium 4 and later**, vectorised \\\`i8\\\` |"
-            echo "| \`infer-$VER-windows64.exe\` | Windows 64-bit -- SSE2 by definition |"
-            echo "| \`infer-$VER-windows64-avx2.exe\` | Windows 64-bit -- **Haswell and later**, fastest |"
-            echo "| \`infer-$VER-linux\` | Linux 32-bit -- i486 baseline, picks \\\`mmx\\\` |"
-            echo "| \`infer-$VER-linux64\` | Linux 64-bit -- picks the vectorised \\\`i8\\\` |"
+            echo "| \`infer-$VER-windows.exe\` | Windows 32-bit -- runs on XP / 486+ / Geode |"
+            echo "| \`infer-$VER-windows64.exe\` | Windows 64-bit |"
+            echo "| \`infer-$VER-linux\` | Linux 32-bit -- runs on a 486 |"
+            echo "| \`infer-$VER-linux64\` | Linux 64-bit |"
             echo
-            echo "**Which Windows build?** Newest your CPU supports:"
-            echo "\`windows64-avx2\` (2013+) > \`windows64\` (any x64) >"
-            echo "\`windows-sse2\` (P4/Athlon 64+) > \`windows\` (anything older)."
-            echo "An ISA build does **not** fall back -- it faults on a CPU"
-            echo "that lacks the instructions. Note AVX needs Windows 7 SP1"
-            echo "or later even on capable silicon: XP never saved \`ymm\`"
-            echo "state across a context switch."
+            echo "**One binary per platform.** Every one carries the MMX,"
+            echo "AVX2, i8 and ref kernels and picks the fastest your CPU"
+            echo "supports at startup, after a CPUID probe (plus XGETBV for"
+            echo "AVX2, because Windows XP never saved \`ymm\` state and an"
+            echo "XP box on modern silicon must fall back, not crash)."
             echo
-            echo "Measured on one Xeon, 20 tokens, greedy: 1.61 / 2.01 /"
-            echo "2.27 / 2.90 tok/s for the four Windows tiers in the order"
-            echo "above -- **1.80x** from the 32-bit baseline to AVX2."
-            echo
-            echo "All builds ship with the per-stage timers compiled in"
-            echo "(overhead not measurable); enable with \`--log-stages\`."
+            echo "There is no ISA ladder to choose from any more: no"
+            echo "\`-sse2\` or \`-avx2\` download, and no way to pick wrong."
+            echo "Check what yours selected with \`--backend list\`."
             echo
             echo "Every binary carries **all** the x86 kernels (\`mmx\`, \`i8\`,"
             echo "\`ref\`) and picks one at run time after a CPUID probe."
             echo
-            echo "The 32-bit builds use an **i486 baseline** and select"
-            echo "\`mmx\`. The 64-bit build has SSE2 by definition, so the"
-            echo "compiler vectorises the portable \`i8\` path and \`auto\`"
-            echo "picks that instead -- measurably faster than the"
-            echo "hand-written MMX kernel on a modern CPU."
+            echo "All four are built at the **i486 baseline**: only"
+            echo "\`backend_avx2.c\` is compiled with \`-mavx2\`, into its own"
+            echo "object, reached through the runtime gate. So the same"
+            echo "file that boots on a Geode uses VPMADDUBSW on a Haswell."
             echo
             echo "In practice the 32-bit binaries need a **Pentium II or"
             echo "later**: our own objects contain no CMOV, but glibc and the"

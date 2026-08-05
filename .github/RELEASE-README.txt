@@ -1,53 +1,46 @@
 infer -- prebuilt binaries
 ===========================
 
-Six binaries. Windows gets a four-step ISA ladder because Windows
-users download binaries; Linux users generally build their own.
+Four binaries. One per platform and word size -- there is nothing to
+choose between, and no way to pick the wrong one.
 
-  infer-<version>-windows.exe          32-bit, i486 floor -- XP, Geode
-  infer-<version>-windows-sse2.exe     32-bit, Pentium 4 and later
-  infer-<version>-windows64.exe        64-bit, any x64
-  infer-<version>-windows64-avx2.exe   64-bit, Haswell (2013) and later
-
-  infer-<version>-linux                32-bit, i486 floor
-  infer-<version>-linux64              64-bit
+  infer-<version>-windows.exe    Windows, 32-bit  (XP, 486+, Geode)
+  infer-<version>-windows64.exe  Windows, 64-bit
+  infer-<version>-linux          Linux, 32-bit    (486+)
+  infer-<version>-linux64        Linux, 64-bit
 
 
-WHICH WINDOWS BUILD?
---------------------
+ONE BINARY, EVERY KERNEL
+------------------------
 
-Take the newest your CPU supports:
+Each of the four is compiled at the i486 baseline and contains all of
 
-  windows64-avx2   Core i-series 4xxx / Ryzen and later   fastest
-  windows64        any 64-bit x86
-  windows-sse2     Pentium 4, Athlon 64 and later
-  windows          anything older, incl. 486 + MMX and Geode
+  avx2  AVX2 VPMADDUBSW inner loop      (Haswell 2013 and later)
+  mmx   MMX PMADDWD inner loop          (Pentium MMX / K6 / Geode+)
+  i8    integer kernels, portable C
+  ref   scalar float reference          (runs on a bare 486)
 
-These do NOT fall back. An avx2 binary faults with an illegal
-instruction on a CPU without AVX2 -- that is the cost of a build
-with no runtime check in the hot loop.
+and picks the fastest your CPU supports at startup. Only
+backend_avx2.c is built with -mavx2, into its own object, reached
+through a runtime gate -- so the same executable that starts on a
+Geode uses AVX2 on a modern chip.
 
-Two caveats worth knowing:
+The AVX2 gate checks CPUID *and* XGETBV. Windows XP never saved the
+ymm registers across a context switch, so an XP machine on Haswell
+silicon reports AVX2 and cannot use it; checking only CPUID would
+crash there instead of falling back to MMX.
 
-  * AVX needs Windows 7 SP1 or later even on capable silicon.
-    Windows XP never saved the ymm registers across a context
-    switch, so the avx2 build is not an XP build.
-  * Only the plain `windows.exe` targets the i486 baseline. It is
-    the one to use on a Geode, and the only one we claim runs on
-    period hardware.
+See what yours chose:
 
-Measured on one Xeon, 20 tokens, greedy decoding:
+  infer-<version>-windows.exe --backend list
 
-  windows        1.61 tok/s
-  windows-sse2   2.01 tok/s   1.25x
-  windows64      2.27 tok/s   1.41x
-  windows64-avx2 2.90 tok/s   1.80x
-
-Your hardware will differ; the ordering should not.
+Earlier releases shipped a -sse2 and a -avx2 download. That is gone:
+it made you diagnose your own CPU, and a wrong guess died with an
+illegal instruction instead of running slower.
 
 
-ALL SIX CONTAIN ALL THREE BACKENDS
-----------------------------------
+WHICH BACKEND WILL I GET?
+-------------------------
 
   mmx   integer kernels with an MMX inner loop  (~2x faster)
   i8    integer kernels, portable C
