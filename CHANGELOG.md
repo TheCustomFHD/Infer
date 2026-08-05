@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.17.5 — CI: the probe now compiles what the build compiles
+
+1.17.4 worked: the toolchains installed, and steps 1–9 passed for the
+first time in five runs. Run #34 then failed at step 10, `make all`,
+exit code 2 — and the step *before* it had just declared
+`x86_32: yes`.
+
+Both faults are mine, and they are the same fault twice.
+
+**The probe was easier than the real build.** It compiled
+`int main(void){return 0;}`. That needs no kernel headers, so it links
+happily in an environment where `asm/errno.h` is missing — which is
+precisely the environment finding 41 describes. `src/net_posix.c`
+includes `<errno.h>`, needs those headers, and dies. Reproduced
+exactly by hiding the i386 headers:
+
+```
+$ cc -m32 hello.c            # links fine -> probe says "x86_32: yes"
+$ cc -m32 uses_errno_h.c
+/usr/include/linux/errno.h:1:10: fatal error: asm/errno.h: No such file
+```
+
+A capability check that is weaker than the thing it gates is not a
+check. The probe now compiles the headers `net_posix.c` actually uses
+(`errno.h`, `sys/socket.h`, `netinet/in.h`, `arpa/inet.h`), and mingw
+gets the `winsock2.h`/`ws2tcpip.h` equivalent. Verified both ways: it
+passes on a healthy runner, and on a runner with the i386 headers
+removed it fails at the probe with the compiler's own error and a
+sentence naming `linux-libc-dev:i386`.
+
+**Finding 41 came back, because Ubuntu is not Debian.** There,
+`linux-libc-dev` is `Architecture: all`; on Ubuntu it is arch-qualified
+(`amd64`, `i386`). `libc6-dev-sparc64-cross` depends on
+`linux-libc-dev-sparc64-cross`, and satisfying the cross libcs can
+replace the shared `linux-libc-dev` and drop the i386 headers with it.
+apt is behaving correctly — nothing in that transaction said i386 was
+needed. 1.17.4 installed the optional cross toolchains *after* the
+required set, so it re-opened the exact hole 1.17.3 closed.
+
+Now `linux-libc-dev:i386` is named explicitly and re-asserted **after**
+the cross toolchains, so the 32-bit headers are a stated property of
+the final state rather than a survivor of dependency resolution.
+
+No source change. `infer` is byte-identical to 1.17.4 apart from the
+version string.
+
 ## 1.17.4 — CI: a failed toolchain install can no longer report success
 
 Run #32 failed at "confirm the win32 (not posix) mingw variant" with

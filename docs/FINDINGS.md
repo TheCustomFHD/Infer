@@ -1474,6 +1474,64 @@ step that caused it — or it is optional, and it must be attempted
 *individually* so its absence cannot take down anything else. A green
 step that installed nothing is worse than a red one.
 
+## 43. A probe must be at least as hard as the build it gates
+
+Finding 42's fix worked — toolchains installed, steps 1–9 green for the
+first time in five runs. Run #34 then died at step 10 (`make all`,
+exit 2), one step after the probe reported `x86_32: yes`.
+
+The probe compiled this:
+
+```c
+int main(void){return 0;}
+```
+
+which needs **no kernel headers at all**. Meanwhile `src/net_posix.c`
+includes `<errno.h>`, which reaches `<asm/errno.h>`. Demonstrated by
+hiding the i386 kernel headers and running both:
+
+```
+$ cc -m32 trivial.c        -> links fine        ("x86_32: yes")
+$ cc -m32 includes_errno.c -> fatal error: asm/errno.h: No such file
+```
+
+So the probe certified a toolchain that could not build the project.
+Every guarantee downstream was gated on a test weaker than the thing it
+was protecting.
+
+**And the cause of the missing headers was finding 41, returning,
+because Ubuntu is not Debian.**
+
+| | Debian | Ubuntu |
+|---|---|---|
+| `linux-libc-dev` | `Architecture: all` | arch-qualified: `amd64`, `i386` |
+
+`libc6-dev-sparc64-cross` → depends on `linux-libc-dev-sparc64-cross`.
+Resolving the cross libcs can replace the shared `linux-libc-dev` and
+take the i386 headers with it. apt is not misbehaving: no package in
+that transaction declared it needed i386. 1.17.4 installed the optional
+cross toolchains *after* the required set — reopening the hole 1.17.3
+had closed. This is why the bug is Ubuntu-only and never reproduced on
+the Debian sandbox.
+
+Two fixes:
+
+1. The probe compiles the headers `net_posix.c` really uses
+   (`errno.h`, `sys/socket.h`, `netinet/in.h`, `arpa/inet.h`); mingw
+   gets `winsock2.h`/`ws2tcpip.h`. Verified in **both** states — passes
+   healthy, and with the i386 headers removed it fails *at the probe*,
+   printing the compiler's own error and naming `linux-libc-dev:i386`.
+2. `linux-libc-dev:i386` is named explicitly and re-asserted **after**
+   the cross toolchains, making the 32-bit headers a stated property of
+   the final state rather than a survivor of dependency resolution.
+
+**The rule:** a capability probe must exercise the same headers,
+flags and libraries as the build it authorises. If the probe is easier
+than the build, it converts a clear failure at the right step into a
+confusing one several steps later. And when guarding against a package
+manager, assert the end state *after* every package operation — not
+once at the beginning.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

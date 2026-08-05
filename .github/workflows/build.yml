@@ -97,6 +97,17 @@ jobs:
       # Best-effort, and genuinely optional: SPARC and s390x only widen
       # coverage. Installed individually so one missing package cannot
       # take the others down with it.
+      #
+      # On Ubuntu `linux-libc-dev` is arch-qualified (amd64/i386), not
+      # `Architecture: all` as on Debian. The sparc64/s390x cross libcs
+      # depend on their own linux-libc-dev-*-cross, and satisfying them
+      # can upgrade or replace the shared `linux-libc-dev`, taking the
+      # i386 headers with it -- finding 41 all over again. apt is not
+      # wrong: nothing in that transaction declared it needed i386.
+      #
+      # So we name `linux-libc-dev:i386` explicitly, and re-assert it
+      # AFTER the cross toolchains, so the i386 headers are a stated
+      # requirement of the final state rather than a leftover.
       - name: install toolchains (optional cross targets)
         run: |
           for p in gcc-sparc64-linux-gnu libc6-dev-sparc64-cross \
@@ -107,6 +118,12 @@ jobs:
               echo "::warning::$p unavailable -- its target will be skipped"
             fi
           done
+          # Re-assert the 32-bit headers. If a cross package displaced
+          # them this puts them back; if not, this is a no-op.
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            linux-libc-dev:i386 libc6-dev-i386
 
       # Prove each target can actually compile before any step relies on
       # it. A capability check fails in one place, with one message,
@@ -122,24 +139,54 @@ jobs:
       - name: probe which targets are usable
         id: probe
         run: |
-          printf 'int main(void){return 0;}\n' > /tmp/p.c
+          # The probe must compile what the PROJECT compiles, not
+          # `int main(void){return 0;}`. Run #34 proved why: a trivial
+          # program needs no kernel headers, so it links happily while
+          # `asm/errno.h` is missing, the probe reports "x86_32: yes",
+          # and `make all` then dies on src/net_posix.c. A capability
+          # check that is easier than the real build is not a check.
+          #
+          # net_posix.c is the file that has actually broken twice, so
+          # the probe pulls the same headers it does.
+          cat > /tmp/p.c <<'EOF'
+          #include <stdio.h>
+          #include <errno.h>
+          #include <sys/types.h>
+          #include <sys/socket.h>
+          #include <netinet/in.h>
+          #include <arpa/inet.h>
+          int main(void){ return (int)sizeof(struct sockaddr_in) * 0; }
+          EOF
+          # mingw has no POSIX sockets; give it the winsock equivalent.
+          cat > /tmp/pw.c <<'EOF'
+          #include <stdio.h>
+          #include <winsock2.h>
+          #include <ws2tcpip.h>
+          int main(void){ return (int)sizeof(struct sockaddr_in) * 0; }
+          EOF
           ok() { echo "$1=yes" >> "$GITHUB_OUTPUT"; echo "  $1: yes"; }
           no() { echo "$1=no"  >> "$GITHUB_OUTPUT"; echo "::warning::$1 unavailable"; }
 
           req=0
-          if cc -m32 -o /tmp/p32 /tmp/p.c 2>/tmp/e32; then ok x86_32; else
-            echo "::error::x86_32 unusable -- 'cc -m32' cannot build a"\
-                 "hello world. gcc-multilib/libc6-dev-i386 did not install."
+          if cc -m32 -D_FILE_OFFSET_BITS=64 -o /tmp/p32 /tmp/p.c 2>/tmp/e32; then
+            ok x86_32
+          else
+            echo "::error::x86_32 unusable -- 'cc -m32' cannot compile the"\
+                 "system headers src/net_posix.c needs. The 32-bit kernel"\
+                 "headers (linux-libc-dev:i386) or libc6-dev-i386 are missing."
             sed 's/^/    /' /tmp/e32; req=1
           fi
-          if i686-w64-mingw32-gcc -o /tmp/p.exe /tmp/p.c 2>/tmp/ewin; then ok win32; else
+          if i686-w64-mingw32-gcc -o /tmp/p.exe /tmp/pw.c 2>/tmp/ewin; then
+            ok win32
+          else
             echo "::error::win32 unusable -- i686-w64-mingw32-gcc cannot"\
-                 "build a hello world. gcc-mingw-w64-i686-win32 did not install."
+                 "compile the winsock headers src/net_win32.c needs."
             sed 's/^/    /' /tmp/ewin; req=1
           fi
           if [ "$req" -ne 0 ]; then
-            echo "::error::Required toolchains are missing. Stopping here"\
-                 "rather than failing later with a misleading error."
+            echo "::error::Required toolchains are missing or incomplete."\
+                 "Stopping here rather than failing later in 'make all'"\
+                 "with an error that points at the wrong component."
             exit 1
           fi
 
