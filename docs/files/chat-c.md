@@ -1,6 +1,6 @@
 # `src/chat.c` — interactive multi-turn chat
 
-**~400 lines.** The `infer chat` REPL: conversation state, the command
+**~480 lines total.** The `infer chat` REPL: conversation state, the command
 set, streaming, and the turn loop.
 
 Prompt rendering and tool calling moved to [`agent.c`](agent-c.md), which

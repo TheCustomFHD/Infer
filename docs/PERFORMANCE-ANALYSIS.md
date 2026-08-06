@@ -19,22 +19,37 @@ section below is measured on a Xeon @ 2.60 GHz.
 | `i8` | 33.29 | 21.8 | **at its floor** |
 | `ref` | ~90 | — | reference only |
 
-**Modern x86, single core, generation tok/s (Xeon @ 2.60 GHz):**
+**Modern x86, generation tok/s (Xeon @ 2.60 GHz, 64-bit build):**
 
-| backend | tok/s | bound by |
-|---|---|---|
-| `avx2` | 14.5 | memory — ~71% of the streaming ceiling |
-| `mmx` | 3.2 | instructions — only ~14% of bandwidth used |
-| `i8` (64-bit, vectorised) | ~12.8 | memory |
+| backend | 1 thread | 2 threads | bound by |
+|---|---|---|---|
+| `avx2` | 14.1 | **22.2** | memory — ~67% of the single-core streaming ceiling |
+| `i8` (vectorised) | 3.5 | — | memory |
+| `mmx` | 3.3 | — | instructions — only ~14% of bandwidth used |
+| `ref` | 1.1 | — | reference only |
+
+The single-core ceiling is hard: 520 MB moves per token against a
+measured 11.3 GB/s single-core streaming read, i.e. **21.7 tok/s**. At
+14.1 we use 7.5 GB/s. Two threads reach 20.9 GB/s aggregate, which is
+why `-T 2` scales nearly linearly while the kernel work does not.
 
 The two paths are limited by different things, which is why they need
 different work:
 
-- **AVX2 is memory-bound.** 6.35 → 14.5 tok/s over 1.19–1.21 came from
+- **AVX2 is memory-bound.** 6.35 → 14.5 tok/s over 1.19–1.22 came from
   threading, adopting llama.cpp's kernel shape (Q8_K-style activation
   plane, integer-domain scaling, one float convert per superblock),
-  prefetch distance tuning, and vectorising the activation quantiser
-  and the DeltaNet recurrence. Further gains need fewer *bytes*.
+  prefetch distance tuning, vectorising the activation quantiser and
+  the DeltaNet recurrence, and finally a word-parallel scale decode
+  that was worth more than the arithmetic it fed (finding 53). Further
+  single-core gains need fewer *bytes*.
+- **Multi-core was left on the table until 1.23.0.** The kernels were
+  fast enough that the thread pool's own condition-variable barrier —
+  44-48 us, about 95 times per token — had become the bottleneck: two
+  cores ran at 159% CPU. Spinning before blocking took `-T 2` from
+  17.25 to 22.16 tok/s (finding 54). The lesson generalises: once the
+  work per parallel region shrinks, the synchronisation that guards it
+  has to shrink too.
 - **MMX is instruction-bound.** `Q4_K` runs at **1.19 MMX instructions
   per weight**, and six of its nineteen per sixteen weights are
   `PUNPCK` widening that exists only because `PMADDWD` consumes words.
@@ -343,9 +358,21 @@ Nothing in the kernels. What remains changes the workload:
 1. **A smaller model or quantisation.** The only lever with a multiple
    in it. `Q4_K_S` cuts bytes ~10%; a 0.4B-class model roughly halves
    everything.
-2. **Batched prompt ingestion.** Untouched. Affects time-to-first-token
-   only (currently 3.1 min), but every prompt token presently re-unpacks
-   the entire model. Plausibly several-fold on TTFT.
-3. **Requantising `token_embd`** from Q6_K to Q4_K. The LM head is
-   **18.1%** of runtime in only 11 calls, and that one tensor is 199 MB
-   (40% of the file). Saves 63 MB of RAM as well.
+2. **Batched prompt ingestion.** Untouched. Every prompt token
+   re-unpacks the entire model, so this affects time-to-first-token
+   only. On the Geode that was minutes; on the Xeon prompt ingestion
+   currently runs at ~21.7 tok/s against ~14.1 tok/s for generation.
+3. **Requantising the LM head** (`output.weight`) from Q6_K to Q4_K.
+   It is **27.4%** of the forward pass in only ~0.7 calls per token
+   (one per generated token, none per prompt token), and the tensor is
+   **208.6 MB** (198.9 MiB) — 39% of the file, and 27.6% of
+   the ~520 MB streamed per generated token. Q4_K would make it
+   143.0 MB, saving 65.6 MB per pass. It changes the output distribution, so it is a different
+   model, not an optimisation.
+4. **Vocabulary pruning.** 248,320 tokens is most of why the LM head is
+   so large. Cutting to ~32k would take ~8x off it, but it is
+   deployment-specific and changes what the model can emit.
+
+Both 3 and 4 are the only routes to the MMX target (4.5-7 tok/s) that
+the kernel work cannot reach: perfect MMX kernels top out around 1.37x
+of today, i.e. ~4.35 tok/s.

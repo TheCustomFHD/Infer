@@ -101,10 +101,12 @@ My name is **Ada**. 😊
 | `/history` | show the conversation |
 | `/system <text>` | set or replace the system prompt |
 | `/think on\|off` | toggle the model's reasoning block |
+| `/raw on\|off` | bypass the chat template mid-session |
 | `/tools` | list MCP tools |
 | `/prompt` | print the exact rendered prompt |
 | `/stats` | messages and prompt tokens vs context |
 | `/perf` | speed of the session so far (needs `--log-perf`) |
+| `/set` | show the options in effect, under their command-line names |
 | `/quit`, `/exit` | leave |
 
 ### Options
@@ -355,15 +357,35 @@ infer run model.gguf -p "hi" -T 0       # one thread per logical CPU
 across cores. Rows are independent, so **the result is bit-identical
 at any thread count** — no partial sum ever crosses a thread.
 
-It is opt-in for two reasons. It is a throughput trade rather than a
-free win: this workload streams the whole model once per token, and on
-a 2-core machine the memory bus was already saturated at one thread
-(14.48 → 14.41 tok/s, i.e. nothing). And a default that quietly uses
-every core is the wrong default for the hardware this project targets.
+It stays opt-in because a default that quietly uses every core is the
+wrong default for the hardware this project targets — but since
+1.23.0 it is worth switching on. Measured on a 2-core Xeon,
+Qwen3.5-0.8B-Q4_K_M, 40 tokens greedy:
 
-More cores help most when memory bandwidth is not the limit — a
-6-core desktop with fast RAM will scale further than a 2-core laptop.
-Measure with `--log-perf` rather than assuming.
+| threads | 1.22.0 | 1.23.0 |
+|---|---|---|
+| `-T 1` | 13.99 tok/s | 14.12 tok/s |
+| `-T 2` | 17.25 tok/s | **22.16 tok/s** |
+
+Before 1.23.0 the thread pool woke and slept its workers through a
+condition variable on every one of the ~95 parallel regions per token,
+costing about 44 us each; the process sat at 159% CPU on two cores
+instead of ~200%. It now spins briefly before blocking.
+
+**Asking for more threads than you have cores does not help.** The
+pool detects that case and goes back to blocking, so it costs nothing,
+but the work is memory-bound and extra threads have nothing to do:
+
+```
+-T 2   22.2 tok/s      (2 physical cores)
+-T 4   18.2 tok/s
+-T 8   17.2 tok/s
+```
+
+More cores help most when memory bandwidth is not the limit. This
+workload streams the whole model once per token — about 520 MB — so
+the ceiling is your RAM, not your CPU. Measure with `--log-perf`
+rather than assuming.
 
 ---
 
@@ -423,8 +445,61 @@ infer run model.gguf -p "..." -n 10 -t 0 --log-perf
   total       : 6.81 s
 ```
 
-`--log-file perf.txt` writes to a file. For a per-stage breakdown build
-`make profile` (or `profile-geode`) — see [PROFILING.md](PROFILING.md).
+`--log-file perf.txt` writes to a file instead of stderr.
+
+### Per-stage breakdown
+
+`--log-stages` prints where the time went inside each forward pass:
+
+```sh
+infer run model.gguf -p "..." -n 40 -t 0 --log-stages
+```
+
+```
+stage                       seconds       %     calls  us/call
+TOTAL forward pass            3.638  100.0%        58  62718.2
+  embedding lookup            0.000    0.0%        58      5.1
+  attention layers (6)        0.227    6.3%       348    653.3
+  delta-net layers (18)       1.179   32.4%      1044   1128.9
+    input projections         0.714   19.6%      1044    684.2
+    causal conv + SiLU        0.071    2.0%      1044     68.2
+    state recurrence          0.173    4.7%      1044    165.4
+    output projection         0.214    5.9%      1044    205.0
+  feed-forward (24)           1.229   33.8%      1392    882.9
+  rms norms                   0.006    0.2%      2784      2.1
+  lm head                     0.995   27.4%        41  24277.7
+```
+
+This needs a build with `-DINFER_PROFILE`. **Every shipped binary has
+it**, so the released downloads work as-is; a build you made with
+plain `make linux` also has it only if you passed `PROFILE=1`. A build
+without it prints a note saying so rather than silently showing
+nothing. There is no `make profile` target — it is a flag:
+`make linux PROFILE=1`. See [PROFILING.md](PROFILING.md).
+
+### Choosing kernels per weight format
+
+`--kernel` pins a specific backend to one weight format, and
+`--kernel bench` measures every combination on this machine and picks
+the winners:
+
+```sh
+infer --kernel list             # show the current assignment
+infer --kernel bench -v         # time them all here, no model needed
+infer --kernel q6k=i8 run model.gguf -p "..."
+```
+
+Mixing the integer kernels (`i8`, `mmx`, `vis`) is purely a speed
+choice — they are bit-identical. Pinning `avx2` for a k-quant format
+changes that format's rounding slightly; see section 8.
+
+### Other diagnostics
+
+```sh
+infer --version                 # version string, then exit
+infer -v run model.gguf -p hi   # --verbose: load progress, chosen backend,
+                                # thread count, and each request in serve
+```
 
 Reference numbers:
 

@@ -1,6 +1,6 @@
 # `src/qwen35.c` — the inference engine
 
-**~825 lines.** Implements the `qwen35` architecture. This is the file
+**~950 lines.** Implements the `qwen35` architecture. This is the file
 that had to be written from the model's actual structure rather than
 from a generic transformer template.
 

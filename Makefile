@@ -100,7 +100,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.22.0
+VERSION = 1.23.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -287,7 +287,7 @@ all:
 
 help:
 	@echo "TARGETS"
-	@echo "  make linux              Linux/x86  -- mmx + i8 + ref"
+	@echo "  make linux              Linux/x86  -- avx2 + mmx + i8 + ref"
 	@echo "  make windows            Windows/x86 (XP and later), same set"
 	@echo "  make solaris            Solaris/SPARC -- vis + i8 + ref"
 
@@ -318,10 +318,10 @@ help:
 	@echo "  make solaris TOOLCHAIN=gcc NO_VIS=1"
 	@echo ""
 	@echo "TESTS"
-	@echo "  make test               full suite (needs a model for some)"
+	@echo "  make test               9 test programs (some need a model)"
 	@echo "  make i8-split-test      i8 Q4_K exactness, any host, no model"
 	@echo "  make vis-shim-test      VIS kernels vs i8 on any host"
-	@echo "  make solaris-vis-test   VIS assumptions, on the real machine"
+	@echo "  make solaris-test       VIS assumptions, on the real machine"
 
 
 # =====================================================================
@@ -335,15 +335,18 @@ help:
 #   -march=i486      BASELINE. Nothing newer than a 486 is emitted for
 #                    ordinary code -- in particular no CMOV, which is a
 #                    Pentium Pro instruction and faults on a 486.
-#   -mtune=geode     SCHEDULING only. Reorders instructions for the
-#                    Geode pipeline; never changes the instruction set.
+#   -mtune=generic   SCHEDULING only; never changes the instruction
+#                    set. It was -mtune=geode until the 64-bit targets
+#                    arrived and needed one shared value; generic
+#                    measured the same on Geode and better elsewhere.
 #   -mmmx            lets the compiler use MMX *inside backend_mmx.c*,
 #                    which is guarded by a runtime CPUID check.
 #   -DINFER_HAVE_MMX compiles that backend in and registers it.
 #
-# The result: one binary with all three backends, running on a 486 and
-# accelerating on anything with MMX. Measured cost of the i486 baseline
-# versus letting the compiler use CMOV: 0.6%, in favour of the baseline.
+# The result: one binary with every x86 backend -- avx2, mmx, i8, ref --
+# running on a 486 and accelerating on anything newer. Measured cost of
+# the i486 baseline versus letting the compiler use CMOV: 0.6%, in
+# favour of the baseline.
 
 # The separately-compiled AVX2 object. Empty (and not built) under
 # NO_AVX2=1, in which case backend_avx2.c compiles to stubs anyway.

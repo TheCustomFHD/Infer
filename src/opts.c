@@ -129,11 +129,21 @@ static const opt_def opts[] = {
 { O_QUIETTOOLS, "--quiet-tools", NULL, NULL, 0, MODE_GEN,   G_TOOLS,
   "do not print tool calls and results" },
 
+/* The list here must match what bk_list() actually offers, or the
+ * help advertises a kernel the build does not carry (and, worse,
+ * omits the one it defaults to). avx2 was missing from this string
+ * for three releases while being the default on every x86 build. */
 { O_BACKEND, "--backend", NULL, "<n>", 0, MODE_ALL,   G_PERF,
 #if defined(INFER_HAVE_VIS)
   "matvec kernel: auto, vis, i8, ref -- or `list`" },
-#else
+#elif defined(INFER_HAVE_AVX2) && defined(INFER_HAVE_MMX)
+  "matvec kernel: auto, avx2, mmx, i8, ref -- or `list`" },
+#elif defined(INFER_HAVE_AVX2)
+  "matvec kernel: auto, avx2, i8, ref -- or `list`" },
+#elif defined(INFER_HAVE_MMX)
   "matvec kernel: auto, mmx, i8, ref -- or `list`" },
+#else
+  "matvec kernel: auto, i8, ref -- or `list`" },
 #endif
 { O_LOGPERF, "--log-perf", NULL, NULL, 0, MODE_GEN,   G_PERF,
   "log TTFT, tokens/second and seconds/token per request,\n"

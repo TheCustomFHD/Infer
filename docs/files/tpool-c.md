@@ -1,6 +1,6 @@
 # `src/tpool.c` — the thread pool
 
-**~230 lines.** A minimal persistent pool over the platform's own
+**~420 lines total.** A minimal persistent pool over the platform's own
 primitives: pthreads on POSIX, `CreateThread` + events on Win32. No
 OpenMP, no new library — the project ships to Sun Studio on Solaris,
 mingw on Windows XP, and a 486 with no threads at all.
@@ -40,6 +40,41 @@ Only two worker bodies exist: `mv_slice` and `dn_recur_slice`. Anything
 those can reach must be thread-safe; anything they cannot is not a
 concern. (Checked: the remaining `static` scratch in `bpe_word` is
 unreachable — tokenisation completes before the first forward pass.)
+
+## The barrier: spin, then block (1.23.0)
+
+A `tp_parallel_for` used to cost **44-48 us** of pure synchronisation:
+a condvar broadcast out, a condvar sleep back. A forward pass issues
+about **95** of them, so on two cores the process ran at **CPU% 159**
+with **17,402 voluntary context switches** — threads asleep in the
+kernel rather than working. Shapes below ~1024 rows were *slower*
+threaded than serial (`nrows=64`: 0.39x).
+
+Now each worker polls a generation counter before falling back to the
+condvar, and the caller polls per-worker completion stamps instead of
+sleeping. The barrier drops to **0.25 us** (~190x) and `-T 2` goes
+**17.25 -> 22.16 tok/s**.
+
+**The spin is conditional and that is not optional.** With more
+threads than cores, spinners starve the workers they are waiting on
+(`-T 4`: 17.2 -> 10.4 tok/s). `tp_start` therefore sets
+
+```c
+tp_spin = (nthreads <= tp_cpu_count()) ? 40000L : 0L;
+```
+
+and at zero **both** sides take the original blocking path — the old
+code, not a degraded imitation of it. Putting a `sched_yield()` in the
+spin loop was tried and was still a regression.
+
+`TP_YIELD()` is `Sleep(0)` on Win32, `sched_yield()` where
+`_POSIX_PRIORITY_SCHEDULING` is defined, and a no-op otherwise:
+`sched_yield` lives in librt on Solaris and must not become a link
+dependency.
+
+Ordering is a compiler barrier plus `volatile`, which is what x86 and
+SPARC (both TSO) need for these store/load pairs. `t_thread`
+cross-built for sparc64 passes under qemu at 1/4/8 threads.
 
 ## Three hazards, all of which have bitten
 

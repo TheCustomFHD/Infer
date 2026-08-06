@@ -1,6 +1,6 @@
 # `src/quant.c` — dequantisation and the reference kernel
 
-**~490 lines.** Decodes GGML block-quantisation formats and provides
+**~510 lines.** Decodes GGML block-quantisation formats and provides
 `qmv_ref`, the scalar float matrix-vector product that every other
 backend is checked against.
 

@@ -426,6 +426,34 @@ jobs:
           # get it -- that is how the mmx race reached a release.
           ./"$LINUX" run /nonexistent.gguf -v 2>&1 | grep -q 'threads: 1'
 
+      # Finding 54: the pool spins before blocking, which is a large win
+      # when every worker owns a core and a large LOSS when they do not
+      # (-T 4 on 2 cores measured 17.2 -> 10.4 tok/s with an
+      # unconditional spin). The guard is that the budget is derived
+      # from the core count and that zero restores the blocking path.
+      - name: the spin budget is conditional on the core count
+        run: |
+          grep -q 'tp_spin = (nthreads <= tp_cpu_count())' src/tpool.c || {
+            echo "tp_spin must be gated on tp_cpu_count() -- see finding 54"
+            exit 1
+          }
+          # Both sides must have a blocking fallback for tp_spin == 0.
+          n=$(grep -c 'tp_spin > 0' src/tpool.c)
+          echo "tp_spin > 0 guards: $n (want >= 2: worker join + caller join)"
+          test "$n" -ge 2
+          # sched_yield() is in librt on Solaris; it must stay behind
+          # TP_YIELD() or the Solaris link breaks. Strip comment lines
+          # and the TP_YIELD definition itself, then nothing may remain.
+          bare=$(grep -n 'sched_yield[[:space:]]*(' src/tpool.c \
+                 | grep -v '#define TP_YIELD' \
+                 | grep -v '^[0-9]*:[[:space:]]*\*' \
+                 | grep -v '^[0-9]*:[[:space:]]*/\*' || true)
+          if [ -n "$bare" ]; then
+            echo "bare sched_yield() outside TP_YIELD() -- breaks Solaris"
+            echo "$bare"
+            exit 1
+          fi
+
       - name: NO_THREADS=1 compiles the pool away
         run: |
           make clean >/dev/null
@@ -720,6 +748,80 @@ jobs:
         run: |
           test ! -f templates/qwen-fixed-v21.3.jinja
           ls templates/
+
+      # Documentation rots silently. These are the claims that were
+      # found stale in a full audit: a flag list that omitted the
+      # DEFAULT backend, make targets that no longer existed, and four
+      # different wrong counts of the findings. All are cheap to check.
+      - name: docs match the code
+        run: |
+          fail=0
+
+          # 1. every `make <target>` in the LIVE docs is a real target.
+          #    CHANGELOG.md and FINDINGS.md are history and legitimately
+          #    name targets that were later removed, so they are excluded.
+          #    Lines that say a target does NOT exist are excluded too.
+          grep -oE '^[a-zA-Z0-9_.-]+:' Makefile | tr -d ':' | sort -u > /tmp/real_t
+          grep -rhoE '`make [a-z0-9-]+' \
+              README.md USER-GUIDE.md COMPILE.md CHAT.md PROFILING.md \
+              AGENTS.md docs/ARCHITECTURE.md docs/TEMPLATES.md \
+              docs/PERFORMANCE-ANALYSIS.md docs/files/ .agents/ \
+            | sed 's/`make //' | grep -v '^-' | sort -u > /tmp/doc_t_all
+          grep -rhoE 'no `make [a-z0-9-]+` target|is no `make [a-z0-9-]+`' \
+              README.md USER-GUIDE.md COMPILE.md CHAT.md PROFILING.md \
+              AGENTS.md docs/ARCHITECTURE.md docs/TEMPLATES.md \
+              docs/PERFORMANCE-ANALYSIS.md docs/files/ .agents/ 2>/dev/null \
+            | grep -oE '`make [a-z0-9-]+' | sed 's/`make //' | sort -u > /tmp/doc_t_neg
+          comm -23 /tmp/doc_t_all /tmp/doc_t_neg > /tmp/doc_t
+          bad=$(comm -23 /tmp/doc_t /tmp/real_t | grep -v '^$' || true)
+          if [ -n "$bad" ]; then
+            echo "docs reference make targets that do not exist:"; echo "$bad"; fail=1
+          fi
+
+          # 2. every --flag in the docs exists in the option table
+          grep -oE '"--[a-z-]+"' src/opts.c | tr -d '"' | sort -u > /tmp/real_o
+          # (docs also mention other tools' flags; only check our own guides)
+          grep -rhoE '\-\-[a-z][a-z-]{2,}' README.md USER-GUIDE.md CHAT.md \
+            | sort -u > /tmp/doc_o
+          bad=$(comm -23 /tmp/doc_o /tmp/real_o | grep -v '^--help$' | grep -v '^$' || true)
+          if [ -n "$bad" ]; then
+            echo "user docs reference flags not in opts.c:"; echo "$bad"; fail=1
+          fi
+
+          # 3. every option in the table is documented in the user guide
+          while read -r o; do
+            grep -q -- "$o" USER-GUIDE.md || { echo "undocumented flag: $o"; fail=1; }
+          done < /tmp/real_o
+
+          # 4. --backend help lists the backends the build actually has
+          for b in avx2 mmx i8 ref; do
+            ./"$LINUX64" --backend list | grep -q "  $b " || {
+              echo "backend $b missing from --backend list"; fail=1; }
+            ./"$LINUX64" --help | grep -A0 'backend <n>' | grep -q "$b" || {
+              echo "backend $b missing from --help text"; fail=1; }
+          done
+
+          # 5. the findings count quoted in the docs is right
+          n=$(grep -cE '^## [0-9]+\. ' docs/FINDINGS.md)
+          for f in README.md AGENTS.md docs/ARCHITECTURE.md .agents/README.md; do
+            if grep -qE '[0-9]+ (measured )?surprises' "$f"; then
+              q=$(grep -oE '[0-9]+ (measured )?surprises' "$f" | grep -oE '^[0-9]+' | head -1)
+              [ "$q" = "$n" ] || { echo "$f says $q findings, there are $n"; fail=1; }
+            fi
+          done
+
+          # 6. findings are numbered contiguously (49 went missing once)
+          python3 - <<'PY' || fail=1
+          import re,sys
+          ns=[int(m) for m in re.findall(r'^## (\d+)\.', open('docs/FINDINGS.md').read(), re.M)]
+          gaps=sorted(set(range(1,max(ns)+1))-set(ns))
+          dupes=sorted({n for n in ns if ns.count(n)>1})
+          if gaps:  print("FINDINGS.md missing numbers:",gaps)
+          if dupes: print("FINDINGS.md duplicate numbers:",dupes)
+          sys.exit(1 if gaps or dupes else 0)
+          PY
+
+          test "$fail" -eq 0
 
       - name: upload binaries
         uses: actions/upload-artifact@v4

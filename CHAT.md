@@ -20,8 +20,14 @@ chat template** on every turn, and streams the reply.
 -c, --ctx <n>     context window     (default 4096)
 -n, --predict <n> max tokens per reply
 -t, --temp <f>    temperature
---backend <n>     avx2 | mmx | i8 | ref
+--backend <n>     avx2 | mmx | i8 | ref   (vis instead of mmx on SPARC)
+-T, --threads <n> worker threads for matvec (default 1; 0 = one per core)
+--log-perf        per-reply tok/s, and a session total on exit
 ```
+
+Every generation and prompting flag from
+[USER-GUIDE.md](USER-GUIDE.md) works here too; the list above is just
+the common ones.
 
 ## Commands
 
@@ -33,10 +39,15 @@ chat template** on every turn, and streams the reply.
 | `/history` | show the conversation so far |
 | `/system <text>` | set or replace the system prompt |
 | `/think on\|off` | toggle the thinking block mid-session |
+| `/raw on\|off` | bypass the chat template mid-session. If no template is available it stays on and says so |
 | `/tools` | list tools offered by the MCP server |
 | `/prompt` | print the exact rendered prompt |
 | `/stats` | messages and prompt tokens vs context |
+| `/perf` | speed of the session so far. Needs `--log-perf`, and says so if it is missing |
+| `/set` | show the options in effect, under their command-line names |
 | `/quit`, `/exit` | leave |
+
+This table is the same list `/help` prints.
 
 `/prompt` is the useful one when something looks wrong — it shows
 precisely what the model is being fed, template and all.

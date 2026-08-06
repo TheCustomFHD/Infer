@@ -1,6 +1,6 @@
 # `src/agent.c` / `src/agent.h` — prompts and tools, shared by every mode
 
-**~390 lines.** Turning messages into a prompt, spotting a tool call in
+**~550 lines total.** Turning messages into a prompt, spotting a tool call in
 the model's output, and running it.
 
 `chat`, `run` and `serve` all need these three things. They used to live

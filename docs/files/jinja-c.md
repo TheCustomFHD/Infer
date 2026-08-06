@@ -1,6 +1,6 @@
 # `src/jinja.c`, `jinja_eval.c`, `jinja.h`, `jinja_priv.h` — template engine
 
-**~1550 lines total.** A Jinja2 subset interpreter, enough to render real
+**~1680 lines total.** A Jinja2 subset interpreter, enough to render real
 GGUF chat templates byte-for-byte identically to Python's Jinja2.
 
 | file | role |

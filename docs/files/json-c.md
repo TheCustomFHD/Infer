@@ -1,6 +1,6 @@
 # `src/json.c`, `src/json.h` — JSON parser
 
-**~320 lines.** Read-only recursive-descent parser, enough of RFC 8259
+**~360 lines total.** Read-only recursive-descent parser, enough of RFC 8259
 to read OpenAI request bodies and MCP responses.
 
 ## API

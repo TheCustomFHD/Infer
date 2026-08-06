@@ -1,6 +1,6 @@
 # `src/server.c` — HTTP and the OpenAI API
 
-**~875 lines.** HTTP/1.1 server exposing an OpenAI-compatible API.
+**~1080 lines total.** HTTP/1.1 server exposing an OpenAI-compatible API.
 Contains **no OS networking calls** — everything goes through
 [net-h.md](net-h.md), which is why this file is byte-for-byte identical
 on Linux and Windows XP.
@@ -28,7 +28,18 @@ As of 1.7.0 the server renders the **model's own Jinja chat template**
 was correct for Qwen3.5 and wrong for anything else.
 
 OpenAI allows `content` to be a string *or* an array of
-`{type:"text",text:...}` parts; `append_content()` flattens both.
+`{type:"text",text:...}` parts. The two paths handle that differently,
+which is deliberate:
+
+- **Templated** (the normal path): `messages_to_jinja()` converts the
+  JSON to Jinja values with `agent_js_to_jj()`, preserving structure —
+  an array stays a list, so a template that iterates `message.content`
+  behaves as its author intended. Missing `role` defaults to `"user"`,
+  missing `content` to `""`, and a non-object entry is skipped rather
+  than crashing.
+- **`--raw`**: `raw_from_messages()` walks the JSON directly and
+  concatenates, joining messages with a blank line and pulling `text`
+  out of each part of an array. That is what benchmark harnesses want.
 
 ## One request at a time
 

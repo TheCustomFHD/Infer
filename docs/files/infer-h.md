@@ -1,6 +1,6 @@
 # `src/infer.h` — shared declarations
 
-**~245 lines.** The one header every translation unit includes. Declares
+**~340 lines.** The one header every translation unit includes. Declares
 the GGUF reader, the quantisation kernels, the tokeniser, the engine, the
 sampler and the small utility layer.
 

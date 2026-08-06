@@ -45,7 +45,7 @@ My name is **Ada**. 😊
 # build
 make
 
-# get the model (532 MB)
+# get the model (508 MiB / 532 MB on disk)
 curl -L -o Qwen3.5-0.8B-Q4_K_M.gguf \
   https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
 
@@ -71,7 +71,7 @@ Nothing to `pip install`, no CMake, no submodules.
 | **[PROFILING.md](PROFILING.md)** | `--log-perf`, `--log-stages`, and reading the output |
 | **[CHANGELOG.md](CHANGELOG.md)** | what changed, and why |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | how the pieces fit; data flow |
-| **[docs/FINDINGS.md](docs/FINDINGS.md)** | 24 surprises, each with measurements |
+| **[docs/FINDINGS.md](docs/FINDINGS.md)** | 54 surprises, each with measurements |
 | **[docs/PERFORMANCE-ANALYSIS.md](docs/PERFORMANCE-ANALYSIS.md)** | why the kernels are at their hardware floor |
 | **[docs/TEMPLATES.md](docs/TEMPLATES.md)** | custom Jinja templates |
 | **[docs/files/](docs/files/)** | one document per source file |
@@ -152,8 +152,22 @@ infer --kernel list         # show the current assignment
 infer --kernel q6k=i8       # pin one format
 ```
 
-`bench` needs no model and takes a second or two. All kernels are
-bit-identical on every format, so this is purely a speed choice.
+`bench` needs no model and takes a second or two.
+
+**These kernels are not all numerically identical, so this is not a
+free choice.** `i8`, `mmx` and `vis` agree bit-for-bit on every format
+(`tests/t_ident.c` asserts it). `avx2` deliberately does not: since
+1.20.0 it quantises the activation per 256 values instead of per 32
+and reassociates the sum, which is the same mathematics in a different
+order. Measured against `i8` on synthetic worst-case weights it is
+bit-identical on `Q8_0` and differs on `Q4_K`/`Q5_K`/`Q6_K`. Its
+accuracy is bounded against the float reference by
+`tests/t_avx2acc.c`, which requires it to be at least as close to
+`ref` as `i8` is.
+
+So mixing is safe for speed among the integer kernels, and pinning
+`avx2` for one format changes that format's rounding. Neither is
+wrong; both are measured.
 
 ### Flags
 
@@ -285,25 +299,37 @@ reference graph: both produce identical ranked logits.
 ## Performance
 
 Single-threaded **by default**. `--threads N` (`-T N`) splits matvec
-rows across cores; `-T 0` means one per core. It is opt-in because it
-is a throughput trade rather than a free win — on a 2-core box it
-bought nothing over an already-saturated memory bus — and because a
-default that silently uses every core is a poor default for the
+rows across cores; `-T 0` means one per core. It stays opt-in because
+a default that silently takes every core is a poor default for the
 hardware this project targets. Results are bit-identical at any thread
 count: rows are split, never dot products.
 
-Generation rate, Qwen3.5-0.8B-Q4_K_M, single core:
+Threading became worth using in 1.23.0. Until then the pool paid a
+44 us condition-variable round trip on each of the ~95 parallel
+regions per token, which on two cores left the process at 159% CPU
+instead of ~200%. It now spins briefly before blocking, and stops
+spinning when asked for more threads than the machine has cores:
 
-| machine | backend | tok/s |
+| threads | 1.22.0 | 1.23.0 |
 |---|---|---|
-| Intel i7-9750H (user hardware) | `avx2`, 64-bit | ~12 |
-| Intel i7-9750H | `avx2`, 32-bit | ~10.5 |
-| Xeon @ 2.60 GHz (CI sandbox) | `avx2`, 64-bit | 14.5 |
-| Xeon @ 2.60 GHz | `mmx` | 3.2 |
-| AMD Geode LX 800 @ 500 MHz | `mmx` | ~0.06 (~15.8 s/token) |
+| `-T 1` | 13.99 tok/s | 14.12 tok/s |
+| `-T 2` | 17.25 tok/s | **22.16 tok/s** |
 
-The AVX2 path went 6.35 → 14.5 tok/s over 1.19–1.21 and is now
-**memory-bound at roughly 71% of the machine's streaming ceiling**.
+Generation rate, Qwen3.5-0.8B-Q4_K_M:
+
+| machine | backend | threads | tok/s |
+|---|---|---|---|
+| Intel i7-9750H (user hardware) | `avx2`, 64-bit | 1 | ~12 |
+| Intel i7-9750H | `avx2`, 32-bit | 1 | ~10.5 |
+| Xeon @ 2.60 GHz (CI sandbox) | `avx2`, 64-bit | 1 | 14.1 |
+| Xeon @ 2.60 GHz | `avx2`, 64-bit | 2 | **22.2** |
+| Xeon @ 2.60 GHz | `mmx`, 32-bit | 1 | 3.2 |
+| AMD Geode LX 800 @ 500 MHz | `mmx` | 1 | ~0.06 (~15.8 s/token) |
+
+The single-core AVX2 path went 6.35 → 14.5 tok/s over 1.19–1.22 and is
+**memory-bound at roughly 67% of that machine's measured 11.3 GB/s
+streaming ceiling** (520 MB moves per token, so the hard ceiling is
+about 21.7 tok/s on one core).
 The MMX path is **instruction-bound**, using only ~14% of available
 bandwidth: `Q4_K` runs at 1.19 MMX instructions per weight, and six of
 its nineteen instructions per sixteen weights are `PUNPCK` widening
@@ -314,8 +340,16 @@ Geode-class hardware.
 [docs/PERFORMANCE-ANALYSIS.md](docs/PERFORMANCE-ANALYSIS.md) documents
 the measurements and every rejected optimisation.
 
-Memory: the model is `mmap`ed, so the 0.8B model idles at **~44 MB RSS**
-and starts instantly.
+Memory: the model is `mmap`ed, so it starts instantly and the process
+idles at **~44 MB RSS** (42 MB of that anonymous — the KV cache,
+DeltaNet state and scratch buffers). That is the number before any
+token is generated.
+
+Generating walks every weight, so the mapped pages become resident and
+peak RSS reaches **~560 MB** for the 508 MiB model. Those pages are
+file-backed and clean, so the kernel can evict them under pressure
+rather than swapping: the model runs on a machine with less RAM than
+the file, it just pages. Anonymous memory stays ~42 MB regardless.
 
 ---
 

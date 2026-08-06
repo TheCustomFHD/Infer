@@ -1,6 +1,6 @@
 # `src/util.c` — allocation, strings, logging, file loading
 
-**~195 lines.** Small shared helpers.
+**~270 lines.** Small shared helpers.
 
 ## Allocation
 

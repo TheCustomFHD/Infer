@@ -1,6 +1,6 @@
 # `src/backend.c` — backend selection and the `i8` kernel
 
-**~625 lines.** Owns the public `q_matvec()`, detects CPU features,
+**~1350 lines total.** Owns the public `q_matvec()`, detects CPU features,
 quantises activations, and implements the portable integer kernels.
 
 ## Why this file exists
@@ -106,4 +106,5 @@ for the four rejected attempts to remove it.
 
 ## See also
 
-- [backend_mmx-c.md](backend_mmx-c.md) · [quant-c.md](quant-c.md)
+- [backend_mmx-c.md](backend_mmx-c.md)
+- [backend_vis-c.md](backend_vis-c.md) — the SPARC kernels · [quant-c.md](quant-c.md)

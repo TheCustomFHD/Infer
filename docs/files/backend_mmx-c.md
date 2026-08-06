@@ -1,6 +1,6 @@
 # `src/backend_mmx.c` — MMX kernels
 
-**~850 lines.** The only file in the project using inline assembly, and
+**~920 lines.** The only file in the project using inline assembly, and
 the only one that is not strictly conforming ANSI C. Compiled into every
 x86 build (`-DINFER_HAVE_MMX`, omit with `make linux NO_MMX=1`), and
 selected at run time only when CPUID reports MMX.
@@ -63,6 +63,8 @@ zero-extends. Getting the sign handling wrong there corrupts output
 silently, and it is only ~25% of runtime.
 
 ## See also
+
+- [backend_vis-c.md](backend_vis-c.md) — the same job on SPARC
 
 - [../PERFORMANCE-ANALYSIS.md](../PERFORMANCE-ANALYSIS.md) — why the
   kernels are at their floor, and the dead ends

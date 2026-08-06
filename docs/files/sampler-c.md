@@ -1,6 +1,6 @@
 # `src/sampler.c` — token selection
 
-**~225 lines.** Logit post-processing: repetition penalty, temperature,
+**~220 lines.** Logit post-processing: repetition penalty, temperature,
 top-k, top-p, and the RNG.
 
 ## Order of operations

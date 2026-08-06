@@ -328,7 +328,7 @@ On the Geode with MMX: **2.08×** over the scalar path.
 
 ---
 
-## The four compute backends
+## The compute backends
 
 `backend.c` owns a table, ordered fastest-first, and picks the first one
 the CPU supports:
@@ -338,6 +338,9 @@ static const bk_backend backends[] = {
 #ifdef INFER_HAVE_AVX2
     { "avx2", "...", bk_avx2_available, qmv_avx2 },
 #endif
+#ifdef INFER_HAVE_VIS
+    { "vis",  "...", bk_vis_available,  bk_qmv_vis },
+#endif
 #ifdef INFER_HAVE_MMX
     { "mmx",  "...", mmx_ok,     qmv_mmx },
 #endif
@@ -346,9 +349,13 @@ static const bk_backend backends[] = {
 };
 ```
 
+`vis` and `mmx` are never both present: one is SPARC, the other x86.
+An x86 build therefore offers four backends and a Solaris build three.
+
 | backend | where it runs | notes |
 |---|---|---|
-| `avx2` | x86 with AVX2 **and** OS `ymm` support | intrinsics, `backend_avx2.c`, the only object compiled `-mavx2`. Gated on CPUID *and* `XGETBV`. |
+| `avx2` | x86 with AVX2 **and** OS `ymm` support | intrinsics, `backend_avx2.c`, the only object compiled `-mavx2`. Gated on CPUID *and* `XGETBV`. Deliberately **not** bit-identical to the others on the k-quants — see `tests/t_avx2acc.c`. |
+| `vis` | UltraSPARC with VIS 1 | `backend_vis.c`, Solaris/SPARC only. Bit-identical to `i8`. See [files/backend_vis-c.md](files/backend_vis-c.md). |
 | `mmx` | x86 with MMX | GNU inline asm, `backend_mmx.c`, compiled only with `-DINFER_HAVE_MMX`. Runtime-gated on CPUID. |
 | `i8` | **everywhere** | portable C89 integer kernels. Not x86-specific. |
 | `ref` | everywhere | scalar float reference. Correctness baseline. |
@@ -374,9 +381,10 @@ degrades to "no features detected".
 
 ### The 486-baseline trick
 
-The MMX builds are compiled `-march=i486 -mtune=geode -mmmx`. The
-baseline means no CMOV or other post-486 instruction is emitted for
-ordinary code; `-mtune` only reorders. MMX appears solely in
+The 32-bit builds are compiled `-march=i486 -mtune=generic -mno-sse
+-mno-sse2 -mfpmath=387 -mmmx`; the 64-bit ones just `-mtune=generic`.
+The baseline means no CMOV or other post-486 instruction is emitted
+for ordinary code; `-mtune` only reorders. MMX appears solely in
 `backend_mmx.c`, behind a runtime check.
 
 **One binary therefore runs on a 486 and accelerates on a Geode.** With
@@ -456,7 +464,7 @@ and kernels read from there directly.
 
 **Opt-in, and off by default.** `--threads N` (`-T N`, `-T 0` for one
 per core) splits work across a small persistent pool in `tpool.c`
-(~230 lines over pthreads or Win32 events — no new library).
+(~380 lines over pthreads or Win32 events — no new library).
 
 Two places are parallel, both because their units are independent:
 
@@ -483,9 +491,27 @@ once:
    for the duration of the parallel region.
 3. **The default is 1.** The original default was one thread per core,
    which meant users who never asked for concurrency still got it —
-   and in the MMX case, silent corruption. It also bought nothing on a
-   2-core box (14.48 → 14.41 tok/s) because the memory bus was already
-   saturated.
+   and in the MMX case, silent corruption.
+
+### The barrier has to be cheaper than the work it guards
+
+A forward pass issues about **95** parallel regions: 77 matvecs with
+enough rows to be worth splitting, plus the 18 DeltaNet head loops.
+Until 1.23.0 each one was a condition-variable round trip costing
+**44–48 us**, which on two cores left the process at 159% CPU with
+17,402 voluntary context switches per 58 passes. Shapes below ~1024
+rows were slower threaded than serial.
+
+The pool now polls a generation counter before blocking, and the
+caller polls per-worker completion stamps rather than sleeping. The
+barrier costs **0.25 us**, and `-T 2` went 17.25 → 22.16 tok/s.
+
+**The spin is conditional, and that is not optional.** With more
+threads than cores, spinners starve the workers they are waiting on
+(`-T 4` on 2 cores measured 17.2 → 10.4 tok/s with an unconditional
+spin). `tp_start` sets the budget from `nthreads <= tp_cpu_count()`,
+and at zero both the worker and the joiner take the original blocking
+path — the old code, not a degraded imitation of it. (Finding 54.)
 
 The server still handles one request at a time: the engine holds a
 single recurrent state, so requests are serialised and each resets it.
@@ -510,7 +536,7 @@ single recurrent state, so requests are serialised and each resets it.
 
 ## See also
 
-- [FINDINGS.md](FINDINGS.md) — 20 surprises, each with measurements
+- [FINDINGS.md](FINDINGS.md) — 54 surprises, each with measurements
 - [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — why the kernels
   are at their hardware floor, including every rejected optimisation
 - [TEMPLATES.md](TEMPLATES.md) — the Jinja subset and how to verify one

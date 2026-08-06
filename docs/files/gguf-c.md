@@ -1,6 +1,6 @@
 # `src/gguf.c` — GGUF container reader
 
-**~470 lines.** Parses the header, the key/value metadata block and the
+**~490 lines.** Parses the header, the key/value metadata block and the
 tensor directory, then makes the tensor data available.
 
 ## Format

@@ -1,6 +1,6 @@
 # `src/mcp.c`, `src/mcp.h` — MCP client
 
-**~505 lines.** Model Context Protocol client over **Streamable HTTP**.
+**~540 lines total.** Model Context Protocol client over **Streamable HTTP**.
 All networking through [net-h.md](net-h.md), so it works on XP.
 
 ## Protocol

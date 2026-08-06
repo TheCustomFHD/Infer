@@ -572,6 +572,12 @@ compiler on the real machine can answer that.
 
 ## 26. `CC ?= cc` cannot override make's built-in default
 
+> **Historical.** The `solaris-gcc-*` targets described below were
+> removed in 1.21.0 when the target list collapsed to four artifacts;
+> the toolchain choice is now `make solaris TOOLCHAIN=gcc`. The
+> finding is kept because the underlying trap — `?=` cannot override a
+> make built-in — is still live for any variable make predefines.
+
 The `solaris-gcc-*` targets exist so a Solaris user can build with GCC
 instead of Sun Studio. They never did. On a Solaris box:
 
@@ -835,8 +841,14 @@ the Q6_K change between **+8% and -4%**. Under every plausible
 correction, the 3.1x instruction reduction is invisible.
 
 Q6_K was never instruction-bound. The kernel stays in the tree behind
-`-DINFER_VIS_Q6K` (`make solaris-vis-q6k`) and is **off by default**,
-because the default should be the path that measured faster.
+`-DINFER_VIS_Q6K` and is **off by default**, because the default
+should be the path that measured faster. There is no `make` target for
+it — the ISA ladder of per-variant targets was collapsed in 1.21.0
+(finding 50), so pass the define by hand:
+
+```sh
+gmake solaris SUNOPT='-xO5 -xunroll=16 -DINFER_VIS_Q6K'
+```
 
 ### The rules this produces
 
@@ -1994,6 +2006,66 @@ at 1024 columns actually more accurate than i8.
 replace the test that guarded it with one that bounds the new
 behaviour. "It is approximately right" is a claim, not a check.
 
+## 49. Streaming was no slower than cache-resident, so the limit was
+##     uops, not bandwidth
+
+Recorded late: findings 48 and 50 were written at the time and this
+one was not, leaving two citations in `backend_avx2.c` pointing at a
+number that existed only in the 1.20.0 changelog. Written up here so
+they resolve.
+
+The question after 1.20.0 was whether the AVX2 kernels were limited by
+memory or by instruction issue. The two need opposite work — fewer
+bytes versus fewer uops — so guessing wrong wastes a release.
+
+The discriminating measurement is to run the same kernel on a matrix
+that fits in cache and on one that cannot possibly fit, and compare
+**per-weight** time:
+
+```
+cache-resident (1024x64)     : 0.111 ns/weight
+streaming      (1024x248320) : 0.072-0.103 ns/weight
+```
+
+The streaming case is the lm head, 209 MB against a 54 MB L3 — four
+times the cache. It came out **no slower** than the cache-resident
+case. If bandwidth were the constraint that is impossible.
+
+Cross-checked against the machine: it sustains 11.3 GB/s aligned and
+10.3 GB/s unaligned on a single core, while the model at that speed
+was asking for only ~5.6 GB/s. Half the available bandwidth was going
+unused.
+
+**Conclusion: the inner loop was issue-bound.** That is what justified
+the next round being instruction selection — the two-row kernels
+(finding 48, item 7) and later the word-parallel scale decode (finding
+53) — rather than anything that moves fewer bytes.
+
+The prefetch sweep belongs to the same measurement. Weights are
+streamed once and never revisited, so the hardware prefetcher has no
+history at a row boundary. One superblock ahead is ~26 ns of work
+against an 80-100 ns DRAM latency, so the line lands too late:
+
+```
+distance  2 -> 10.7 tok/s
+          4 -> 11.1
+          8 -> 11.6
+         24 -> 12.0
+         48 -> 11.4
+```
+
+Past ~24 the prefetches evict each other. (1.22.0 re-swept this after
+the scale-decode work moved the balance and settled on 32; see finding
+53.)
+
+**Caveat now attached to the headline number.** "0.102 ns/weight for
+every format regardless of bits per weight" was true of the 1.20.0
+kernels and was the cleanest evidence for the uop argument. It is no
+longer true: after finding 53 the formats separate (Q4_K 0.056, Q5_K
+0.066, Q6_K 0.071), because the scale decode that dominated them all
+equally is gone. The conclusion survives, the specific figure does
+not.
+
 ## 50. An ISA ladder was the wrong shape; a gated object is the right one
 
 1.18.0 shipped four Windows downloads (`-sse2`, `64`, `64-avx2`, plain)
@@ -2274,6 +2346,88 @@ The next candidate is the 186 separate matvec calls per forward pass,
 each restarting the hardware prefetcher on a different tensor -- but
 that is a hypothesis, not a finding, and the previous three teach that
 the difference matters.
+
+## 54. The thread pool spent more time sleeping than the kernels spent
+##     working
+
+Reported from SPARC: ~19% of the process in the kernel, cores no
+longer pegged. Reproduced on x86 immediately — `-T 2` on two cores was
+using **CPU% 159** instead of ~200, with **17,402 voluntary context
+switches** over 58 forward passes (~300 per pass).
+
+The cause is a mismatch that grew over time rather than a bug that was
+introduced. `tpool.c` was written when a `tp_parallel_for` call had
+"roughly a millisecond of work to give away" (its own comment). Since
+then the kernels got several times faster and the work per call
+shrank, but the barrier did not: every call was a condition-variable
+round trip in both directions.
+
+Measured with the real `tpool.c` and an empty job:
+
+```
+tp_parallel_for, one barrier : 44-48 us
+```
+
+A forward pass issues ~95 of them (77 matvecs with `nrows >= 64`, plus
+18 DeltaNet head loops). Small shapes were slower threaded than
+serial:
+
+```
+nrows=64    serial 19.8 us   pooled 51.0 us   0.39x
+nrows=256   serial 79.9 us   pooled 92.1 us   0.87x
+nrows=1024  serial 318 us    pooled 216 us    1.47x
+nrows=4096  serial 1276 us   pooled 683 us    1.87x
+```
+
+Fix: poll a generation counter before blocking, and have the joiner
+poll per-worker completion stamps instead of sleeping on a condvar.
+
+```
+                              before    after
+tp_parallel_for, one barrier  44-48 us  0.25 us   (~190x)
+nrows=64                      0.39x     1.93x
+nrows=4096                    1.87x     2.01x
+```
+
+Model, 2 cores: **17.25 -> 22.16 tok/s (+28.5%)**, CPU% 159 -> 181,
+nvcsw 17402 -> 4510. `-T 1` unchanged, as it must be — the pool is not
+used at all.
+
+### The part that was nearly a regression
+
+Spinning unconditionally is wrong. With more threads than cores the
+spinners steal CPU from the workers being waited on:
+
+```
+        1.22.0   naive spin
+-T 4    17.2     10.4 tok/s
+-T 8    16.9      7.6 tok/s
+```
+
+Putting `sched_yield()` in the spin loop only softened it (`-T 4`:
+15.3, still below baseline). The working answer is to not spin at all
+when oversubscribed: the spin budget is set from
+`nthreads <= tp_cpu_count()` in `tp_start`, and at zero both the
+worker and the joiner take the original blocking path, which restores
+the old behaviour exactly rather than approximating it. After that,
+`-T 4` and `-T 8` are within noise of baseline.
+
+**Lesson:** a fast path that is only fast under an assumption must
+detect when the assumption fails and fall back to the code it
+replaced, not to a degraded version of itself.
+
+### Portability notes
+
+- `sched_yield()` is in librt on Solaris, not libc. Behind
+  `TP_YIELD()`: `Sleep(0)` on Win32, `sched_yield()` under
+  `_POSIX_PRIORITY_SCHEDULING`, no-op otherwise. No new link
+  dependency anywhere.
+- Both pthread and Win32 paths were changed, so Windows benefits too.
+- x86 and SPARC are TSO; `volatile` plus a compiler barrier is what
+  these store/load pairs need. `t_thread` cross-built for sparc64
+  passes under qemu at 1/4/8 threads.
+- Output is bit-identical at every thread count and equal to the
+  previous release: this is scheduling only, no arithmetic changed.
 
 ## See also
 

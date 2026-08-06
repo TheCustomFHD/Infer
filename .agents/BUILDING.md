@@ -87,30 +87,61 @@ make windows
 make windows PROFILE=1
 ```
 
-Flags, all combinable: `PROFILE=1`, `NATIVE=1`, `BITS=64`,
-`TOOLCHAIN=gcc` (Solaris), and `NO_MMX=1` / `NO_SSE2=1` / `NO_AVX2=1` /
-`NO_VIS=1` to leave a kernel out. **Do not add build targets** — there
-are three (`linux`, `windows`, `solaris`) and anything else is a flag.
+Flags, all combinable:
+
+| flag | effect |
+|---|---|
+| `PROFILE=1` | per-stage timers. Every shipped build has them; `PROFSUF` is empty so the filename does not change |
+| `BITS=64` | 64-bit build |
+| `NATIVE=1` | `-march=native`; runs only on the build machine, never shipped |
+| `NO_THREADS=1` | compile the thread pool away: no `pthread_create`, no `-lpthread` |
+| `TOOLCHAIN=gcc` | Solaris via GCC instead of Sun Studio |
+| `FAST=1` | Solaris only, `-fast`, non-IEEE float. Verify with `t_backend` |
+| `NO_MMX=1` `NO_AVX2=1` `NO_VIS=1` | leave a kernel out |
+| `NO_SSE2=1` | reserved, currently a no-op — no source reads `INFER_HAVE_SSE2` |
+
+**Do not add build targets** — there are three (`linux`, `windows`,
+`solaris`) and anything else is a flag. Threading in particular is
+*not* a target: it is compiled in by default and selected at run time
+with `-T`, defaulting to one thread.
 
 ---
 
 ## 2b. Which build for which machine
 
-Measured on a Xeon @ 2.60 GHz with the 0.8B Q4_K_M model, `-n 10 -t 0
---seed 1 -c 512`, generation tok/s, best of 3. Ordering transfers to
-other hosts; magnitudes do not.
+**There is one binary per platform, and it picks its kernel at run
+time.** Since 1.21.0 there is no build to choose per CPU: `make linux`
+carries `avx2`, `mmx`, `i8` and `ref` together, at the i486 baseline,
+and a CPUID (plus XGETBV) probe selects among them. The table below is
+therefore about *which kernel each machine ends up on*, not about
+which download to make.
 
-| target CPU | build | picks | tok/s here | notes |
-|---|---|---|---|---|
-| **pure 486** (no MMX) | `make linux` + musl/uClibc | `ref` | — | see the libc trap below |
-| **Geode LX** (486+MMX) | `make linux` | `mmx` | 2.45 | the shipped default |
-| **Pentium M / Dothan** | `make linux` | `mmx` | 2.45 | SSE2 exists but no kernel uses it yet |
-| **i7 9th gen (AVX2)** | `make linux BITS=64 NATIVE=1` | `i8` | **4.23** | 1.73x; runs only on that CPU class |
-| i7, portable binary | `make linux` | `mmx` | 2.45 | same binary as the Geode |
+Measured here on a Xeon @ 2.60 GHz, 0.8B Q4_K_M, `-n 10 -t 0 --seed 1
+-c 512`, single thread. Ordering transfers to other hosts; magnitudes
+do not.
 
-`NATIVE=1` and `BITS=64` both emit CMOV and SSE/AVX (`NATIVE=1`: 114
-CMOV + 716 SSE/AVX; `BITS=64`: 126 + 2455). **Neither is 486- or
-Geode-safe.** Only the default and `PROFILE=1` are.
+| target CPU | picks | 32-bit build | 64-bit build |
+|---|---|---|---|
+| **pure 486** (no MMX) | `i8` | 1.45 | — (needs a 32-bit build; see the libc trap below) |
+| **Geode LX** (486+MMX) | `mmx` | 3.21 | — |
+| **Pentium M / Dothan** | `mmx` | 3.21 | — |
+| **Haswell and later** | `avx2` | 10.87 | **14.21** |
+| any of the above, forced `--backend ref` | `ref` | 0.63 | 1.15 |
+
+Two results in that table look wrong and are not:
+
+- **`i8` beats `mmx` in the 64-bit build** (3.54 vs 3.32) but loses
+  badly in the 32-bit one (1.45 vs 3.21). On x86-64 the compiler may
+  assume SSE2 and vectorises the portable C past the hand-written
+  64-bit MMX kernel; at the i486 baseline it cannot, so `i8` stays
+  scalar. `auto` accounts for this (finding 33).
+- **The 32-bit `avx2` number is well below the 64-bit one** (10.87 vs
+  14.21) even though it is the same kernel. Half the registers and a
+  32-bit ABI, not a bug.
+
+`NATIVE=1` and `BITS=64` both emit CMOV and SSE/AVX outside the gated
+object. **Neither is 486- or Geode-safe.** Only the default 32-bit
+build (with or without `PROFILE=1`) is.
 
 ### The libc trap on a real 486
 

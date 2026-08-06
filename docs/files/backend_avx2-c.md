@@ -1,6 +1,6 @@
 # `src/backend_avx2.c` — AVX2 kernels
 
-**~700 lines.** Intrinsics (`<immintrin.h>`), so like `backend_mmx.c`
+**~960 lines.** Intrinsics (`<immintrin.h>`), so like `backend_mmx.c`
 it is not strictly conforming ANSI C. It is **the only object in the
 project compiled with `-mavx2`**, and that fact drives everything
 below.

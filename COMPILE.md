@@ -118,10 +118,13 @@ rebuilding.
 |---|---|
 | `PROFILE=1` | per-stage timers (every shipped build has them) |
 | `NATIVE=1` | `-march=native`; **runs only on the build machine** |
-| `BITS=64` | 64-bit Linux, named `...-linux64` (default 32-bit) |
+| `BITS=64` | 64-bit build, named `...-linux64` / `...-windows64.exe` (default 32-bit) |
+| `NO_THREADS=1` | compile the thread pool away entirely; `--threads` then reports 1 |
 | `TOOLCHAIN=gcc` | Solaris via GCC instead of Sun Studio |
+| `FAST=1` | Solaris only: `-fast`, **non-IEEE** float. Opt-in; verify with `t_backend` |
 | `NO_MMX=1` | leave the MMX kernels out |
-| `NO_SSE2=1` `NO_AVX2=1` | ...likewise |
+| `NO_AVX2=1` | leave the AVX2 kernel out (also drops the gated object) |
+| `NO_SSE2=1` | **reserved, currently a no-op.** No hand-written SSE2 kernel exists, and `INFER_HAVE_SSE2` is read by no source file, so the binary is byte-identical with or without it (verified by md5). Kept so the flag exists when the kernel lands. |
 | `NO_VIS=1` | leave the VIS kernels out (Solaris) |
 
 They combine:
@@ -129,8 +132,39 @@ They combine:
 ```sh
 make linux PROFILE=1
 make linux BITS=64 NATIVE=1
+make linux NO_THREADS=1          # no pthreads, no -lpthread
 make solaris TOOLCHAIN=gcc NO_VIS=1
 ```
+
+### Threads are a build-time *and* a run-time choice
+
+Threading is compiled in by default and **off at run time** unless
+asked for. Nothing here is automatic:
+
+```sh
+make linux BITS=64               # pool compiled in, still 1 thread by default
+./infer-<version>-linux64 run model.gguf -p hi -T 2    # 2 threads
+./infer-<version>-linux64 run model.gguf -p hi -T 0    # one per core
+```
+
+`NO_THREADS=1` removes the machinery altogether — no `pthread_create`
+in the binary and no `-lpthread` on the link line. That is the build
+for a 486, for Solaris hosts where you do not want the dependency, and
+for isolating a threading bug:
+
+```sh
+make linux NO_THREADS=1
+nm infer-<version>-linux | grep -c pthread_create    # 0
+```
+
+Both builds produce **bit-identical output** at any thread count: the
+pool splits matrix rows, so no dot product is ever reassociated. See
+`tests/t_thread.c`, which asserts this for every backend by name.
+
+The pool spins briefly before blocking (finding 54), which is worth
+~28% at `-T 2`. It automatically stops spinning when you ask for more
+threads than the machine has cores, so oversubscription costs nothing
+— but it is still pointless, because the work is memory-bound.
 
 `NATIVE=1` **replaces** the portable baseline rather than adding to it.
 Appending `-march=native` after `-mno-sse` does not work — the `-mno-*`
@@ -373,49 +407,56 @@ make clean
 make linux
 ```
 
-Full command it runs:
-
-```sh
-cc -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-   -march=i486 -mtune=geode -mmmx -mno-sse -mno-sse2 -mfpmath=387 \
-   -DINFER_HAVE_MMX \
-   -m32 -D_FILE_OFFSET_BITS=64 \
-   -o infer-<version>-linux \
-   src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
-   src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
-   src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
-   src/util.c src/prof.c src/tpool.c src/backend_a2stub.c \
-   src/net_posix.c src/sys_posix.c \
-   src/backend_mmx.c \
-   -lm -lpthread
-```
-
-That command produces a working 486-baseline binary with `mmx`, `i8`
-and `ref`. To also get the AVX2 kernel it needs **two stages**, because
-`backend_avx2.c` is the only file that may be compiled with AVX2:
+`make linux` runs **two** commands, because `backend_avx2.c` is the
+only file that may be compiled with AVX2. Both are reproduced verbatim
+below — this is exactly what `make -n linux` prints, so it can be
+pasted and run.
 
 ```sh
 # stage 1: the gated AVX2 object, and ONLY this file, with -mavx2
-cc -std=gnu89 -O3 -march=haswell -mavx2 -ffp-contract=off -mmmx \
-   -DINFER_HAVE_MMX -DINFER_HAVE_AVX2 -DINFER_HAVE_THREADS \
+mkdir -p build
+cc -std=gnu89 -Wall -Wextra -Wno-unused-parameter \
+   -O3 -march=haswell -mavx2 -ffp-contract=off -mmmx \
+   -DINFER_HAVE_MMX -DINFER_HAVE_SSE2 -DINFER_HAVE_AVX2 \
+   -DINFER_HAVE_THREADS \
    -m32 -D_FILE_OFFSET_BITS=64 -Isrc \
-   -c -o backend_avx2.o src/backend_avx2.c
+   -c -o build/backend_avx2.o src/backend_avx2.c
 
 # stage 2: everything else at the i486 baseline, linking that object.
 #          note -DINFER_A2_LINKED, which tells backend_a2stub.c to
 #          stand down because the real helpers are in the link.
-cc -std=gnu89 -O3 -march=i486 -mtune=geode -mmmx \
-   -mno-sse -mno-sse2 -mfpmath=387 \
-   -DINFER_HAVE_MMX -DINFER_HAVE_AVX2 -DINFER_HAVE_THREADS \
-   -DINFER_A2_LINKED -m32 -D_FILE_OFFSET_BITS=64 \
+cc -std=gnu89 -Wall -Wextra -Wno-unused-parameter \
+   -O3 -march=i486 -mtune=generic -mno-sse -mno-sse2 -mfpmath=387 \
+   -mmmx \
+   -DINFER_HAVE_MMX -DINFER_HAVE_SSE2 -DINFER_HAVE_AVX2 \
+   -DINFER_HAVE_THREADS -DINFER_A2_LINKED \
+   -m32 -D_FILE_OFFSET_BITS=64 \
    -o infer-<version>-linux \
-   src/main.c ... src/backend_mmx.c backend_avx2.o -lm -lpthread
+   src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
+   src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c \
+   src/tokenizer.c src/sampler.c src/quant.c src/backend.c \
+   src/gguf.c src/json.c src/util.c src/prof.c src/tpool.c \
+   src/backend_a2stub.c src/net_posix.c src/sys_posix.c \
+   src/backend_mmx.c build/backend_avx2.o \
+   -lm -lpthread
 ```
+
+For a 64-bit build swap `-m32` for `-m64` in both stages and drop
+`-D_FILE_OFFSET_BITS=64` (it is only needed on 32-bit hosts), or just
+use `make linux BITS=64`.
 
 **Compiling everything in one command with `-mavx2` would apply it to
 every file, and the binary would fault on a 486 before reaching
 `main()`.** `make linux` does the two stages for you; this is only
 here for people building without make.
+
+Three things in stage 2 are easy to drop and each fails differently:
+
+| omission | symptom |
+|---|---|
+| `-DINFER_A2_LINKED` | duplicate definitions of `bk_a2_amax` and friends — the stub and the real object both provide them |
+| `build/backend_avx2.o` but keeping the macro | unresolved `bk_a2_*` at link time |
+| `-DINFER_HAVE_THREADS` (and `-lpthread`) | links and runs, but silently single-threaded: `--threads 4` reports 1 |
 
 ### Read those flags carefully — every one is deliberate
 
@@ -423,7 +464,7 @@ here for people building without make.
 |---|---|
 | `-std=gnu89` | `backend_mmx.c` uses GNU inline asm. **The only file in the project that is not strict C89.** |
 | `-march=i486` | **Baseline.** Nothing newer than a 486 is emitted for ordinary code — in particular no CMOV, which is a Pentium Pro instruction. |
-| `-mtune=geode` | **Scheduling only.** Reorders for the Geode pipeline; never changes the instruction set. |
+| `-mtune=generic` | **Scheduling only.** Never changes the instruction set. Was `-mtune=geode` until the 64-bit targets needed one shared value; generic measured the same on Geode and better elsewhere. |
 | `-mmmx` | Lets the compiler use MMX *inside `backend_mmx.c`*, which is guarded by a runtime CPUID check. |
 | `-DINFER_HAVE_MMX` | Compiles that backend in and registers it in the backend table. |
 | `-mfpmath=387` | x87 floating point, not SSE. |
@@ -532,25 +573,41 @@ address to check.
 make windows
 ```
 
-Full command:
+Full commands — again two stages, exactly as `make -n windows` prints:
 
 ```sh
-i686-w64-mingw32-gcc -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
-   -march=i486 -mtune=geode -mmmx -mno-sse -mno-sse2 -mfpmath=387 \
-   -DINFER_HAVE_MMX \
-   -D_WIN32_WINNT=0x0501 \
+# stage 1: the gated AVX2 object
+mkdir -p build
+i686-w64-mingw32-gcc -std=gnu89 -Wall -Wextra -Wno-unused-parameter \
+   -O3 -march=haswell -mavx2 -ffp-contract=off -mmmx \
+   -DINFER_HAVE_MMX -DINFER_HAVE_SSE2 -DINFER_HAVE_AVX2 \
+   -DINFER_HAVE_THREADS -D_WIN32_WINNT=0x0501 -Isrc \
+   -c -o build/backend_avx2.o src/backend_avx2.c
+
+# stage 2: everything else at the i486 baseline
+i686-w64-mingw32-gcc -std=gnu89 -Wall -Wextra -Wno-unused-parameter \
+   -O3 -march=i486 -mtune=generic -mno-sse -mno-sse2 -mfpmath=387 \
+   -mmmx \
+   -DINFER_HAVE_MMX -DINFER_HAVE_SSE2 -DINFER_HAVE_AVX2 \
+   -DINFER_HAVE_THREADS -DINFER_A2_LINKED -D_WIN32_WINNT=0x0501 \
    -o infer-<version>-windows.exe \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
-   src/util.c src/prof.c src/net_win32.c src/sys_win32.c \
-   src/backend_mmx.c \
+   src/util.c src/prof.c src/tpool.c src/backend_a2stub.c \
+   src/net_win32.c src/sys_win32.c \
+   src/backend_mmx.c build/backend_avx2.o \
    -lws2_32
 ```
 
 Identical flags to the Linux target except for the two platform files
-and `-D_WIN32_WINNT=0x0501`, which pins the Windows API surface to XP so
-the compiler refuses anything newer.
+(`net_win32.c`, `sys_win32.c`) and `-D_WIN32_WINNT=0x0501`, which pins
+the Windows API surface to XP so the compiler refuses anything newer.
+
+Note there is **no `-lpthread`**: the pool uses `CreateThread` and
+Win32 events directly, so threading costs no extra library here. For
+the 64-bit build use `x86_64-w64-mingw32-gcc` and add `-m64`, or just
+`make windows BITS=64`.
 
 ### Verify
 
@@ -1022,9 +1079,9 @@ same way — it does not become another artifact.
 | target | output | key flags |
 |---|---|---|
 | `make solaris` | `infer-<version>-solaris` | `-Xc -xc99=none -xO5 -xunroll=16 -m64 -xtarget=native -DINFER_BIG_ENDIAN=1 -lsocket -lnsl` |
-| `make solaris PROFILE=1` | `infer-<version>-solaris-profile` | as above `+ -DINFER_PROFILE` |
+| `make solaris PROFILE=1` | `infer-<version>-solaris` | as above `+ -DINFER_PROFILE`. Same filename: `PROFSUF` is empty by default, because every shipped build carries the timers. Set `PROFSUF=-profile` to keep both side by side. |
 | `make solaris TOOLCHAIN=gcc` | `infer-<version>-solaris` | GCC equivalent, `-m64 -lsocket -lnsl` |
-| `make solaris TOOLCHAIN=gcc PROFILE=1` | `infer-<version>-solaris-profile` | as above `+ -DINFER_PROFILE` |
+| `make solaris TOOLCHAIN=gcc PROFILE=1` | `infer-<version>-solaris` | as above `+ -DINFER_PROFILE` |
 | `make solaris FAST=1` | `infer-<version>-solaris` | `+ -fast` — non-IEEE float, opt-in, verify with `t_backend` |
 | `make solaris-test` | `build/t_*` | test programs, Sun Studio |
 
@@ -1032,8 +1089,11 @@ same way — it does not become another artifact.
 
 | target | effect |
 |---|---|
-| `make test` | eight test programs into `build/` |
-| `make bench` | just `build/t_backend` |
+| `make test` | nine test programs into `build/` (`t_quant`, `t_tokenizer`, `t_engine`, `t_backend`, `t_align`, `t_jinja`, `t_agent`, `t_endian`, `t_cache`) |
+| `make i8-split-test` | the host-side kernel tests: `t_i8split`, `t_q5split`, `t_ident`, `t_avx2sat`, `t_scales`, `t_avx2acc`, `t_thread`, `t_kbench`. No model needed |
+| `make vis-shim-test` | VIS kernels vs `i8` on any host, through a shim |
+| `make solaris-test` | VIS assumption tests, built with Sun Studio |
+| `make bench` | just `build/t_backend` (needs a model at run time) |
 | `make help` | the target list |
 | `make version` | prints `<version>` |
 | `make checkversion` | asserts the Makefile matches `src/infer.h` |
@@ -1047,13 +1107,21 @@ same way — it does not become another artifact.
 | `SUNOPT` | `-xO5 -xunroll=16` | Sun Studio optimisation flags |
 | `SUNTARGET` | `native` | `make solaris SUNTARGET=ultra2` to cross-build |
 | `SUNBITS` | `-m64` | do not change unless you know why (see section 6) |
-| `CC` / `WINCC` | `cc` / `i686-w64-mingw32-gcc` | alternate compilers |
+| `CC` / `WINCC` / `WINCC64` | `cc` / `i686-w64-mingw32-gcc` / `x86_64-w64-mingw32-gcc` | alternate compilers |
+| `PROFSUF` | empty | suffix for `PROFILE=1` builds; set to `-profile` to keep timed and untimed builds side by side |
+| `BUILD` | `build` | directory for test binaries and the gated AVX2 object |
 
 ## 10. Compile-time toggles
 
 | define | effect |
 |---|---|
 | `-DINFER_HAVE_MMX` | compiles `backend_mmx.c` in and registers the `mmx` backend. Requires `-mmmx` and `-std=gnu89`. |
+| `-DINFER_HAVE_AVX2` | registers the `avx2` backend. **Must be this macro, never `__AVX2__`** — `backend.c` is compiled at the i486 baseline where `__AVX2__` is false, so testing it there silently drops the kernel (finding 50). |
+| `-DINFER_A2_LINKED` | tells `backend_a2stub.c` to stand down because the real AVX2 helpers are in the link. Set by the Makefile, **not** derivable from `__AVX2__`. Omit it and you get duplicate symbols; omit the object and forget the macro and you get unresolved `bk_a2_*`. |
+| `-DINFER_HAVE_THREADS` | compiles the thread pool in. Needs `-lpthread` on POSIX; Win32 uses the API directly. Without it every `tp_*` entry point is a stub. |
+| `-DINFER_HAVE_VIS` | compiles `backend_vis.c` in and registers the `vis` backend (SPARC). |
+| `-DINFER_HAVE_SSE2` | **reserved and unused.** No source file reads it; there is no hand-written SSE2 kernel yet. |
+| `-DINFER_VIS_Q6K` | SPARC only: opts the VIS Q6_K kernel back in. Off by default because it measured no faster than `i8`. There is no `make` target for it — pass it by hand. |
 | `-DINFER_PROFILE` | compiles in per-stage timers. Without it, every timer macro expands to nothing. |
 | `-DINFER_BIG_ENDIAN=1` / `=0` | forces byte order. Autodetected; the build **fails** rather than guessing if it cannot tell. |
 | `-DINFER_BACKEND="i8"` | changes the default backend when none is given on the command line. |

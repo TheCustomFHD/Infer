@@ -1,5 +1,249 @@
 # Changelog
 
+## 1.23.1 — a full documentation audit, and the two code bugs it found
+
+Every one of the 44 documentation files was read against the code it
+describes. This is the result. Two of the findings were bugs in the
+program itself, not in the prose.
+
+### Code fixes
+
+**`--help` never listed `avx2`.** The `--backend` help string read
+`auto, mmx, i8, ref` — omitting the kernel that is the default on
+every x86 build, and has been since 1.19.0. Anyone reading `--help`
+would conclude AVX2 was unavailable. The string is now built from the
+same `INFER_HAVE_*` macros that register the backends, so it cannot
+drift again:
+
+```
+--backend <n>   matvec kernel: auto, avx2, mmx, i8, ref -- or `list`
+```
+
+Verified against `NO_AVX2=1` (drops `avx2`) and the SPARC build
+(offers `vis`).
+
+**`tests/t_ident.c` printed a claim it had not tested.** Its banner
+said `i8 vs mmx vs avx2` and its verdict said "all bit-identical —
+safe to mix per format", but the AVX2 comparison was disabled by a
+`&& 0` in its `#if`. So it asserted nothing about `avx2` while
+appearing to clear it.
+
+That matters because it is not true. Measured directly, `qmv_avx2`
+against `qmv_i8` on synthetic worst-case weights:
+
+```
+Q4_K   NOT bit-identical   (8/8 rows differ, max abs delta 5)
+Q5_K   NOT bit-identical   (8/8 rows differ, max abs delta 15.7)
+Q6_K   NOT bit-identical   (8/8 rows differ, max abs delta 18.4)
+Q8_0   bit-identical       (0/8 rows differ)
+```
+
+That is by design — the AVX2 k-quant kernels quantise the activation
+per 256 values instead of per 32 and reassociate the sum — and it is
+bounded by `t_avx2acc.c` against the float reference. The dead code
+is gone and the test now states its real scope, with a comment
+explaining why enabling the comparison would report failures that are
+not defects.
+
+**`make help` also omitted `avx2`** ("Linux/x86 — mmx + i8 + ref") and
+pointed at `make solaris-vis-test`, which has not existed since
+1.21.0.
+
+### Documentation fixes
+
+The ones that would have cost someone real time:
+
+- **COMPILE.md had no threading section at all**, and its flag table
+  omitted `NO_THREADS=1` and `FAST=1`. Threading is now covered as
+  what it is: a build-time *and* a run-time choice, with the
+  `NO_THREADS=1` verification (`nm | grep -c pthread_create` → 0).
+- **Every hand-written compile recipe was stale.** They showed `-O2`
+  (real: `-O3`), `-mtune=geode` (real: `-mtune=generic`), no AVX2
+  stage, no `tpool.c`, no `-DINFER_HAVE_THREADS`, and the Linux one
+  ended in `src/main.c ... src/backend_mmx.c` — an ellipsis that
+  cannot be pasted. Both Linux and Windows recipes are now the exact
+  output of `make -n`, and **both were run verbatim in a clean
+  directory** to confirm they produce a working binary. The Windows
+  one was checked to still import exactly three XP-safe DLLs.
+- **The three ways to get the two-stage AVX2 build wrong** are now
+  documented with their actual symptoms, each reproduced: omitting
+  `-DINFER_A2_LINKED` gives duplicate `bk_a2_*` definitions, omitting
+  the object gives undefined references, and omitting
+  `-DINFER_HAVE_THREADS` links fine and silently ignores `-T`.
+- **README claimed "all kernels are bit-identical on every format, so
+  this is purely a speed choice"** about `--kernel`. Corrected with
+  the measurements above.
+- **README's memory figure was the flattering half.** "~44 MB RSS" is
+  true *before generating*; touching the weights takes peak RSS to
+  ~560 MB. Both are now stated, with the note that those pages are
+  file-backed and clean so the model still runs on a machine with less
+  RAM than the file.
+- **`docs/FINDINGS.md` was missing finding 49 entirely** while
+  `backend_avx2.c` cited it twice. Reconstructed from the 1.20.0
+  changelog and the code comments: the measurement that showed
+  streaming was no slower than cache-resident, i.e. the kernels were
+  uop-bound rather than bandwidth-bound. Its headline figure ("0.102
+  ns/weight for every format") no longer holds after finding 53, and
+  the entry says so.
+- **`src/backend_vis.c` had no page** — 885 lines, the whole SPARC
+  story. `docs/files/backend_vis-c.md` now covers the `fmul8x16`
+  exactness trick, the four lane budgets, why Q6_K is compiled out,
+  and the Sun Studio shim.
+- **`make profile` / `profile-geode` / `solaris-vis-q6k` were
+  referenced as targets** in USER-GUIDE, prof-c.md and FINDINGS. None
+  exist; profiling became `PROFILE=1` in 1.16.0.
+- **`docs/files/tests.md` documented 9 of 17 tests**, omitting the
+  entire `make i8-split-test` group — `t_ident`, `t_avx2acc`,
+  `t_avx2sat`, `t_scales`, `t_thread` and the rest. That group is the
+  one to run after a kernel change.
+- **Four different wrong counts of the findings** (20, 20, 24, 52 —
+  actual 54), **`make test` described as eight programs** (nine), and
+  **stale line counts on 9 of 22 file pages**, one off by 85%.
+- **`docs/files/server-c.md` documented `append_content()`**, a
+  function that does not exist, and described flattening that does not
+  happen: templated requests preserve structured content, only `--raw`
+  concatenates.
+- Threading numbers in README, USER-GUIDE and ARCHITECTURE still said
+  threading "bought nothing (14.48 → 14.41 tok/s)". True in 1.22.0,
+  false since 1.23.0.
+- `NO_SSE2=1` is now documented as **a no-op**: no source file reads
+  `INFER_HAVE_SSE2`, and the binary is byte-identical with and without
+  it (verified by md5).
+
+### A CI step so this cannot rot again
+
+Auditing 44 files by hand is not repeatable, so the mechanical parts
+are now a build step, `docs match the code`. It checks that every
+`make <target>` named in the live docs exists, that every `--flag`
+they mention is in the option table, that every flag in the table is
+documented in the user guide, that `--help` lists the backends the
+build actually carries, that the findings count quoted in four files
+matches, and that the findings are numbered without gaps.
+
+It excludes `CHANGELOG.md` and `FINDINGS.md` from the target check —
+they are history and legitimately name targets that were later
+removed — and it ignores sentences that say a target does *not* exist.
+
+All four failure modes were verified with negative controls: a fake
+target, an undocumented flag, a wrong count and a numbering gap each
+make it exit 1.
+
+### Unchanged
+
+No behaviour changes beyond the `--help` string. Same four artifacts,
+all tests pass, and the full CI suite runs locally with the same three
+GitHub-only steps skipped as before.
+
+## 1.23.0 — the threads were asleep more than they were working
+
+Two cores, sandbox Xeon, 64-bit AVX2, 40 tokens greedy, medians of 5
+interleaved runs against 1.22.0:
+
+| threads | 1.22.0 | 1.23.0 | |
+|---|---|---|---|
+| `-T 1` | 13.99 tok/s | 14.12 tok/s | +1.0% (noise — the pool is not used) |
+| `-T 2` | 17.25 tok/s | **22.16 tok/s** | **+28.5%** (best seen 22.86) |
+
+The user reported it from the other end of the fleet: on SPARC the
+process was spending ~19% of its time in the kernel and no longer
+pegging the cores. It reproduces exactly on x86.
+
+### What was happening
+
+`getrusage` on a 2-core, `-T 2` run of 1.22.0:
+
+```
+CPU% 159      <- should be ~200
+nvcsw 17402   <- voluntary context switches
+```
+
+17,402 voluntary context switches for 58 forward passes is ~300 per
+pass. The forward pass issues about 95 `tp_parallel_for` calls (77
+matvecs with `nrows >= 64`, plus 18 DeltaNet head loops), and each one
+was a full condition-variable round trip: broadcast to wake the
+workers, then the caller sleeps on `tp_cv_done` until they report in.
+
+Timed directly, with the real `tpool.c` and an empty job:
+
+```
+tp_parallel_for, one barrier : 44-48 us
+```
+
+At ~95 barriers per pass that is milliseconds of pure sleep/wake per
+token, and it explains both symptoms: the missing 40% of CPU is
+threads blocked in the kernel, and the kernel time is the futex
+traffic. The pool was built for "roughly a millisecond of work per
+call" (see the comment at the top of `tpool.c`); the kernels have
+since got fast enough that many calls are now *shorter* than the
+barrier that guards them. Small shapes were actually slower threaded
+than serial:
+
+```
+nrows=64    serial 19.8 us   pooled 51.0 us   0.39x
+nrows=256   serial 79.9 us   pooled 92.1 us   0.87x
+nrows=1024  serial 318 us    pooled 216 us    1.47x
+nrows=4096  serial 1276 us   pooled 683 us    1.87x
+```
+
+### The fix
+
+Workers now poll a generation counter for a bounded number of
+iterations before falling back to the condition variable, and the
+caller polls a per-worker completion stamp instead of sleeping. Same
+barrier, no kernel transition in the common case:
+
+```
+                              before    after
+tp_parallel_for, one barrier  44-48 us  0.25 us    (~190x)
+nrows=64                      0.39x     1.93x
+nrows=256                     0.87x     1.97x
+nrows=1024                    1.47x     1.86x
+nrows=4096                    1.87x     2.01x
+```
+
+End to end, `-T 2`: `CPU% 159 -> 181`, `nvcsw 17402 -> 4510`.
+
+### Spinning is only correct when every worker owns a core
+
+The first version spun unconditionally and **regressed badly when
+oversubscribed** — spinners steal the CPU the running workers need:
+
+```
+        1.22.0   naive spin
+-T 4    17.2     10.4 tok/s
+-T 8    16.9      7.6 tok/s
+```
+
+`sched_yield()` in the spin loop was not enough either (`-T 4`: 15.3).
+The pool now sets its spin budget to zero whenever
+`nthreads > tp_cpu_count()`, and in that mode both the worker and the
+joiner take the original blocking path exactly as before. Measured
+after the fix: `-T 4` 18.2 vs 18.8 baseline, `-T 8` 17.2 vs 17.3 —
+within noise, no regression.
+
+### Unchanged
+
+Output is **bit-identical**: verified `-T 1/2/3/4/8` all byte-equal on
+a 150-token greedy generation, and equal to the 1.22.0 binary. The
+change is pure scheduling; no arithmetic was touched. Full suite
+passes (`t_ident`, `t_avx2acc`, `t_avx2sat`, `t_scales`, `t_thread` at
+1/4/8, `t_i8split`, `t_q5split`).
+
+### Portability
+
+- Both the pthread and the Win32 paths got the same treatment, so the
+  Windows builds benefit too (the reporter's main machine is Windows).
+- `sched_yield()` lives in librt on Solaris, not libc. It is behind
+  `TP_YIELD()`, which is `Sleep(0)` on Win32, `sched_yield()` where
+  `_POSIX_PRIORITY_SCHEDULING` is defined, and a no-op otherwise — so
+  no new link dependency on any platform.
+- Ordering: x86 and SPARC are both TSO and the flags are `volatile`
+  with a compiler barrier, which is what the store/load pairs here
+  need. `t_thread` cross-built for sparc64 passes under qemu at
+  1/4/8 threads.
+- `NO_THREADS=1` still compiles the pool away (0 `pthread_create`
+  references), and threading still defaults to one thread.
+
 ## 1.22.0 — the scale decode was bigger than the arithmetic
 
 Single core, sandbox Xeon, 64-bit AVX2, 40 tokens greedy:

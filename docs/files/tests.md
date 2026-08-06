@@ -1,7 +1,17 @@
 # `tests/` — the test suite
 
-`make test` builds all nine into `build/`, plus `t_vis` and `t_viskern`
-on SPARC.
+There are four groups, built by four different targets. Running
+only `make test` leaves most of the kernel tests unbuilt, which is how
+a stale assertion and a threading race once shipped.
+
+```sh
+make test             # 9 programs, several need a model
+make i8-split-test    # 8 host-side kernel tests, no model needed
+make vis-shim-test    # VIS kernels vs i8 on any host
+make solaris-test     # VIS assumptions, Sun Studio, on the real machine
+```
+
+### `make test` — the nine
 
 | test | needs a model? | what it proves |
 |---|---|---|
@@ -14,6 +24,31 @@ on SPARC.
 | `t_agent` | no | chat/run/serve render identical prompts; every tool-call shape parses |
 | `t_endian` | optional | byte-order neutrality; same numbers on a big-endian host |
 | `t_cache` | yes | prompt-prefix reuse gives bit-identical logits to a fresh decode |
+
+### `make i8-split-test` — the eight host-side kernel tests
+
+None of these need a model, and all of them run in seconds. This is
+the group to run after touching any kernel.
+
+| test | what it proves |
+|---|---|
+| `t_ident` | `i8` and `mmx` agree **bit-for-bit** on every format. Deliberately excludes `avx2` — see below |
+| `t_avx2acc` | `avx2` is at least as close to the float `ref` as `i8` is. This is the accuracy claim that replaces bit-identity for the AVX2 k-quants |
+| `t_avx2sat` | `VPMADDUBSW`'s int16 lanes cannot saturate on any format fed to them. Q6_K is the tight one at 16002/32767 |
+| `t_scales` | the word-parallel 6-bit scale decode matches the branchy reference exactly (finding 53) |
+| `t_i8split` | the `i8` Q4_K split-loop reassociation is integer-exact |
+| `t_q5split` | ditto for Q5_K, whose loop shape differs between scalar and vectorised builds |
+| `t_thread` | threading changes the schedule, never the arithmetic — every backend, by name, at 1/4/8 threads |
+| `t_kbench` | isolated per-format kernel throughput (timing, not pass/fail) |
+
+**Why `t_ident` skips `avx2`.** Since 1.20.0 the AVX2 k-quant kernels
+quantise the activation per 256 values instead of per 32, reassociate
+the sum across lanes, and apply the scale before converting to float.
+That is the same mathematics in a different order, and it is *not*
+bit-identical: measured against `i8` on synthetic worst-case weights,
+`Q8_0` matches exactly while `Q4_K`/`Q5_K`/`Q6_K` differ. Bounding
+that error is `t_avx2acc`'s job. Do not "fix" `t_ident` by switching
+the comparison on — it will report failures that are not defects.
 
 ## `t_agent` — the one that guards cross-mode consistency
 
@@ -132,7 +167,9 @@ kernel changes:
 
 * **Exhaustive backend sweep** — all 320 tensors × 6 activation patterns
   (uniform, large, tiny, sparse, alternating, all-zero) × both fast
-  backends against `ref`. 2,244 comparisons, zero failures.
+  backends against `ref`. 2,244 comparisons, zero failures. This was a
+  development-time sweep with `t_backend`, not something `make test`
+  reruns.
 * **Jinja byte-comparison** — render a template with both this engine and
   Python's Jinja2 and `cmp` the output. Done for the built-in Qwen3.5
   template and the 16 kB froggeric community template, with and without

@@ -1,6 +1,6 @@
 # `src/opts.c` / `src/opts.h` — the option table
 
-**~330 lines.** Every command-line toggle `infer` understands, declared
+**~530 lines total.** Every command-line toggle `infer` understands, declared
 exactly once.
 
 Three things read that single declaration:

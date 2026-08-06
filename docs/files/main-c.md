@@ -1,6 +1,6 @@
 # `src/main.c` — the launcher
 
-**~320 lines.** Dispatch and the one-shot `run` loop. Contains no
+**~400 lines.** Dispatch and the one-shot `run` loop. Contains no
 inference and no networking logic; it loads a model and hands over to one
 of four sub-commands.
 

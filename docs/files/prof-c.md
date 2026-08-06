@@ -1,6 +1,6 @@
 # `src/prof.c`, `src/prof.h` — profiling and throughput logging
 
-**~410 lines.** Two independent features.
+**~480 lines total.** Two independent features.
 
 ## 1. Throughput logging — run time, always compiled
 
@@ -19,12 +19,18 @@ Costs two clock reads per request, so it is always available. Works with
 
 ## 2. Stage profiling — compile time only
 
-`-DINFER_PROFILE` (via `make profile*`) adds per-stage timers:
+`-DINFER_PROFILE` (via `make <target> PROFILE=1` — there is no
+`make profile` target; it became a flag in 1.16.0) adds per-stage
+timers:
 embedding, attention and its sub-stages, delta-net and its sub-stages,
 FFN, norms, LM head, plus a second view sliced by weight format.
 
+**Every shipped binary is built with it**, so the released downloads
+can `--log-stages` as-is; `PROFSUF` is empty precisely so those builds
+keep their ordinary names.
+
 **Without the define every macro expands to nothing.** Verified with
-`nm`: `prof_add` and `prof_now` are entirely absent from a normal build.
+`nm`: `prof_add` and `prof_now` are entirely absent from such a build.
 That matters — on a 500 MHz Geode a `gettimeofday()` inside the matvec
 loop would distort exactly what is being measured.
 
