@@ -1099,10 +1099,6 @@ void q_matvec(int type, const unsigned char *w, const float *x,
               float *y, long ncols, long nrows) {
     PROF_DECL(pt);
     ensure_selected();
-#ifdef INFER_SHAPE_LOG
-    { static FILE*sf=NULL; if(!sf) sf=fopen("/tmp/shapes.txt","w");
-      fprintf(sf,"%d %ld %ld\n",type,ncols,nrows); }
-#endif
 
     PROF_START(pt);
     {
@@ -1115,13 +1111,14 @@ void q_matvec(int type, const unsigned char *w, const float *x,
         /* Rows are independent, so they split across cores with no
          * locking and no change to the arithmetic: each row is summed
          * by the same code in the same order, just on another core.
-         * Bit-identity is asserted by tests/t_thread.c.
+         * Bit-identity is asserted by tests/t_thread.c, which since
+         * finding 52 exercises every backend rather than only the one
+         * `auto` happens to pick.
          *
          * Only worth the dispatch for matrices with enough rows to
-         * amortise it; below that the serial call is faster. The
-         * activation quantisation must also happen ONCE, before the
-         * split, or every thread would race to fill the same scratch
-         * buffer. */
+         * amortise it. The activation quantisation must also happen
+         * ONCE, before the split, or every thread would race to fill
+         * the same scratch buffer. */
         long rb_ = gg_type_size(type, ncols);
         if (tp_threads() > 1 && nrows >= 64 && rb_ > 0 &&
             type != GGML_TYPE_F32 && type != GGML_TYPE_F16 &&

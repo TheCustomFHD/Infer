@@ -1,5 +1,108 @@
 # Changelog
 
+## 1.21.3 — documentation brought up to date
+
+No code change; `infer` is byte-identical to 1.21.2 apart from the
+version string. The docs had drifted badly across 1.18–1.21 and several
+were actively misleading.
+
+**Corrected claims that were simply false:**
+
+- `README.md` opened with "No SSE, no threads" and described "six
+  shipping artifacts". It is now four artifacts, each carrying `avx2`,
+  `mmx`, `i8` and `ref`, with an opt-in thread pool.
+- `README.md` and `AGENTS.md` still listed `NO_SSE2=1 NO_AVX2=1` as
+  "reserved for kernels not yet written".
+- `docs/ARCHITECTURE.md` said "Threading: none, single-threaded
+  throughout, deliberately".
+- `USER-GUIDE.md` listed three backends and never mentioned threads.
+- `CHAT.md` advertised `--backend mmx | i8 | ref`.
+- The hand-written compile lines in `COMPILE.md` omitted `tpool.c` and
+  `backend_a2stub.c`, so anyone following them got link errors, and
+  omitted the AVX2 stage entirely, so they got a binary with no AVX2.
+  The two-stage recipe is now documented and was verified verbatim.
+
+**New:**
+
+- `docs/files/backend_avx2-c.md` — the AVX2 kernels, why the file is
+  compiled separately, the `XGETBV` gate, and the `bk_a2_*` helpers.
+- `docs/files/tpool-c.md` — the pool, its bit-identity contract, and
+  the three hazards that have actually bitten.
+- `USER-GUIDE.md` section 9, "Threads".
+- `docs/ARCHITECTURE.md` now documents the two parallel regions and the
+  three constraints that follow from them.
+
+**Explained rather than asserted:** why `i8` beats `mmx` on a modern
+64-bit build but not in the 32-bit one — with SSE2 guaranteed the
+compiler vectorises `i8` past the hand-written 64-bit MMX kernel, while
+at the i486 baseline neither `__SSE2__` nor `__AVX2__` is defined so
+`i8` stays scalar. Both are correct for their target, and the 32-bit
+binary remains XP/486-compatible: PE32 subsystem 4.00, three DLLs, and
+every SIMD instruction confined to the five gated AVX2 functions
+(`qmv_i8`, `qmv_mmx` and `qmv_ref` contain zero).
+
+## 1.21.2 — CRITICAL: MMX produced garbage under threading
+
+**If you ran 1.20.0 or 1.21.x with `--backend mmx` and more than one
+thread, the output was wrong.** Fluent-looking gibberish, not a crash.
+Upgrade.
+
+`i8`, `avx2` and `ref` were never affected.
+
+### The bug
+
+The MMX kernels kept their per-row integer accumulator in a `static`
+array:
+
+```c
+static int acc[MMX_ROW_ACC];   /* one per row -- but shared! */
+```
+
+`static` was chosen to keep 1 KB off a 486's stack. When 1.20.0 added
+the thread pool, `q_matvec` began splitting a matvec's rows across
+workers -- and every worker then wrote that same array. `i8` and
+`avx2` accumulate in locals, so only MMX raced.
+
+### Why every existing test passed
+
+This is the part worth recording. Each dot product was still computed
+correctly; the rows simply trampled one another's scratch on the way
+out. So:
+
+- `t_ident` compared kernels **single-threaded** -> bit-identical.
+- A synthetic cross-check of every (format, ncols, nrows) shape
+  **single-threaded** -> all matched.
+- An instrumented build that ran `i8` and `mmx` on every real call
+  found **zero** mismatches -- because running `i8` first happened to
+  serialise the pair.
+- `t_thread` did test threading, but through `q_matvec`, which uses
+  whatever `auto` picks. On this machine that is `avx2`. **MMX was
+  never threaded by any test.**
+
+Four layers of correctness checking, and the gap was "which backend
+does the threading test actually exercise".
+
+### The fixes
+
+- The accumulators are now **automatic**, not `static`. 1 KB of stack
+  per call is affordable even on a Geode; a data race is not.
+- A bounds check: if a tensor were ever wider than `MMX_ROW_ACC`
+  covers, `qmv_mmx` now falls back to `qmv_i8` instead of smashing the
+  stack. Previously the limit was a comment.
+- `tests/t_thread.c` now runs **every** backend explicitly --
+  `ref`, `i8`, `mmx`, `avx2` -- rather than only the default.
+  Verified against the bug: with `static` restored it reports
+  6 nondeterministic configurations; with the fix, all stable.
+
+### Threading is now opt-in
+
+`--threads` defaults to **1**. It was "one per logical CPU", which
+meant a user who never asked for threading still got it -- and in this
+case got silent corruption. On a 2-core box it also bought nothing
+(14.48 -> 14.41 tok/s), because the memory bus was already saturated.
+
+Use `-T 0` for one thread per core, or `-T N` for a specific count.
+
 ## 1.21.1 — MMX Q6_K rewritten: 2.70 -> 3.18 tok/s
 
 Single core, sandbox Xeon, `--backend mmx`, Qwen3.5-0.8B-Q4_K_M:

@@ -13,7 +13,7 @@ a request end to end, and change something without breaking the rest.
 - [The layers](#the-layers)
 - [The model: what qwen35 actually is](#the-model-what-qwen35-actually-is)
 - [How a weight becomes a number](#how-a-weight-becomes-a-number)
-- [The three compute backends](#the-three-compute-backends)
+- [The four compute backends](#the-four-compute-backends)
 - [Byte order](#byte-order)
 - [Ownership and lifetimes](#ownership-and-lifetimes)
 - [Threading](#threading)
@@ -328,26 +328,45 @@ On the Geode with MMX: **2.08×** over the scalar path.
 
 ---
 
-## The three compute backends
+## The four compute backends
 
 `backend.c` owns a table, ordered fastest-first, and picks the first one
 the CPU supports:
 
 ```c
 static const bk_backend backends[] = {
-#ifdef INFER_HAVE_MMX
-    { "mmx", "...", mmx_ok,     qmv_mmx },
+#ifdef INFER_HAVE_AVX2
+    { "avx2", "...", bk_avx2_available, qmv_avx2 },
 #endif
-    { "i8",  "...", always_yes, qmv_i8  },
-    { "ref", "...", always_yes, qmv_ref }
+#ifdef INFER_HAVE_MMX
+    { "mmx",  "...", mmx_ok,     qmv_mmx },
+#endif
+    { "i8",   "...", always_yes, qmv_i8  },
+    { "ref",  "...", always_yes, qmv_ref }
 };
 ```
 
 | backend | where it runs | notes |
 |---|---|---|
+| `avx2` | x86 with AVX2 **and** OS `ymm` support | intrinsics, `backend_avx2.c`, the only object compiled `-mavx2`. Gated on CPUID *and* `XGETBV`. |
 | `mmx` | x86 with MMX | GNU inline asm, `backend_mmx.c`, compiled only with `-DINFER_HAVE_MMX`. Runtime-gated on CPUID. |
 | `i8` | **everywhere** | portable C89 integer kernels. Not x86-specific. |
 | `ref` | everywhere | scalar float reference. Correctness baseline. |
+
+Two things about this table are easy to get wrong:
+
+**Registration keys on `INFER_HAVE_AVX2`, not `__AVX2__`.** `backend.c`
+is compiled at the i486 baseline, so `__AVX2__` is false there even in
+a build that links the AVX2 object. Testing the codegen macro instead
+of the intent macro silently drops the kernel from every artifact —
+which happened once, and is now asserted in CI. (Finding 50.)
+
+**`auto` tries `avx2` before the `I8_IS_VECTORISED` preference.**
+Finding 33 established "prefer the portable `i8` once the compiler can
+vectorise", from a table whose only hand-written x86 entry was MMX at
+4 MACs per instruction. `VPMADDUBSW` does 32, so that conclusion
+inverts and `avx2` goes first; the finding-33 rule still applies
+below it.
 
 The only x86-specific code outside `backend_mmx.c` is the CPUID probe,
 which is `#if defined(__i386__) || defined(__x86_64__)` guarded and
@@ -435,12 +454,41 @@ and kernels read from there directly.
 
 ## Threading
 
-None. Single-threaded throughout, deliberately.
+**Opt-in, and off by default.** `--threads N` (`-T N`, `-T 0` for one
+per core) splits work across a small persistent pool in `tpool.c`
+(~230 lines over pthreads or Win32 events — no new library).
 
-The target is a single-core, in-order, 500 MHz CPU where threads add
-complexity and cache contention for no gain. The server handles one
-request at a time; the engine holds a single recurrent state, so
-requests are serialised and each resets that state.
+Two places are parallel, both because their units are independent:
+
+- **matvec rows** (`q_matvec` in `backend.c`). Each output row is a
+  separate dot product over shared read-only weights.
+- **Gated DeltaNet heads** (`layer_deltanet` in `qwen35.c`). Each head
+  owns its own 128×128 state and writes a disjoint slice of the output.
+
+**Rows are split, never dot products**, so every value is summed by the
+same code in the same order regardless of thread count — results are
+bit-identical, asserted by `tests/t_thread.c` across backends and
+thread counts.
+
+Three constraints follow, and all three have been violated at least
+once:
+
+1. **No `static` scratch in any kernel.** It becomes shared mutable
+   state the moment rows are split. The MMX kernels held their
+   accumulator in a `static` and produced fluent gibberish under
+   threading while every single-threaded test passed. (Finding 52.)
+2. **Activation quantisation happens once, before the split.**
+   `bk_quantize_x`/`bk_quantize_k` write one shared buffer, so
+   `q_matvec` fills it and then latches it with `bk_quantize_hold()`
+   for the duration of the parallel region.
+3. **The default is 1.** The original default was one thread per core,
+   which meant users who never asked for concurrency still got it —
+   and in the MMX case, silent corruption. It also bought nothing on a
+   2-core box (14.48 → 14.41 tok/s) because the memory bus was already
+   saturated.
+
+The server still handles one request at a time: the engine holds a
+single recurrent state, so requests are serialised and each resets it.
 
 ---
 

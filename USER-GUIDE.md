@@ -16,10 +16,11 @@ New here? [COMPILE.md](COMPILE.md) builds it; this explains using it.
 6. [`infer info`](#6-infer-info)
 7. [Sampling](#7-sampling)
 8. [Compute backends](#8-compute-backends)
-9. [Custom templates](#9-custom-templates)
-10. [MCP tools](#10-mcp-tools)
-11. [Measuring performance](#11-measuring-performance)
-12. [Troubleshooting](#12-troubleshooting)
+9. [Threads](#9-threads)
+10. [Custom templates](#10-custom-templates)
+11. [MCP tools](#11-mcp-tools)
+12. [Measuring performance](#12-measuring-performance)
+13. [Troubleshooting](#13-troubleshooting)
 
 ---
 
@@ -297,29 +298,76 @@ infer --backend list
 ```
 
 ```
-CPU: AuthenticAMD  features: mmx 3dnow cmov
+CPU: GenuineIntel  features: mmx cmov
 
 available backends:
-  mmx   ok  integer kernels with MMX inner loop      <- selected
-  i8    ok  integer kernels, portable C
-  ref   ok  scalar float reference, 486-safe
+  avx2  ok  integer kernels with AVX2 VPMADDUBSW inner loop (Haswell+)   <- selected
+  mmx   ok  integer kernels with MMX inner loop (Pentium MMX / K6 / Geode+)
+  i8    ok  integer kernels, portable C (recommended)
+  ref   ok  scalar float reference, maximum portability (486-safe)
 ```
 
-| backend | requires | speed |
+| backend | requires | notes |
 |---|---|---|
-| `mmx` | MMX (Pentium MMX, K6, Geode LX+) | fastest |
-| `i8` | 486 | ~2× `ref` |
+| `avx2` | AVX2 **and** OS `ymm` support (Haswell 2013+, Windows 7 SP1+) | fastest by far |
+| `mmx` | MMX (Pentium MMX, K6, Geode LX+) | fastest without AVX2 |
+| `i8` | 486 | portable integer path |
 | `ref` | 486 | reference / ground truth |
 
-Chosen automatically by CPUID. Override with `--backend mmx|i8|ref`.
+Chosen automatically after a CPUID probe. Override with
+`--backend avx2|mmx|i8|ref`.
+
+**All four are in every binary**, including the 32-bit one. Only the
+AVX2 kernel is compiled with AVX2 instructions, in its own object,
+behind a runtime gate — so the same executable starts on a 486 and
+uses AVX2 on a modern chip.
+
+The AVX2 gate checks CPUID **and** `XGETBV`. Windows XP never saved
+the `ymm` registers across a context switch, so an XP machine on
+Haswell silicon reports AVX2 in CPUID and cannot execute it; checking
+only CPUID would crash instead of falling back to `mmx`.
+
+One result that surprises people: **on a modern 64-bit build `i8` is
+faster than `mmx`.** With SSE2 guaranteed, the compiler vectorises the
+portable `i8` loops past the hand-written 64-bit MMX kernel, and
+`auto` prefers it. In the 32-bit build, compiled to an i486 baseline,
+`i8` stays scalar and `mmx` wins. Both are right for their target.
 
 **If output ever looks wrong, `--backend ref` is the numerical ground
-truth.** 2,244 automated comparisons across every tensor currently show
-zero discrepancies, but that is the check to run.
+truth.** `avx2`, `mmx`, `i8` and `ref` agree bit-for-bit on the
+k-quant formats, except the AVX2 k-quant kernels, which are
+deliberately a different (equally valid) rounding — bounded against
+`ref` by `tests/t_avx2acc.c`.
 
 ---
 
-## 9. Custom templates
+## 9. Threads
+
+**`infer` runs single-threaded unless you ask otherwise.**
+
+```sh
+infer run model.gguf -p "hi"            # 1 thread (default)
+infer run model.gguf -p "hi" -T 4       # 4 threads
+infer run model.gguf -p "hi" -T 0       # one thread per logical CPU
+```
+
+`--threads` / `-T` splits the rows of each matrix-vector product
+across cores. Rows are independent, so **the result is bit-identical
+at any thread count** — no partial sum ever crosses a thread.
+
+It is opt-in for two reasons. It is a throughput trade rather than a
+free win: this workload streams the whole model once per token, and on
+a 2-core machine the memory bus was already saturated at one thread
+(14.48 → 14.41 tok/s, i.e. nothing). And a default that quietly uses
+every core is the wrong default for the hardware this project targets.
+
+More cores help most when memory bandwidth is not the limit — a
+6-core desktop with fast RAM will scale further than a 2-core laptop.
+Measure with `--log-perf` rather than assuming.
+
+---
+
+## 10. Custom templates
 
 ```sh
 infer chat  model.gguf --template mytemplate.jinja
@@ -331,7 +379,7 @@ debug a template with `/prompt`.
 
 ---
 
-## 10. MCP tools
+## 11. MCP tools
 
 ```sh
 python3 tools/mcp_test_server.py 3000          # a test server
@@ -361,7 +409,7 @@ the model is small.
 
 ---
 
-## 11. Measuring performance
+## 12. Measuring performance
 
 ```sh
 infer run model.gguf -p "..." -n 10 -t 0 --log-perf
@@ -387,7 +435,7 @@ Reference numbers:
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 **`architecture 'llama' is not supported`** — this engine implements
 `qwen35` only. Check with `infer info`.

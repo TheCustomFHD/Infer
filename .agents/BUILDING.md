@@ -233,10 +233,15 @@ objdump -d infer-$V-linux | grep -cE 'pmaddwd|punpcklbw|paddd'
 CPU: GenuineIntel  features: mmx cmov
 
 available backends:
-  mmx   ok  integer kernels with MMX inner loop (Pentium MMX / K6 / Geode+)   <- selected
+  avx2  ok  integer kernels with AVX2 VPMADDUBSW inner loop (Haswell+)   <- selected
+  mmx   ok  integer kernels with MMX inner loop (Pentium MMX / K6 / Geode+)
   i8    ok  integer kernels, portable C (recommended)
   ref   ok  scalar float reference, maximum portability (486-safe)
 ```
+
+All four must be listed even in the 32-bit build. If `avx2` is missing
+the two-stage compile broke, or the backend table was gated on
+`__AVX2__` instead of `INFER_HAVE_AVX2` (finding 50).
 
 ---
 
@@ -248,9 +253,20 @@ make test
 ./build/t_agent      # cross-mode prompts, tool-call shapes
 ./build/t_endian     # byte-order neutrality
 ./build/t_jinja      # template engine
+
+make i8-split-test
+./build/t_ident      # every backend bit-identical (memcmp, not tolerance)
+./build/t_avx2sat    # VPMADDUBSW cannot saturate on any format
+./build/t_avx2acc    # AVX2 k-quant error bounded against the float ref
+./build/t_thread     # every backend deterministic under threading
+./build/t_thread 4   # ...and at several thread counts
 ```
 
 Each ends in a line saying it passed.
+
+`t_thread` loops over every backend **by name**. Testing only whatever
+`auto` picks is what let a threading race in `mmx` reach a release
+(finding 52).
 
 With a model, the strongest test is making the backends disagree:
 

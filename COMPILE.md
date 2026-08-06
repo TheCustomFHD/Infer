@@ -116,7 +116,7 @@ rebuilding.
 
 | flag | effect |
 |---|---|
-| `PROFILE=1` | per-stage timers; binary named `...-profile` |
+| `PROFILE=1` | per-stage timers (every shipped build has them) |
 | `NATIVE=1` | `-march=native`; **runs only on the build machine** |
 | `BITS=64` | 64-bit Linux, named `...-linux64` (default 32-bit) |
 | `TOOLCHAIN=gcc` | Solaris via GCC instead of Sun Studio |
@@ -384,10 +384,38 @@ cc -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O2 \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
-   src/util.c src/prof.c src/net_posix.c src/sys_posix.c \
+   src/util.c src/prof.c src/tpool.c src/backend_a2stub.c \
+   src/net_posix.c src/sys_posix.c \
    src/backend_mmx.c \
-   -lm
+   -lm -lpthread
 ```
+
+That command produces a working 486-baseline binary with `mmx`, `i8`
+and `ref`. To also get the AVX2 kernel it needs **two stages**, because
+`backend_avx2.c` is the only file that may be compiled with AVX2:
+
+```sh
+# stage 1: the gated AVX2 object, and ONLY this file, with -mavx2
+cc -std=gnu89 -O3 -march=haswell -mavx2 -ffp-contract=off -mmmx \
+   -DINFER_HAVE_MMX -DINFER_HAVE_AVX2 -DINFER_HAVE_THREADS \
+   -m32 -D_FILE_OFFSET_BITS=64 -Isrc \
+   -c -o backend_avx2.o src/backend_avx2.c
+
+# stage 2: everything else at the i486 baseline, linking that object.
+#          note -DINFER_A2_LINKED, which tells backend_a2stub.c to
+#          stand down because the real helpers are in the link.
+cc -std=gnu89 -O3 -march=i486 -mtune=geode -mmmx \
+   -mno-sse -mno-sse2 -mfpmath=387 \
+   -DINFER_HAVE_MMX -DINFER_HAVE_AVX2 -DINFER_HAVE_THREADS \
+   -DINFER_A2_LINKED -m32 -D_FILE_OFFSET_BITS=64 \
+   -o infer-<version>-linux \
+   src/main.c ... src/backend_mmx.c backend_avx2.o -lm -lpthread
+```
+
+**Compiling everything in one command with `-mavx2` would apply it to
+every file, and the binary would fault on a 486 before reaching
+`main()`.** `make linux` does the two stages for you; this is only
+here for people building without make.
 
 ### Read those flags carefully — every one is deliberate
 
@@ -655,7 +683,8 @@ cc -Xc -xc99=none -xO5 -xunroll=16 -m64 -xtarget=native \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
-   src/util.c src/prof.c src/net_posix.c src/sys_posix.c \
+   src/util.c src/prof.c src/tpool.c src/backend_a2stub.c \
+   src/net_posix.c src/sys_posix.c \
    -lm -lsocket -lnsl
 ```
 
@@ -854,7 +883,8 @@ s390x-linux-gnu-gcc -std=c89 -pedantic -Wall -Wextra -Wno-unused-parameter \
    src/main.c src/opts.c src/server.c src/chat.c src/agent.c \
    src/jinja.c src/jinja_eval.c src/mcp.c src/qwen35.c src/tokenizer.c \
    src/sampler.c src/quant.c src/backend.c src/gguf.c src/json.c \
-   src/util.c src/prof.c src/net_posix.c src/sys_posix.c -lm
+   src/util.c src/prof.c src/tpool.c src/backend_a2stub.c \
+   src/net_posix.c src/sys_posix.c -lm
 
 qemu-s390x-static ./infer-<version>-s390x-linux run model.gguf \
     -p "The capital of France is" -n 8 -t 0 --seed 1 -c 256

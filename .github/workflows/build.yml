@@ -393,11 +393,37 @@ jobs:
           make i8-split-test BITS=64 ISA=avx2
           ./build/t_avx2sat
           ./build/t_avx2acc
+          # t_thread loops over every backend by name (finding 52):
+          # testing only the one `auto` picks left mmx unthreaded by
+          # any test, and mmx was the backend that raced.
           ./build/t_thread
           ./build/t_thread 1
           ./build/t_thread 4
+          ./build/t_thread 8
           make clean >/dev/null
           make all
+
+      # No kernel may keep per-call scratch in a `static`: the thread
+      # pool splits rows across workers, so a shared buffer is a data
+      # race that produces plausible-looking wrong output rather than
+      # a crash. (Finding 52.)
+      - name: no static scratch in the backends
+        run: |
+          n=$(grep -nE '^[[:space:]]+static [a-z_ ]+[a-zA-Z_]+\[' \
+              src/backend.c src/backend_mmx.c src/backend_avx2.c \
+              | grep -v const | wc -l)
+          echo "static scratch arrays in backend sources: $n (want 0)"
+          if [ "$n" -ne 0 ]; then
+            grep -nE '^[[:space:]]+static [a-z_ ]+[a-zA-Z_]+\[' \
+              src/backend.c src/backend_mmx.c src/backend_avx2.c | grep -v const
+            exit 1
+          fi
+
+      - name: threading defaults to one thread
+        run: |
+          # Threading is opt-in. A user who never asked for it must not
+          # get it -- that is how the mmx race reached a release.
+          ./"$LINUX" run /nonexistent.gguf -v 2>&1 | grep -q 'threads: 1'
 
       - name: NO_THREADS=1 compiles the pool away
         run: |

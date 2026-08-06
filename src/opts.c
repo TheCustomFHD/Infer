@@ -149,7 +149,7 @@ static const opt_def opts[] = {
   "per-format kernel: q4k=mmx, or `bench` to measure, or `list`" },
 
 { O_THREADS, "--threads", "-T", "<n>", 0, MODE_ALL,   G_PERF,
-  "worker threads for matvec (default: one per core, 1 disables)" },
+  "worker threads for matvec (default 1; 0 = one per core)" },
 
 { O_VERBOSE, "--verbose", "-v", NULL, 0, MODE_ALL,   G_OTHER,
   "log progress and each request" },
@@ -192,6 +192,12 @@ void opts_default(infer_opts *o) {
     o->tool_rounds = 4;
     o->show_tools  = 1;
     o->thinking    = 0;
+    /* Single-threaded by default. Threading is opt-in because it is a
+     * throughput trade, not a free win: on a 2-core box it bought
+     * nothing over a saturated memory bus, and it turns a wrong
+     * --threads guess into a support problem. Ask for it explicitly
+     * with --threads/-T. */
+    o->threads     = 1;
     sampler_default(&o->sp);
 }
 

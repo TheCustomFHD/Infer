@@ -102,6 +102,32 @@ static int check(int type, const char *name, long ncols, int nrows) {
     return bad;
 }
 
+/* Run the whole matrix of formats against ONE named backend.
+ *
+ * Testing only whatever `auto` picks is not enough: on a machine with
+ * AVX2 that never exercises mmx, and mmx was the backend that broke.
+ * Its kernels used `static` scratch arrays, so threaded rows raced
+ * through one buffer -- every individual dot product still correct,
+ * so t_ident passed, while the model emitted gibberish. (Finding 52.) */
+static int run_all(const char *backend) {
+    int bad = 0;
+
+    if (bk_select(backend) != 0) {
+        printf("  (%s unavailable on this CPU, skipped)\n", backend);
+        return 0;
+    }
+    printf("  backend %s:\n", backend);
+    bad += check(GGML_TYPE_Q4_K, "Q4_K", 1024, 512);
+    bad += check(GGML_TYPE_Q5_K, "Q5_K", 1024, 512);
+    bad += check(GGML_TYPE_Q6_K, "Q6_K", 1024, 512);
+    bad += check(GGML_TYPE_Q8_0, "Q8_0", 1024, 512);
+    /* a row count that does not divide evenly by the thread count --
+     * the remainder slice is the caller's and is easy to get wrong */
+    bad += check(GGML_TYPE_Q4_K, "Q4_K", 1024, 517);
+    bad += check(GGML_TYPE_Q6_K, "Q6_K", 1024,  65);
+    return bad;
+}
+
 int main(int argc, char **argv) {
     int want = (argc > 1) ? atoi(argv[1]) : 0;
     int bad = 0;
@@ -111,14 +137,15 @@ int main(int argc, char **argv) {
     printf("thread determinism: pool has %d thread(s), %d logical CPU(s)\n\n",
            n, tp_cpu_count());
 
-    bad += check(GGML_TYPE_Q4_K, "Q4_K", 1024, 512);
-    bad += check(GGML_TYPE_Q5_K, "Q5_K", 1024, 512);
-    bad += check(GGML_TYPE_Q6_K, "Q6_K", 1024, 512);
-    bad += check(GGML_TYPE_Q8_0, "Q8_0", 1024, 512);
-    /* a row count that does not divide evenly by the thread count --
-     * the remainder slice is the caller's and is easy to get wrong */
-    bad += check(GGML_TYPE_Q4_K, "Q4_K", 1024, 517);
-    bad += check(GGML_TYPE_Q6_K, "Q6_K", 1024,  65);
+    /* EVERY backend, not just the one `auto` happens to choose. */
+    bad += run_all("ref");
+    bad += run_all("i8");
+#ifdef INFER_HAVE_MMX
+    bad += run_all("mmx");
+#endif
+#ifdef INFER_HAVE_AVX2
+    bad += run_all("avx2");
+#endif
 
     tp_stop();
 

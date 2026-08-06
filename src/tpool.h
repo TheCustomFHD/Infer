@@ -21,7 +21,8 @@
 /* Work function: process rows [lo, hi). */
 typedef void (*tp_fn)(void *arg, long lo, long hi);
 
-/* Create the pool. nthreads <= 0 means "one per logical CPU".
+/* Create the pool. nthreads <= 0 means "one per logical CPU"; the CLI
+ * defaults to 1, so threading is opt-in.
  * Returns the total number of participating threads (including the
  * caller). Safe to call more than once; only the first takes effect. */
 int  tp_start(int nthreads);

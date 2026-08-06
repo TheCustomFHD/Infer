@@ -4,8 +4,9 @@ A self-contained GGUF inference server and chat client for **Qwen3.5**,
 written in **ANSI C (C89)** with **no dependencies** beyond the C
 standard library and the operating system's own socket calls.
 
-CPU only. No SSE, no threads, no BLAS, no `ggml`, no `libcurl`, no JSON
-library. The target is a **486**.
+CPU only. No BLAS, no `ggml`, no `libcurl`, no JSON library. The
+baseline target is a **486** — and the same binary uses AVX2 on a
+modern chip, decided at run time.
 
 ![infer running](imgs/example.jpg)
 
@@ -75,6 +76,8 @@ Nothing to `pip install`, no CMake, no submodules.
 | **[docs/TEMPLATES.md](docs/TEMPLATES.md)** | custom Jinja templates |
 | **[docs/files/](docs/files/)** | one document per source file |
 | **[docs/files/opts-c.md](docs/files/opts-c.md)** | how one option table drives parsing, help and validation |
+| **[docs/files/backend_avx2-c.md](docs/files/backend_avx2-c.md)** | the AVX2 kernels, and how AVX2 lives inside a 486 binary |
+| **[docs/files/tpool-c.md](docs/files/tpool-c.md)** | the thread pool and its three hazards |
 | **[docs/files/agent-c.md](docs/files/agent-c.md)** | shared prompt building and tool calling |
 
 ---
@@ -117,16 +120,23 @@ Three targets. Everything else is a flag.
 make linux              # Linux/x86    -> infer-<version>-linux
 make windows            # Windows/x86  -> infer-<version>-windows.exe
 make solaris            # Solaris/SPARC-> infer-<version>-solaris
-make all                # all six shipping artifacts
+make all                # all four shipping artifacts
 
 make test               # the test suite
 ```
 
 **Every accelerated kernel is compiled in and chosen at run time** after
-a CPUID / feature probe. The x86 binaries carry `mmx`, `i8` and `ref`; the Solaris binary
-carries `vis`, `i8` and `ref`. One
-binary per platform: `make linux` runs on a 486 and accelerates on
-anything newer.
+a CPUID probe (plus `XGETBV` for AVX2). The x86 binaries carry `avx2`,
+`mmx`, `i8` and `ref`; the Solaris binary carries `vis`, `i8` and
+`ref`. One binary per platform: `make linux` runs on a 486 and
+accelerates on anything newer.
+
+Only `backend_avx2.c` is compiled with `-mavx2`, into its own object.
+Everything else — including `qmv_i8`, `qmv_mmx` and `qmv_ref` — is
+built at the i486 baseline, so the AVX2 code is present but
+unreachable unless the CPU *and* the OS support it. There is no
+`-sse2` or `-avx2` download to choose between, and no way to pick
+wrong.
 
 Runtime selection costs one indirect call per matrix *row* — measured at
 the noise floor on both x86-64 and an i486-targeted build.
@@ -149,12 +159,13 @@ bit-identical on every format, so this is purely a speed choice.
 
 | flag | effect |
 |---|---|
-| `PROFILE=1` | per-stage timers; names the binary `...-profile` |
+| `PROFILE=1` | per-stage timers (all shipped builds have them) |
 | `NATIVE=1` | `-march=native`; **only runs on the build machine** |
-| `BITS=64` | 64-bit Linux build, named `...-linux64` (default 32-bit) |
+| `BITS=64` | 64-bit build (default 32-bit) |
 | `TOOLCHAIN=gcc` | build Solaris with GCC instead of Sun Studio |
-| `NO_MMX=1` `NO_VIS=1` | leave a kernel out |
-| `NO_SSE2=1` `NO_AVX2=1` | reserved for the dedicated SSE2/AVX2 kernels (not yet written) |
+| `NO_MMX=1` `NO_AVX2=1` `NO_VIS=1` | leave a kernel out |
+| `NO_THREADS=1` | compile the thread pool away entirely |
+| `NO_SSE2=1` | reserved; a hand-written SSE2 kernel is not yet written |
 
 ```sh
 make linux PROFILE=1            # timers
@@ -162,16 +173,27 @@ make linux BITS=64 NATIVE=1     # fastest on this machine only
 make solaris TOOLCHAIN=gcc      # GCC instead of Sun Studio
 ```
 
-`make all` builds the six shipping artifacts — 32-bit and 64-bit Linux
-and 32-bit Windows, each with and without timers. `NATIVE=1` is
-excluded on purpose: it only runs on the machine that built it.
+`make all` builds the four shipping artifacts — 32-bit and 64-bit, for
+Linux and Windows. All four are i486-baseline and carry every kernel.
+`NATIVE=1` is excluded on purpose: it only runs on the machine that
+built it.
 
-Which backend each one picks is decided at run time:
+Which backend each picks is decided at run time, by the CPU it finds:
 
-| artifact | picks | why |
-|---|---|---|
-| `-linux`, `-windows.exe` | `mmx` | i486 baseline, no SSE2 available |
-| `-linux64` | `i8` | x86-64 implies SSE2, so the compiler vectorises `i8` past the hand-written MMX kernel |
+| CPU | picks |
+|---|---|
+| Haswell (2013) and later, with OS `ymm` support | `avx2` |
+| Pentium MMX / K6 / Geode / anything with MMX | `mmx` |
+| 486 with no MMX | `i8` |
+| anything, as numerical ground truth | `ref` |
+
+One subtlety worth stating, because it looks like a contradiction:
+**`i8` beats `mmx` in the 64-bit build but not the 32-bit one.** On
+x86-64 the compiler may assume SSE2 and vectorises the portable `i8`
+loops past the hand-written 64-bit MMX kernel, so `auto` prefers it
+(finding 33). At the i486 baseline neither `__SSE2__` nor `__AVX2__`
+is defined, `i8` stays scalar, and `mmx` wins. Both are correct for
+their target.
 
 The profiler stays a **compile-time** choice: its timers sit inside the
 per-layer path, so a runtime test would tax every build, including the
@@ -180,9 +202,11 @@ slow machines this project exists for.
 Solaris/SPARC is deliberately separate: different compiler, different
 flags, big-endian, 64-bit.
 
-Every target compiles with **zero warnings**. The i486 build was
-disassembled and audited: **no SSE, MMX, CMOV or any post-486
-instruction**. The Windows binaries import exactly three DLLs —
+Every target compiles with **zero warnings**. The i486 baseline is
+audited in CI: every object except the gated `backend_avx2.o` contains
+**no CMOV and no SSE/AVX**, and a `NO_AVX2=1` rebuild of the shipped
+binary contains zero `xmm`/`ymm` references at all. The Windows
+binaries are PE32 subsystem 4.00 and import exactly three DLLs —
 KERNEL32, msvcrt, WS2_32 — all present on a stock XP install.
 
 Full detail in [COMPILE.md](COMPILE.md).
@@ -207,7 +231,10 @@ src/
   jinja_eval.c    Jinja2 subset: parser and interpreter
   mcp.c           MCP client over HTTP
   backend.c       CPU detection, backend selection, i8 kernels
-  backend_mmx.c   MMX kernels (optional)
+  backend_mmx.c   MMX kernels (optional, -DINFER_HAVE_MMX)
+  backend_avx2.c  AVX2 kernels -- the ONLY object built with -mavx2
+  backend_a2stub.c  fallbacks when that object is not linked
+  tpool.c         thread pool for row-parallel matvec (optional)
   quant.c         Q4_K/Q5_K/Q6_K/Q8_0 decoders + the float reference
   gguf.c          GGUF container reader
   sampler.c       temperature / top-k / top-p / repeat penalty
@@ -257,15 +284,33 @@ reference graph: both produce identical ranked logits.
 
 ## Performance
 
-Single-threaded by design.
+Single-threaded **by default**. `--threads N` (`-T N`) splits matvec
+rows across cores; `-T 0` means one per core. It is opt-in because it
+is a throughput trade rather than a free win — on a 2-core box it
+bought nothing over an already-saturated memory bus — and because a
+default that silently uses every core is a poor default for the
+hardware this project targets. Results are bit-identical at any thread
+count: rows are split, never dot products.
 
-| machine | s/token |
-|---|---|
-| Intel i7-9750H | ~0.4 |
-| AMD Geode LX 800 @ 500 MHz | ~15.8 |
+Generation rate, Qwen3.5-0.8B-Q4_K_M, single core:
 
-Both compute kernels are within ~10% of what the hardware allows —
-`mmx` at 8.9 cycles/MAC, `i8` at 21.8 against a modelled floor of ~22.
+| machine | backend | tok/s |
+|---|---|---|
+| Intel i7-9750H (user hardware) | `avx2`, 64-bit | ~12 |
+| Intel i7-9750H | `avx2`, 32-bit | ~10.5 |
+| Xeon @ 2.60 GHz (CI sandbox) | `avx2`, 64-bit | 14.5 |
+| Xeon @ 2.60 GHz | `mmx` | 3.2 |
+| AMD Geode LX 800 @ 500 MHz | `mmx` | ~0.06 (~15.8 s/token) |
+
+The AVX2 path went 6.35 → 14.5 tok/s over 1.19–1.21 and is now
+**memory-bound at roughly 71% of the machine's streaming ceiling**.
+The MMX path is **instruction-bound**, using only ~14% of available
+bandwidth: `Q4_K` runs at 1.19 MMX instructions per weight, and six of
+its nineteen instructions per sixteen weights are `PUNPCK` widening
+that exists only because `PMADDWD` takes words. MMX has no
+unsigned-byte multiply-accumulate, so that is close to the floor for
+Geode-class hardware.
+
 [docs/PERFORMANCE-ANALYSIS.md](docs/PERFORMANCE-ANALYSIS.md) documents
 the measurements and every rejected optimisation.
 

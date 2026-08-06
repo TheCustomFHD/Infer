@@ -1,14 +1,17 @@
 # Where the time goes, and why the kernels are done
 
-A record of the optimisation effort on an **AMD Geode LX 800 @ 500 MHz**
-running `Qwen3.5-0.8B-Q4_K_M`, so the reasoning is not lost and the dead
-ends are not retried.
+A record of the optimisation effort on `Qwen3.5-0.8B-Q4_K_M`, so the
+reasoning is not lost and the dead ends are not retried.
 
-All figures are measured on that hardware unless stated.
+Most of this document concerns the **AMD Geode LX 800 @ 500 MHz** and
+the MMX path. Figures are from that hardware unless stated; the AVX2
+section below is measured on a Xeon @ 2.60 GHz.
 
 ---
 
 ## The short version
+
+**Geode LX 800, MMX path:**
 
 | backend | s/token | cycles/MAC | status |
 |---|---|---|---|
@@ -16,8 +19,36 @@ All figures are measured on that hardware unless stated.
 | `i8` | 33.29 | 21.8 | **at its floor** |
 | `ref` | ~90 | — | reference only |
 
-Both kernels are within ~10% of what the hardware can do. Further
-optimisation has to change *what is computed*, not *how*.
+**Modern x86, single core, generation tok/s (Xeon @ 2.60 GHz):**
+
+| backend | tok/s | bound by |
+|---|---|---|
+| `avx2` | 14.5 | memory — ~71% of the streaming ceiling |
+| `mmx` | 3.2 | instructions — only ~14% of bandwidth used |
+| `i8` (64-bit, vectorised) | ~12.8 | memory |
+
+The two paths are limited by different things, which is why they need
+different work:
+
+- **AVX2 is memory-bound.** 6.35 → 14.5 tok/s over 1.19–1.21 came from
+  threading, adopting llama.cpp's kernel shape (Q8_K-style activation
+  plane, integer-domain scaling, one float convert per superblock),
+  prefetch distance tuning, and vectorising the activation quantiser
+  and the DeltaNet recurrence. Further gains need fewer *bytes*.
+- **MMX is instruction-bound.** `Q4_K` runs at **1.19 MMX instructions
+  per weight**, and six of its nineteen per sixteen weights are
+  `PUNPCK` widening that exists only because `PMADDWD` consumes words.
+  MMX has no unsigned-byte multiply-accumulate — `PMADDUBSW` is SSSE3
+  (2006) and Extended MMX on the Geode adds nothing that helps. Even
+  driving `Q5_K` (1.88) and `Q6_K` (2.12) down to `Q4_K`'s 1.19 would
+  be 1.37×. Further gains need less *work*, not faster instructions:
+  lm-head requantisation or vocabulary pruning.
+
+A caution that recurs throughout: **isolated kernel wins do not always
+survive the whole model.** A Q5_K change that improved the kernel
+0.103 → 0.086 ns/weight made the model *slower* (12.9 vs 13.3 tok/s),
+and the Q6_K bias trick improved the kernel while costing 1.4% end to
+end. Every change here was A/B'd against the full model.
 
 ---
 

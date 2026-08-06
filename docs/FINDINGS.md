@@ -2141,6 +2141,63 @@ inner loop**, which is what makes lm-head requantisation (25% of the
 pass, in the most expensive format per weight) the next lever rather
 than more instruction-shaving.
 
+## 52. `static` scratch + a thread pool = silent corruption, and four
+## test layers that all missed it
+
+1.20.0 added row-parallel matvec. The MMX kernels kept their per-row
+integer accumulator in a `static` array -- chosen originally to keep
+1 KB off a 486's stack -- so every worker wrote the same buffer. The
+model produced fluent gibberish; `i8`, `avx2` and `ref` were fine
+because they accumulate in locals.
+
+**Every individual dot product was still correct.** The rows raced
+through one scratch array on the way out. That is what made it
+invisible:
+
+| check | why it passed |
+|---|---|
+| `t_ident` (memcmp, all formats) | single-threaded |
+| synthetic sweep of every (format, ncols, nrows) | single-threaded |
+| instrumented build comparing `i8` vs `mmx` on every real call | running `i8` first serialised the pair |
+| `t_thread` | went through `q_matvec`, which uses whatever `auto` picks -- `avx2` here. **MMX was never threaded by any test.** |
+
+The third one is the most instructive: adding the cross-check *made
+the bug disappear*, because it introduced an ordering the buggy code
+depended on. A debugging tool that perturbs the thing it measures will
+happily prove the wrong conclusion.
+
+**The rule that would have caught it:** a test that exercises "the
+default configuration" tests one point in the matrix. If a property is
+claimed for N backends, the test must loop over N backends by name.
+`t_thread` now does, and with the `static` restored it reports six
+nondeterministic configurations -- so the test demonstrably has the
+power to catch the bug it was written for.
+
+### Secondary fixes
+
+- The `MMX_ROW_ACC` bound was enforced only by a comment. `qmv_mmx`
+  now computes the requirement and falls back to `qmv_i8` if a tensor
+  would exceed it, rather than smashing the stack.
+- Threading became **opt-in** (`--threads` defaults to 1). Defaulting
+  to one-thread-per-core meant users who never asked for concurrency
+  still got it, and here that meant silent corruption. It also bought
+  nothing on the 2-core test box: 14.48 -> 14.41 tok/s, because the
+  memory bus was already saturated at one thread.
+
+**The wider lesson:** `static` local buffers are a single-threaded
+idiom. Introducing a thread pool invalidates every one of them at
+once, and the compiler will not say a word. When adding concurrency,
+grep for `static` in every function the new parallel region can reach
+-- that search takes a minute and would have found this before it
+shipped.
+
+Done for this tree: the only remaining `static` scratch is in
+`bpe_word` (`src/tokenizer.c`), and the pool has exactly two worker
+bodies -- `mv_slice` and `dn_recur_slice` -- neither of which can
+reach the tokenizer, because tokenisation completes before the first
+forward pass. It is safe, and now on record as *checked* rather than
+assumed.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

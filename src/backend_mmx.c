@@ -146,7 +146,26 @@ const void *mmx_const_addrs[5] = {
  * the sync. See the mmx_row_* functions below. */
 /* Largest number of per-sub-row accumulators a single matrix row can
  * need: the widest tensor here is 3584 columns (ffn_down) = 14 blocks of
- * 256, 8 accumulators each. Rounded up generously. */
+ * 256. Q6_K needs 16 per block (two half-blocks x 8 groups) = 224;
+ * Q8_0/Q4_0 need one per 32 columns = 112. Rounded up generously.
+ *
+ * These arrays are AUTOMATIC, deliberately.
+ *
+ * They used to be `static`, to keep 1 KB off a 486's stack. That made
+ * every MMX kernel thread-unsafe: q_matvec splits a matvec's rows
+ * across the pool, and each worker then wrote the same shared buffer.
+ * The dot products were all individually correct -- t_ident and a
+ * synthetic cross-check both passed -- but the rows raced through one
+ * array and the model emitted fluent gibberish. i8 and avx2 were never
+ * affected because they accumulate in locals.
+ *
+ * 1 KB of stack per call is affordable even on the Geode; correctness
+ * under threading is not optional. tests/t_thread.c now covers the
+ * mmx backend explicitly. (Finding 52.)
+ *
+ * 256 covers every kernel: Q6_K's 224 is the worst case, and Q8_0 /
+ * Q4_0 need one accumulator per 32 columns = 112 at 3584 columns.
+ * A bounds assert guards the assumption rather than trusting it. */
 #define MMX_ROW_ACC 256
 
 static void mmx_sync(void) {
@@ -642,7 +661,7 @@ static void mmx_q4_0_block(const unsigned char *q, const short *x, int *acc) {
 static float mmx_dot_q4_K(const unsigned char *b, const bk_qx *xq, long ncols) {
     /* 8 sub-row accumulators per 256-block; the widest row in this model
      * is 3584 columns = 14 blocks = 112 ints. */
-    static int acc[MMX_ROW_ACC];
+    int acc[MMX_ROW_ACC];
     const unsigned char *b0 = b;
     float sum = 0.0f;
     long c;
@@ -693,7 +712,7 @@ static float mmx_dot_q4_K(const unsigned char *b, const bk_qx *xq, long ncols) {
 
 /* Q5_K row -- same two-phase split as Q4_K. */
 static float mmx_dot_q5_K(const unsigned char *b, const bk_qx *xq, long ncols) {
-    static int acc[MMX_ROW_ACC];
+    int acc[MMX_ROW_ACC];
     const unsigned char *b0 = b;
     float sum = 0.0f;
     long c;
@@ -747,7 +766,7 @@ static float mmx_dot_q5_K(const unsigned char *b, const bk_qx *xq, long ncols) {
 
 /* Q6_K row -- same two-phase split. 8 accumulators per half-block. */
 static float mmx_dot_q6_K(const unsigned char *b, const bk_qx *xq, long ncols) {
-    static int acc[MMX_ROW_ACC];
+    int acc[MMX_ROW_ACC];
     const unsigned char *b0 = b;
     float sum = 0.0f;
     long c;
@@ -789,7 +808,7 @@ static float mmx_dot_q6_K(const unsigned char *b, const bk_qx *xq, long ncols) {
 
 /* Q8_0 row -- same two-phase split. */
 static float mmx_dot_q8_0(const unsigned char *b, const bk_qx *xq, long ncols) {
-    static int acc[MMX_ROW_ACC * 4];
+    int acc[MMX_ROW_ACC];
     const unsigned char *b0 = b;
     float sum = 0.0f;
     long c;
@@ -815,7 +834,7 @@ static float mmx_dot_q8_0(const unsigned char *b, const bk_qx *xq, long ncols) {
 
 /* Q4_0 row -- same two-phase split. */
 static float mmx_dot_q4_0(const unsigned char *b, const bk_qx *xq, long ncols) {
-    static int acc[MMX_ROW_ACC * 4];
+    int acc[MMX_ROW_ACC];
     const unsigned char *b0 = b;
     float sum = 0.0f;
     long c;
@@ -848,10 +867,24 @@ void qmv_mmx(int type, const unsigned char *w, const float *x, float *y,
              long ncols, long nrows) {
     const bk_qx *xq;
     long rowbytes, r;
+    long need;
 
     if (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
         (ncols % 32) != 0) {
         qmv_ref(type, w, x, y, ncols, nrows);
+        return;
+    }
+
+    /* The per-row accumulator arrays are fixed size. Rather than trust
+     * that no tensor is wider than this model's, check: a wider one
+     * would silently smash the stack. Falling back to the portable
+     * kernel is always correct, just slower. */
+    need = (type == GGML_TYPE_Q6_K) ? (ncols / 256) * 16
+         : (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0)
+             ? (ncols / 32)
+             : (ncols / 256) * 8;
+    if (need > MMX_ROW_ACC) {
+        qmv_i8(type, w, x, y, ncols, nrows);
         return;
     }
 

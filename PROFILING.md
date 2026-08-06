@@ -7,11 +7,21 @@ Two separate features. You can use either or both.
 | **Throughput log** | `--log-perf` at run time | ~2 clock reads per request | TTFT, tokens/second and seconds/token, per request |
 | **Stage profile** | `-DINFER_PROFILE` at build time **and** `--log-stages` at run time | ~2% (measured) | Where the time actually goes, per layer type and per weight format |
 
+**Pin the thread count when benchmarking.** `--threads` defaults to 1,
+but if you pass `-T 0` or `-T N` the number of cores becomes part of
+the measurement. Compare like with like, and say which you used:
+
+```sh
+infer run model.gguf -p "..." -n 40 -t 0 --seed 1 -c 256 \
+    -T 1 --log-perf          # single core, the comparable default
+```
+
 **Both are opt-in.** Building with `-DINFER_PROFILE` makes measurement
 *possible*; `--log-stages` asks for it. Before 1.10.0 a profile build
 printed a full report after every request whether or not you wanted one,
 which made `infer-profile.exe` unpleasant for ordinary use — it is now
-as quiet as any other build until you ask.
+as quiet as any other build until you ask. That is what lets the
+shipped binaries carry the timers unconditionally.
 
 The stage profile is a **compile-time** option on purpose. Without
 `-DINFER_PROFILE` every timer macro expands to nothing — verified with
@@ -77,12 +87,18 @@ There are three targets and `PROFILE=1`:
 ```sh
 make linux PROFILE=1      # -> infer-<version>-linux
 make windows PROFILE=1    # -> infer-<version>-windows.exe
-make solaris PROFILE=1    # -> infer-<version>-solaris-profile
+make solaris PROFILE=1    # -> infer-<version>-solaris
 ```
 
-`PROFILE=1` appends `-DINFER_PROFILE` and renames the binary, so a
-profiling build can never overwrite a normal one. Without it the timers
-are not compiled in at all — every `PROF_*` macro expands to nothing.
+`PROFILE=1` appends `-DINFER_PROFILE`. **Every shipped binary is built
+with it**, because the overhead was not measurable (2.443–2.477 tok/s
+profiled against 2.430–2.466 plain, overlapping ranges) and the
+logging is opt-in at run time anyway — so a second timer-less copy of
+each artifact bought nothing but confusion. Set `PROFSUF=-profile` if
+you want both kinds side by side in one directory.
+
+Without `PROFILE=1` the timers are not compiled in at all — every
+`PROF_*` macro expands to nothing.
 
 ---
 

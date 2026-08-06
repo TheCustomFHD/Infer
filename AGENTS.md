@@ -29,7 +29,7 @@ mistakes agents make here come from applying modern-toolchain habits.
 make linux              # Linux/x86     -> infer-<version>-linux
 make windows            # Windows/x86   -> infer-<version>-windows.exe
 make solaris            # Solaris/SPARC -> infer-<version>-solaris
-make all                # all six shipping artifacts
+make all                # all four shipping artifacts
 make help               # targets and flags
 make test               # unit tests into build/
 ```
@@ -38,19 +38,45 @@ make test               # unit tests into build/
 
 | flag | effect |
 |---|---|
-| `PROFILE=1` | per-stage timers, binary named `...-profile` |
+| `PROFILE=1` | per-stage timers (every shipped build has them) |
 | `NATIVE=1` | `-march=native`; runs only on the build machine |
-| `BITS=64` | 64-bit Linux, named `...-linux64` (default 32) |
+| `BITS=64` | 64-bit build (default 32) |
 | `TOOLCHAIN=gcc` | Solaris via GCC instead of Sun Studio |
-| `NO_MMX=1` `NO_VIS=1` | leave a kernel out |
-| `NO_SSE2=1` `NO_AVX2=1` | reserved for the dedicated SSE2/AVX2 kernels (not yet written) |
+| `NO_MMX=1` `NO_AVX2=1` `NO_VIS=1` | leave a kernel out |
+| `NO_THREADS=1` | compile the thread pool away |
+| `NO_SSE2=1` | reserved; hand-written SSE2 kernel not yet written |
 
 Every binary contains **every kernel it could use** and picks one at run
-time after a CPUID / feature probe: `mmx`, `i8`, `ref` on x86; `vis`, `i8`, `ref` on SPARC. The x86 builds use an i486
+time after a CPUID probe (plus `XGETBV` for AVX2): `avx2`, `mmx`, `i8`,
+`ref` on x86; `vis`, `i8`, `ref` on SPARC. The x86 builds use an i486
 baseline, so one binary runs on a 486 and accelerates on anything newer.
 
-**Do not add targets.** No "MMX build", no "486 build", no
-"`-profile` target". If you think you need one, it is a flag.
+**`backend_avx2.c` is the only object compiled with `-mavx2`**, in a
+separate stage, linked against everything else built at the baseline.
+Compiling it together with the rest would apply `-mavx2` project-wide
+and the binary would fault on a 486 before `main()`. Two consequences
+for anyone editing this:
+
+- The backend table registers `avx2` on **`INFER_HAVE_AVX2`**, never
+  on `__AVX2__` — the latter is false in `backend.c`, so testing it
+  silently drops the kernel from every shipped build. (Finding 50.)
+- No intrinsics in `backend.c` or `qwen35.c`. Anything AVX2 goes
+  behind a `bk_a2_*` entry point in `backend_avx2.c` that returns 0
+  when unavailable, with a scalar fallback at the call site.
+
+**Threading is opt-in** (`--threads`, default 1) and rows are split,
+never dot products, so results are bit-identical at any thread count.
+Kernels must not keep per-call scratch in a `static` — that is a data
+race that produces plausible wrong output rather than a crash, and it
+shipped once. (Finding 52.)
+
+**Do not add targets, and do not add artifacts.** No "MMX build", no
+"486 build", no "`-profile` target", and no per-ISA download. 1.18-1.20
+shipped a `-sse2`/`-avx2` ladder and it was removed in 1.21.0: it made
+the user diagnose their own CPU, and a wrong guess died with an illegal
+instruction instead of running slower. A new kernel joins the runtime
+table as a gated object; it does not become a build flag or a file to
+download.
 
 ### First, in a fresh sandbox
 

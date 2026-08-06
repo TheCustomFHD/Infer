@@ -20,7 +20,7 @@ chat template** on every turn, and streams the reply.
 -c, --ctx <n>     context window     (default 4096)
 -n, --predict <n> max tokens per reply
 -t, --temp <f>    temperature
---backend <n>     mmx | i8 | ref
+--backend <n>     avx2 | mmx | i8 | ref
 ```
 
 ## Commands

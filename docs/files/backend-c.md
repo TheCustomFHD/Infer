@@ -9,17 +9,55 @@ Profiling showed **~95% of inference time in one operation**: the
 quantised matrix-vector product. Making that swappable — at compile time
 or run time — is the whole point.
 
-## The three backends
+## The four backends
 
 | name | requires | idea |
 |---|---|---|
 | `ref` | 486, x87 | dequantise each weight to float, multiply-add |
 | `i8` | 486, x87 | quantise activations to int8 once per matrix, then integer MACs |
 | `mmx` | MMX | as `i8`, with `PMADDWD` doing 4 MACs per instruction |
+| `avx2` | AVX2 + OS `ymm` | as `i8`, with `VPMADDUBSW` doing **32** per instruction |
 
 Selection is `auto` by default: the table is ordered fastest-first and
 the first entry the CPU supports wins. `--backend` overrides;
 `-DINFER_BACKEND=\"i8\"` sets a compile-time default.
+
+Two subtleties in the table, both of which have caused real bugs:
+
+**`avx2` is registered on `INFER_HAVE_AVX2`, never `__AVX2__`.** This
+file is compiled at the i486 baseline so one binary runs everywhere, so
+`__AVX2__` is false here even when `backend_avx2.o` is in the link.
+Testing the codegen macro silently drops the kernel from every shipped
+build. (Finding 50.)
+
+**`auto` tries `avx2` before the `I8_IS_VECTORISED` preference.**
+Finding 33 concluded "prefer portable `i8` once the compiler can
+vectorise" from a table whose only hand-written x86 kernel was MMX at
+4 MACs. At 32 the conclusion inverts. The finding-33 rule still applies
+below `avx2`, which is why a 64-bit build without AVX2 picks `i8` while
+a 32-bit i486-baseline build picks `mmx`.
+
+## Two activation planes
+
+`bk_quantize_x` produces the classic plane: int8 values widened to
+int16, **one scale per 32**, plus per-block and per-16 sums. `ref`,
+`i8` and `mmx` read it.
+
+`bk_quantize_k` produces a **Q8_K-style** plane: int8, **one scale per
+256**, plus per-16 sums. Only the AVX2 k-quant kernels read it, and it
+is built lazily — building it on every matvec cost more than it saved,
+at ~187 matvecs per forward pass.
+
+Both write shared static buffers, so under threading `q_matvec` fills
+them before the split and latches with `bk_quantize_hold()`.
+
+## Threading
+
+`q_matvec` splits output rows across the pool when there are enough of
+them. Rows are independent; **dot products are never split**, so the
+result is bit-identical at any thread count. See
+[`tpool-c.md`](tpool-c.md) for the hazards — the short version is that
+no kernel may keep per-call scratch in a `static`.
 
 ## Activation quantisation
 
