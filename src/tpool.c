@@ -137,7 +137,21 @@ static DWORD WINAPI tp_worker(LPVOID p) {
             if (++spins > tp_spin) break;
         }
         TP_BARRIER();
-        if (tp_sgen == mygen && !tp_quit)
+        /* MUST be a loop, not an `if`.
+         *
+         * tp_go is an AUTO-RESET event and the dispatcher signals it
+         * unconditionally on every batch, whether or not this worker
+         * was blocked. A signal that arrives while the worker is
+         * spinning is therefore still latched, and the NEXT wait
+         * returns immediately without a new batch existing. With a
+         * bare `if` the worker fell through, read tp_sgen unchanged,
+         * re-ran the PREVIOUS slice's indices and stamped tp_sdone
+         * with a stale generation -- so the dispatcher waited forever
+         * for a stamp that had already been written, or accepted one
+         * batch early. The pthread path always looped here; this one
+         * did not. (Finding 55.)
+         */
+        while (tp_sgen == mygen && !tp_quit)
             WaitForSingleObject(tp_go[id], INFINITE);
         if (tp_quit) break;
         mygen = tp_sgen;
@@ -230,12 +244,26 @@ int tp_start(int nthreads) {
     tp_spin = (nthreads <= tp_cpu_count()) ? 40000L : 0L;
 
 #if defined(_WIN32)
+    /* Every event must exist before ANY worker runs.
+     *
+     * Creating handle i and then immediately spawning worker i means
+     * worker 0 can reach WaitForSingleObject(tp_go[0]) while this loop
+     * is still creating tp_go[1]. That is survivable, but the same
+     * interleaving lets a worker observe a half-initialised table --
+     * and on the failure path (`if (!tp_th[i]) { tp_n = i; break; }`)
+     * it leaves already-running workers with an id >= tp_n, which the
+     * dispatcher then never schedules and never joins.
+     *
+     * Two passes: allocate everything, then start everything. */
     for (i = 0; i < tp_n; i++) {
         tp_sdone[i] = 0;
         tp_go[i]   = CreateEvent(NULL, FALSE, FALSE, NULL);
         tp_done[i] = CreateEvent(NULL, FALSE, FALSE, NULL);
-        tp_th[i]   = CreateThread(NULL, 0, tp_worker,
-                                  (LPVOID) (INT_PTR) i, 0, NULL);
+        if (!tp_go[i] || !tp_done[i]) { tp_n = i; break; }
+    }
+    for (i = 0; i < tp_n; i++) {
+        tp_th[i] = CreateThread(NULL, 0, tp_worker,
+                                (LPVOID) (INT_PTR) i, 0, NULL);
         if (!tp_th[i]) { tp_n = i; break; }
     }
 #else

@@ -2429,6 +2429,62 @@ replaced, not to a degraded version of itself.
 - Output is bit-identical at every thread count and equal to the
   previous release: this is scheduling only, no arithmetic changed.
 
+## 55. The same barrier, two platforms, one `while` and one `if`
+
+Finding 54 rewrote the pool barrier to spin before blocking, on both
+the pthread and Win32 paths. The pthread version re-checked its
+predicate in a loop. The Win32 version used a bare `if`.
+
+That is the classic condition-variable mistake, and Win32 auto-reset
+events make it worse rather than better. The dispatcher signals
+`tp_go` on **every** batch, whether or not the worker is blocked. A
+signal delivered while the worker is spinning is still latched, so the
+next `WaitForSingleObject` returns at once with no new work. With an
+`if` the worker fell through, read an unchanged `tp_sgen`, re-ran the
+**previous** slice and stamped `tp_sdone` with a stale generation —
+after which the dispatcher either waited forever for a stamp already
+written, or proceeded while workers were still writing `y[]`.
+
+On real hardware it crashed at `-T 2`. `-T 1` never enters the pool,
+so the default was safe and it shipped in 1.23.0 and 1.23.1.
+
+Modelling the auto-reset event exactly, 400 batches, one worker:
+
+```
+CURRENT (if)     stale-wakeups=10   batches with wrong slice: 10
+FIXED (while)    stale-wakeups=0    batches with wrong slice: 0
+```
+
+A latent second defect sat in the same function: `tp_start` created
+event `i` then immediately spawned worker `i`, so a worker could wait
+on a handle while later ones were still being created, and the
+allocation-failure path left running workers with an id `>= tp_n`,
+never scheduled and never joined. Events are now created in one pass,
+threads in a second.
+
+### Why four rounds of testing missed it
+
+Every threading test runs on Linux, where the pthread path is right.
+`t_thread` passed at 1/4/8 the whole time. The Windows binaries had
+never been run — a gap acknowledged since 1.18.0 and repeatedly
+justified with "no Wine in the sandbox".
+
+**That justification was wrong.** Wine installs fine and runs both
+binaries against the real model. The gap was never technical.
+
+### The rules this produces
+
+- **A platform you cannot execute is a platform you cannot claim.**
+  Four releases of "verified" Windows binaries rested on static
+  inspection of imports and opcode counts. None of that can see a
+  logic error in a wait loop.
+- **When one code path is ported to another, diff the control flow,
+  not just the API calls.** `pthread_cond_wait` → `WaitForSingleObject`
+  looks like a faithful translation and is not, because the loop
+  around it carries the correctness.
+- **Guard the source shape when no test can reach the behaviour.**
+  CI now asserts every go-signal wait is loop-governed on both paths.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

@@ -239,4 +239,4 @@ wrote** to confirm it produces the output you claimed.
 - [`.agents/PITFALLS.md`](.agents/PITFALLS.md) — bugs that have actually
   happened here, and how they were found
 - [`COMPILE.md`](COMPILE.md) — every target, every flag
-- [`docs/FINDINGS.md`](docs/FINDINGS.md) — 54 measured surprises
+- [`docs/FINDINGS.md`](docs/FINDINGS.md) — 55 measured surprises

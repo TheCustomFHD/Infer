@@ -352,12 +352,15 @@ i686-w64-mingw32-objdump -p infer-<version>-windows.exe \
 
 Must print nothing.
 
-### Step 5 — you cannot run it here, so test the Linux twin
+### Step 5 — run the Windows binary under Wine, then test the Linux twin
 
-Wine is unreliable in most sandboxes (Debian's Wine 10 fails its own
-prefix bootstrap with `user32.dll.CreateDialogParamW` unimplemented).
-Do not burn time on it.
+Wine was written off here for four releases on the strength of one
+bootstrap failure, and that call was wrong: the failure was a prefix
+in a directory the user did not own, not Wine itself. Debian's Wine 10
+runs both binaries fine. A Windows-only crash shipped twice behind
+that assumption (finding 55).
 
+Test the `.exe` first, then the Linux twin as a cross-check.
 `make linux` builds the *same sources with the same flags* and only
 swaps `net_win32.c`/`sys_win32.c` for their POSIX equivalents. If the
 Linux build is correct, the Windows one almost certainly is:
@@ -372,6 +375,31 @@ curl -L -o model.gguf \
     -n 8 -t 0 --seed 1 --backend mmx -c 256
 ./infer-<version>-linux run model.gguf -p "The capital of France is" \
     -n 8 -t 0 --seed 1 --backend i8 -c 256
+```
+
+**Run the actual .exe.** For four releases this step said the Windows
+binaries could not be executed in a sandbox. That was wrong, and it
+let a Windows-only crash ship twice (finding 55). Wine installs and
+runs them:
+
+```sh
+sudo apt-get install -y wine
+export WINEPREFIX="$HOME/.wineprefix"     # must be a directory you own
+export WINEDEBUG=-all
+wine ./infer-<version>-windows64.exe --backend list
+wine ./infer-<version>-windows64.exe run 'Z:\path\to\model.gguf' \
+     -n 12 -t 0 -p "whats the capital of germany" -T 2
+```
+
+Two traps: the prefix cannot live in `/tmp` if you do not own it, and
+the model path must be a Windows path (`Z:\` maps to `/`).
+
+**Test every thread count**, not just the default. The 1.23.0 bug was
+invisible at `-T 1` because that path never enters the pool:
+
+```sh
+for T in 1 2 4 8; do wine ./infer-<version>-windows64.exe run "$M" \
+    -n 12 -t 0 -p hi -T $T; done
 ```
 
 `-t 0` is greedy, so both **must** print identical text. If they differ,
@@ -396,7 +424,7 @@ make clean
 | `bits/libc-header-start.h: No such file` | `gcc-multilib` missing, needed for the 32-bit `make linux` |
 | binary is `PE32+` | used `x86_64-w64-mingw32-gcc`; use `i686-` |
 | `cannot open 'model.gguf'` mid-session | the sandbox pruned it; re-download |
-| tried to run the `.exe` under Wine | do not; verify statically and test the Linux twin |
+| `wine: '/tmp' is not owned by you` | set `WINEPREFIX` to a directory you own, e.g. `$HOME/.wineprefix` |
 | `--log-stages` prints nothing | you built without PROFILE=1; use `make windows PROFILE=1` |
 
 ---

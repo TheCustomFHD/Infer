@@ -454,6 +454,72 @@ jobs:
             exit 1
           fi
 
+      # Finding 55: the Win32 worker waited on its auto-reset event with
+      # a bare `if` while the pthread worker used a `while`. The
+      # dispatcher signals tp_go on EVERY batch, so a signal delivered
+      # while the worker was spinning stayed latched and the next wait
+      # returned with no new work -- the worker re-ran the previous
+      # slice and stamped a stale generation. Windows crashed at -T 2.
+      # Nothing on Linux can catch it, so guard the source shape.
+      # Finding 55: the Win32 worker waited on its auto-reset event with
+      # a bare "if" while the pthread worker used a "while". The
+      # dispatcher signals tp_go on EVERY batch, so a signal delivered
+      # while the worker was spinning stayed latched, the next wait
+      # returned with no new work, and the worker re-ran the previous
+      # slice and stamped a stale generation. Windows crashed at -T 2.
+      # No Linux test can see it, so guard the source shape instead.
+      #
+      # The invariant: every blocking wait for the go-signal must sit
+      # INSIDE a "while (tp_sgen == mygen ...)" loop, on both paths.
+      - name: both tpool waits re-check under a loop
+        run: |
+          fail=0
+          python3 - <<'PYEOF' || fail=1
+          import re, sys
+          src = open('src/tpool.c').read()
+          waits = ['WaitForSingleObject(tp_go[id]', 'pthread_cond_wait(&tp_cv_go']
+          ok = True
+          for w in waits:
+              i = src.find(w)
+              if i < 0:
+                  print('MISSING wait call:', w); ok = False; continue
+              # look back a few lines for the governing construct
+              back = src[max(0, i - 200):i]
+              gov = back.rfind('while (tp_sgen == mygen')
+              bad = back.rfind('if (tp_sgen == mygen')
+              if gov < 0 or bad > gov:
+                  print('NOT loop-guarded (finding 55):', w)
+                  print('   context:', repr(back[-120:]))
+                  ok = False
+              else:
+                  print('loop-guarded OK:', w)
+          sys.exit(0 if ok else 1)
+          PYEOF
+
+          # All Win32 events must exist before ANY worker is spawned.
+          # Line order alone is not enough: interleaving them inside ONE
+          # loop still puts the last CreateEvent above the first
+          # CreateThread. What matters is that they are in SEPARATE
+          # loops, so check that no single loop body contains both.
+          python3 - <<'PYEOF' || fail=1
+          import re, sys
+          body = re.search(r'^int tp_start.*?^\}', open('src/tpool.c').read(),
+                           re.S | re.M).group(0)
+          ok = True
+          # crude but sufficient: split on "for (" and inspect each block
+          for blk in body.split('for (')[1:]:
+              blk = blk[:blk.find('\n    }')]
+              if 'CreateEvent' in blk and 'CreateThread' in blk:
+                  print('CreateEvent and CreateThread share one loop '
+                        '-- a worker can start before its event exists '
+                        '(finding 55)')
+                  ok = False
+          print('event creation and thread creation are in separate loops'
+                if ok else 'FAIL')
+          sys.exit(0 if ok else 1)
+          PYEOF
+          test "$fail" -eq 0
+
       - name: NO_THREADS=1 compiles the pool away
         run: |
           make clean >/dev/null

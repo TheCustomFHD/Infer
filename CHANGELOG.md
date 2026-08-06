@@ -1,5 +1,87 @@
 # Changelog
 
+## 1.23.2 — CRITICAL: Windows crashed at any `-T` above 1
+
+**Every Windows user on 1.23.0 and 1.23.1 must update.** `-T 2` or
+higher started generating and then died with no output. `-T 1`, the
+default, was unaffected — which is the only reason this shipped.
+
+Reported from real hardware: *"if i run -T 2 or anything but 1 it
+tries to generate but quits empty"*. Reproduced here under Wine on the
+1.23.1 binary — it does not "quit empty", it **crashes** with a
+register dump. The fixed binary prints identical text at `-T 1`,
+`-T 2`, `-T 4` and `-T 8`.
+
+### The bug
+
+1.23.0 rewrote the thread-pool barrier to spin before blocking
+(finding 54). Both the pthread and Win32 paths were changed. The
+pthread one re-checked its predicate in a loop:
+
+```c
+while (tp_sgen == mygen && !tp_quit)
+    pthread_cond_wait(&tp_cv_go, &tp_mx);
+```
+
+The Win32 one used a bare `if`:
+
+```c
+if (tp_sgen == mygen && !tp_quit)
+    WaitForSingleObject(tp_go[id], INFINITE);   /* WRONG */
+```
+
+`tp_go` is an **auto-reset event**, and the dispatcher signals it on
+every batch whether or not the worker is blocked. A signal delivered
+while the worker was spinning stays latched, so the *next*
+`WaitForSingleObject` returns immediately with no new batch. With a
+bare `if` the worker fell straight through, read an unchanged
+`tp_sgen`, re-ran the **previous** slice's indices and stamped
+`tp_sdone` with a stale generation. The dispatcher then either waited
+forever for a stamp already written, or accepted a batch early and
+raced the workers still writing into `y[]`.
+
+Simulated faithfully on POSIX (auto-reset event modelled exactly),
+400 batches:
+
+```
+CURRENT (if)     stale-wakeups=10   batches with wrong slice: 10
+FIXED (while)    stale-wakeups=0    batches with wrong slice: 0
+```
+
+A second, latent defect in the same function: `tp_start` created event
+`i` and immediately spawned worker `i`, so a worker could reach
+`WaitForSingleObject(tp_go[id])` while later handles were still being
+created — and on the allocation-failure path it left already-running
+workers with an id `>= tp_n`, never scheduled and never joined. Events
+are now all created in one pass, threads in a second.
+
+### Why no test caught it
+
+Every threading test runs on Linux, where the pthread path is correct.
+`t_thread` passes at 1/4/8 threads and always did. The Windows
+binaries had **never been executed** — noted as a known gap since
+1.18.0.
+
+That gap is now closed: **Wine runs them**. Both Windows binaries were
+executed here at `-T 1/2/4/8` against the real model, and the 32-bit
+one confirmed correct on the XP/Geode build too.
+
+```
+win64  -T 1   11.939 tok/s
+win64  -T 2   13.651 tok/s
+```
+
+CI gains `both tpool waits re-check under a loop`, which asserts the
+source shape no Linux test can observe: every blocking wait for the
+go-signal sits inside a `while (tp_sgen == mygen ...)`, and event
+creation and thread creation live in separate loops. Both failure
+modes verified with negative controls.
+
+### Unchanged
+
+Linux and the arithmetic are untouched: output is bit-identical at
+every thread count, and the full host-side suite passes.
+
 ## 1.23.1 — a full documentation audit, and the two code bugs it found
 
 Every one of the 44 documentation files was read against the code it

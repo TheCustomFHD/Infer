@@ -48,6 +48,6 @@ Three things that trip agents up more than anything else:
   expected output. Section 2 is a step-by-step Windows XP recipe.
 - [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) — how the pieces
   fit; read before any structural change.
-- [`../docs/FINDINGS.md`](../docs/FINDINGS.md) — 54 measured surprises.
+- [`../docs/FINDINGS.md`](../docs/FINDINGS.md) — 55 measured surprises.
 - [`../docs/PERFORMANCE-ANALYSIS.md`](../docs/PERFORMANCE-ANALYSIS.md) —
   read before optimising. Contains every rejected approach and why.

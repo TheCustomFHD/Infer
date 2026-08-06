@@ -71,7 +71,7 @@ Nothing to `pip install`, no CMake, no submodules.
 | **[PROFILING.md](PROFILING.md)** | `--log-perf`, `--log-stages`, and reading the output |
 | **[CHANGELOG.md](CHANGELOG.md)** | what changed, and why |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | how the pieces fit; data flow |
-| **[docs/FINDINGS.md](docs/FINDINGS.md)** | 54 surprises, each with measurements |
+| **[docs/FINDINGS.md](docs/FINDINGS.md)** | 55 surprises, each with measurements |
 | **[docs/PERFORMANCE-ANALYSIS.md](docs/PERFORMANCE-ANALYSIS.md)** | why the kernels are at their hardware floor |
 | **[docs/TEMPLATES.md](docs/TEMPLATES.md)** | custom Jinja templates |
 | **[docs/files/](docs/files/)** | one document per source file |
