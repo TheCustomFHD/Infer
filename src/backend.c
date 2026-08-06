@@ -1095,6 +1095,7 @@ static void mv_slice(void *argp, long lo, long hi) {
           j->ncols, hi - lo);
 }
 
+
 void q_matvec(int type, const unsigned char *w, const float *x,
               float *y, long ncols, long nrows) {
     PROF_DECL(pt);

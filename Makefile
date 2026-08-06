@@ -100,7 +100,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.21.3
+VERSION = 1.22.0
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -601,7 +601,7 @@ vis-shim-test: tests/t_viskern.c $(VISSRC)
 		$(STEST_DEPS) -lm
 	@echo "run: ./$(BUILD)/t_viskern_sun   then   ./$(BUILD)/t_viskern_gcc"
 
-i8-split-test: $(USE_AVX2SRC) tests/t_i8split.c tests/t_q5split.c tests/t_ident.c tests/t_avx2sat.c \
+i8-split-test: $(USE_AVX2SRC) tests/t_i8split.c tests/t_q5split.c tests/t_ident.c tests/t_avx2sat.c tests/t_scales.c \
                tests/t_avx2acc.c tests/t_thread.c tests/t_kbench.c
 	@mkdir -p $(BUILD)
 	$(CC) -std=gnu89 -Wall -Wextra -O2 -o $(BUILD)/t_i8split tests/t_i8split.c
@@ -614,6 +614,8 @@ i8-split-test: $(USE_AVX2SRC) tests/t_i8split.c tests/t_q5split.c tests/t_ident.
 		$(SRCDIR)/sys_posix.c $(LDLIBS)
 	$(CC) -std=c89 -pedantic -Wall -Wextra -O3 \
 		-o $(BUILD)/t_avx2sat tests/t_avx2sat.c
+	$(CC) -std=c89 -pedantic -Wall -Wextra -O3 \
+		-o $(BUILD)/t_scales tests/t_scales.c
 	$(CC) $(X86FLAGS) -m$(BITS) $(USE_LFS) -I$(SRCDIR) \
 		-o $(BUILD)/t_avx2acc tests/t_avx2acc.c \
 		$(SRCDIR)/backend.c $(USE_MMXSRC) $(A2_OBJ) $(SRCDIR)/quant.c \
@@ -631,6 +633,7 @@ i8-split-test: $(USE_AVX2SRC) tests/t_i8split.c tests/t_q5split.c tests/t_ident.
 		$(SRCDIR)/tpool.c $(SRCDIR)/sys_posix.c $(LDLIBS) $(USE_THRLIB)
 	@echo "run: ./$(BUILD)/t_i8split  ./$(BUILD)/t_q5split  ./$(BUILD)/t_ident"
 	@echo "     ./$(BUILD)/t_avx2sat  ./$(BUILD)/t_avx2acc  ./$(BUILD)/t_thread"
+	@echo "     ./$(BUILD)/t_scales"
 	@echo "     ./$(BUILD)/t_kbench   (timing, not pass/fail)"
 
 # =====================================================================

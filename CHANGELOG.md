@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.22.0 — the scale decode was bigger than the arithmetic
+
+Single core, sandbox Xeon, 64-bit AVX2, 40 tokens greedy:
+**13.56 -> 14.5 tok/s** (best of 8; median 14.4). Isolated kernel gains are much larger:
+
+| format | before | after |
+|---|---|---|
+| Q4_K | 0.070 ns/weight | **0.056** |
+| Q5_K | 0.086 | **0.066** |
+| Q6_K | 0.085 | **0.071** |
+
+### Where the time actually was
+
+Stripping the Q4_K kernel down and timing each layer:
+
+```
+loads only                            0.015 ns/weight
++ nibble split                        0.016
++ VPMADDUBSW / VPMADDWD               0.019   <- all the real arithmetic
+full kernel                           0.070
+```
+
+**73% of the kernel was not the arithmetic.** Timing the pieces found
+`a2_scales8` — the per-superblock unpack of six 6-bit scales and six
+6-bit mins from twelve packed bytes — at **0.038 ns/weight**, twice the
+cost of the vector work it feeds. It runs once per superblock per row,
+so on the 248320-row lm head that is a million calls per token.
+
+The old version walked the eight indices with a branch and several
+shifts each. The new one treats the twelve bytes as four 32-bit words
+and does the whole thing with three masks and no branch — llama.cpp's
+`utmp` trick. **9.76 ns -> 1.94 ns per superblock, 5.0x.**
+
+`tests/t_scales.c` (new) proves the two forms agree: all-zeros,
+all-ones, all 96 single-bit patterns, every two-bit carry pattern, and
+2,000,000 random inputs. Pure integer arithmetic, so it runs on every
+target rather than only x86.
+
+### Prefetch distance re-tuned
+
+`A2_PFDIST` 24 -> 32, measured in-model rather than in a microbenchmark
+(8 -> 12.8, 16 -> 14.6, 24 -> 14.6, **32 -> 14.7**, 40 -> 14.7,
+48 -> 14.7, 64 -> 14.2).
+
+### Honest accounting of the remaining gap
+
+llama.cpp reaches roughly twice this on the same machine, and this
+release does not close that. What the measurements now say:
+
+- The machine sustains **11.3 GB/s** single-core streaming.
+- The model must move **520 MB per generated token**, so the hard
+  ceiling is **21.7 tok/s**.
+- We are at 14.5, i.e. **7.5 GB/s, about 67% of the ceiling**.
+
+Three hypotheses were tested and killed along the way, each recorded in
+finding 53: transparent hugepages (file mappings measured *faster* than
+`malloc`, 12.6 vs 10.9 GB/s), cache eviction by the 18.9 MB DeltaNet
+state (touching 1 MB between matvecs did not slow the weight stream),
+and prefetch overshoot past the end of a row (overshoot turned out to
+help, because rows are contiguous).
+
+The kernel reaches **9.3 GB/s** on a cold 522 MB mmap'd file with the
+model's exact shapes, but only 6.9-8.2 GB/s inside the engine. That
+residual is the next thing to chase and it is not in the kernels.
+
 ## 1.21.3 — documentation brought up to date
 
 No code change; `infer` is byte-identical to 1.21.2 apart from the

@@ -59,6 +59,7 @@
 
 #if defined(INFER_HAVE_AVX2) && defined(__AVX2__)
 
+#include <string.h>
 #include <immintrin.h>
 
 #define QK_K 256
@@ -74,7 +75,7 @@
  * the L3): distance 1 gave 3.77 GB/s, distance 4 gave the numbers in
  * finding 49. Beyond ~6 the lines start evicting each other and it
  * turns back down. */
-#define A2_PFDIST 24
+#define A2_PFDIST 32
 
 
 /* Prefetch a whole block: 144-210 bytes = 3-4 cache lines. */
@@ -91,24 +92,46 @@ static float a2_rd_f16p(const unsigned char *p) {
     return q_fp16_to_fp32((unsigned short) (p[0] | (p[1] << 8)));
 }
 
-/* Decode all EIGHT (scale, min) pairs of a k-quant superblock in one
- * go, straight-line, from the 12 packed bytes.
+/* Decode all EIGHT (scale, min) pairs of a k-quant superblock at once.
  *
- * The per-index helper below is called eight times per superblock and
- * is branchy; at 40% of the forward pass in Q4_K alone that showed up.
- * This is the same bit layout, unrolled and branch-free -- llama.cpp
- * does the equivalent with three 32-bit masks. */
+ * This is word-parallel, not byte-at-a-time, and that matters more than
+ * it looks: profiling the AVX2 Q4_K kernel showed the vector core
+ * (loads, nibble split, VPMADDUBSW, VPMADDWD) costing 0.019 ns/weight
+ * while the whole kernel cost 0.070 -- and **the scalar scale decode
+ * alone was 0.038 of that**, twice the arithmetic it feeds. It runs
+ * once per superblock per row, so on the 248320-row lm head it runs a
+ * million times per token.
+ *
+ * The layout is six 6-bit scales and six 6-bit mins packed into 12
+ * bytes, with the top two bits of the first four bytes carrying the
+ * high nibbles of entries 4..7. Handling that per index needs a branch
+ * and several shifts; handled as four 32-bit words it is three masks
+ * and a shuffle, with no branch at all. Same bit layout, same output --
+ * asserted against the per-index form over random inputs by
+ * tests/t_scales.c.
+ *
+ * Measured: 9.76 ns -> 1.94 ns per superblock, a 5.0x cut on what was
+ * the single largest term in the kernel. (Finding 53.)
+ */
 static void a2_scales8(const unsigned char *q, unsigned char *sc,
                        unsigned char *mn) {
-    int j;
-    for (j = 0; j < 4; j++) {
-        sc[j] = (unsigned char) (q[j] & 63);
-        mn[j] = (unsigned char) (q[j + 4] & 63);
-    }
-    for (j = 4; j < 8; j++) {
-        sc[j] = (unsigned char) ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
-        mn[j] = (unsigned char) ((q[j + 4] >>  4) | ((q[j    ] >> 6) << 4));
-    }
+    const unsigned int k1 = 0x3f3f3f3fu;   /* 6 bits per byte  */
+    const unsigned int k2 = 0x0f0f0f0fu;   /* low nibble       */
+    const unsigned int k3 = 0x03030303u;   /* top 2 bits       */
+    unsigned int u[4], aux;
+
+    memcpy(u, q, 12);
+    u[3] = ((u[2] >> 4) & k2) | (((u[1] >> 6) & k3) << 4);
+    aux  = u[1] & k1;
+    u[1] = (u[2] & k2) | (((u[0] >> 6) & k3) << 4);
+    u[2] = aux;
+    u[0] &= k1;
+
+    /* u[0],u[1] are the eight scales; u[2],u[3] the eight mins. */
+    memcpy(sc,     &u[0], 4);
+    memcpy(sc + 4, &u[1], 4);
+    memcpy(mn,     &u[2], 4);
+    memcpy(mn + 4, &u[3], 4);
 }
 
 

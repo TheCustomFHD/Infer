@@ -392,6 +392,7 @@ jobs:
           make clean >/dev/null
           make i8-split-test BITS=64 ISA=avx2
           ./build/t_avx2sat
+          ./build/t_scales
           ./build/t_avx2acc
           # t_thread loops over every backend by name (finding 52):
           # testing only the one `auto` picks left mmx unthreaded by

@@ -2198,6 +2198,83 @@ reach the tokenizer, because tokenisation completes before the first
 forward pass. It is safe, and now on record as *checked* rather than
 assumed.
 
+## 53. The scale decode cost more than the arithmetic it fed
+
+Chasing the 2x gap against llama.cpp. The AVX2 Q4_K kernel was at
+0.070 ns/weight. Stripping it down and timing each layer, on the same
+data:
+
+| what | ns/weight |
+|---|---|
+| loads only | 0.015 |
+| + nibble split | 0.016 |
+| + VPMADDUBSW / VPMADDWD | **0.019** |
+| the full kernel | **0.070** |
+
+**73% of the kernel was not the arithmetic.** That is not a ratio you
+can guess at from reading code -- the vector instructions are what the
+eye lands on, and they were a fifth of the cost.
+
+Timing the remaining pieces individually found `a2_scales8` at
+**0.038 ns/weight** -- twice the vector work it feeds. It unpacks six
+6-bit scales and six 6-bit mins from twelve packed bytes, once per
+superblock per row, which on the 248320-row lm head is a million calls
+per token. The old form walked the eight indices with a branch and
+several shifts each; the new one treats the twelve bytes as four 32-bit
+words, three masks, no branch. **9.76 ns -> 1.94 ns, 5.0x.**
+
+Result: Q4_K 0.070 -> 0.056, Q5_K 0.086 -> 0.066, Q6_K 0.085 -> 0.071
+ns/weight.
+
+**The rule:** when a kernel is slower than its instruction mix
+suggests, time it *by subtraction* -- build the loop up one stage at a
+time and measure each. Reading the assembly tells you what is there;
+subtraction tells you what it costs. Here the assembly showed 64
+VPMADDUBSW against 80 VPBROADCASTW and I spent a while on the
+broadcasts, which turned out to be worth only 7%.
+
+### Three hypotheses that were wrong, and how each died
+
+Recorded because each was plausible, cheap to test, and would have been
+expensive to "fix" on faith.
+
+**Transparent hugepages.** The benchmark used `malloc` (THP-eligible)
+while the model uses a file mapping, where THP is off. A 384 MB
+streaming read measured: anon+`MADV_HUGEPAGE` 10.91 GB/s, anon 4K
+11.78, **file mmap 12.58**. The file mapping was *fastest*. Dead.
+
+**Cache eviction by the DeltaNet state.** 18 layers x 16 heads x
+128x128 floats = 18.9 MB, 35% of L3, read and written twice per token.
+Adding a 1 MB state touch between matvecs in a benchmark changed
+6.14 -> 7.16 GB/s -- it got *faster*, i.e. noise, not interference.
+Dead.
+
+**Prefetch overshooting the row.** `A2_PFDIST=24` prefetches 24
+superblocks ahead; a 1024-column Q4_K row is only 4 superblocks, so the
+prefetch lands six rows away. That looked like obvious waste. Sweeping
+the distance in-model: 8 -> 12.8 tok/s, 16 -> 14.6, 24 -> 14.6,
+32 -> 14.7, 48 -> 14.7, 64 -> 14.2. Overshoot **helps**, because rows
+are contiguous in memory and the next row is read immediately after.
+Dead -- and the distance was raised to 32 rather than lowered.
+
+### Where the remaining gap is, measured
+
+- Machine sustains **11.3 GB/s** single-core streaming (AVX2 loads,
+  prefetched, 4 accumulators -- all three variants within 2%).
+- The model moves **520 MB per generated token** (508 MB file, and the
+  profiler's own byte counter agrees).
+- Hard ceiling: **21.7 tok/s**. We are at 14.7 = **7.6 GB/s, 67%**.
+- The same kernel on a cold 522 MB mmap'd file with the model's exact
+  shapes reaches **9.3 GB/s**; inside the engine the same shapes run at
+  6.9-8.2.
+
+So roughly a fifth of the remaining gap is inside the kernel and the
+rest is engine-side, and it is *not* any of the three causes above.
+The next candidate is the 186 separate matvec calls per forward pass,
+each restarting the hardware prefetcher on a different tensor -- but
+that is a hypothesis, not a finding, and the previous three teach that
+the difference matters.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full
