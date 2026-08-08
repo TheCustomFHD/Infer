@@ -144,6 +144,14 @@ int main(int argc, char **argv) {
         { double m = 0.0;
           bench_one("mmx", qmv_mmx, types[t], names[t], ncols, nrows, &m); }
 #endif
+#if defined(INFER_HAVE_VIS)
+        /* VIS was missing here entirely, so the one machine whose
+         * kernels most needed timing could not be timed. */
+        { double v = 0.0;
+          bench_one("vis", bk_qmv_vis, types[t], names[t], ncols, nrows, &v);
+          if (v > 0.0) printf("  %-5s speedup vis vs i8: %.2fx\n",
+                              names[t], a / v); }
+#endif
 #if defined(INFER_HAVE_AVX2) && defined(__AVX2__)
         bench_one("avx2", qmv_avx2, types[t], names[t], ncols, nrows, &b);
         if (b > 0.0) printf("  %-5s speedup avx2 vs i8: %.2fx\n", names[t], a / b);

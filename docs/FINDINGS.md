@@ -2485,6 +2485,188 @@ binaries against the real model. The gap was never technical.
 - **Guard the source shape when no test can reach the behaviour.**
   CI now asserts every go-signal wait is loop-governed on both paths.
 
+## 56. SPARC: MADV_SEQUENTIAL means something different on Solaris
+
+Reported from a real UltraSPARC: 25.88 s/tok generation, and "VERY
+high disk usage" throughout.
+
+The disk usage is the interesting half. `sys_map_advise_random()` has
+advised `MADV_SEQUENTIAL` since finding 48 replaced the original (and
+genuinely wrong) `MADV_RANDOM`. On Linux that widens readahead and
+nothing else -- pages are **not** dropped behind the read pointer,
+confirmed on lkml: it "will only increase the amount of read ahead ...
+but will not influence the rate at which the pages just read will be
+freed from memory".
+
+Solaris does not agree. Its manual says of `MADV_SEQUENTIAL`: pages
+"will be accessed only once and can be freed behind the current access
+point". That is licence to discard.
+
+The access pattern here is sequential **within** one token and then
+starts over from the beginning for the next one. So the hint is true
+for a few milliseconds and false forever after: the pages the next
+token needs are exactly the ones Solaris was just told to throw away.
+On a machine with less RAM than the 508 MiB model, every generated
+token re-reads the model from disk.
+
+`MADV_WILLNEED` alone gives the useful half -- start pulling the
+mapping in -- with no licence to evict. Neither hint forces residency,
+so a small machine still works; it just pages honestly.
+
+**Lesson:** a POSIX advice constant is not a portable API. The name is
+standard, the semantics are per-kernel, and this one differs in the
+direction that matters on exactly the platform least able to absorb
+it.
+
+## 57. SPARC has no integer-to-float register move, and -O3 makes it worse
+
+Same machine, the compute half. The VIS backend was reaching ~56
+Mflop/s where the model needs ~100 to hit 15 s/tok.
+
+Disassembling `vis_dot_q4_K` (sparc64 gcc 14, `-O3`) showed **32
+`fmul8x16` against 105 `ld`, 64 `st`, 51 `ldx` and 31 `stx`** -- about
+250 memory operations for 32 multiplies. 99 of 103 stores were to
+`%fp`, i.e. stack spills, not real work.
+
+The cause is architectural. VIS operands live in the **floating-point**
+register file, and UltraSPARC has no direct move between the integer
+and FP files: every integer-side value fed to a VIS instruction must
+go out to memory and come back. `PACK_U8X4` -- which turns four packed
+nibbles into a VIS vector -- is therefore one store plus one load,
+every time, and there are four per 32-weight group.
+
+`-O3` unrolls the inner loop 4x, multiplying the number of such values
+live at once, and the allocator spills. Normalised per `fmul8x16`, so
+the unroll factor cannot flatter the count:
+
+```
+                     insns/mul   stack-spill ops/mul
+  -O3                   19.5            4.2
+  -O2                   46.0           10.5   (barely unrolls)
+  -Os                   38.8            9.2
+  -O2 -funroll-loops    16.0            3.7   <- best on both
+```
+
+Same ordering on `vis_dot_q5_K` (27.0/7.1 -> 21.5/4.7). The Solaris
+GCC target now defaults to `-O2 -funroll-loops`, overridable with
+`SOLGCCOPT`.
+
+**Lesson:** `-O3` is not a synonym for "faster" on a register-poor
+machine with an expensive register-file crossing. Normalise by the
+unit of real work before comparing, or unrolling will flatter itself.
+
+## 58. Eight function calls per super-block, for a single array read
+
+While measuring finding 57, `i8_dot_q6_K` on sparc64 showed **9 calls
+per Q6_K super-block**: one to `rd_f16p` and **eight to
+`sum16.isra.0`**. `sum16()` is one line:
+
+```c
+static int sum16(const bk_qx *xq, long idx) { return xq->s16[idx / 16]; }
+```
+
+At `-O2` GCC declined to inline it, so each of the eight epilogue uses
+became a real call -- a register-window save and restore on SPARC, in
+a kernel that is **35% of a token** on that machine (Q6_K is the LM
+head).
+
+Adding an `always_inline` attribute to `sum16()` and `rd_f16p()`:
+
+```
+  i8_dot_q6_K   328 -> 272 insns,  105 -> 54 spills,  9 -> 1 calls
+```
+
+Doing the same to `get_scale_min_k4()` was tried and is **worse**: it
+is big enough that inlining it twice per group inflates Q4_K 256 ->
+288 and Q5_K 176 -> 216, and the share-weighted total across the three
+formats goes 219 -> 239. Reverted.
+
+**Lesson:** "hot" is not the criterion for force-inlining; "small and
+hot" is. And check the whole weighted profile, not the one kernel you
+were looking at.
+
+## 59. The VIS Q6_K kernel is still not worth enabling
+
+Finding 30 disabled the VIS Q6_K kernel because it measured no faster
+than the portable path. Re-checked while chasing finding 57, since
+Q6_K is 35% of a SPARC token and the biggest single target.
+
+Per 256-weight super-block, `-O2 -funroll-loops`, whole function:
+
+```
+  i8_dot_q6_K       328 insns, 105 spills
+  vis_dot_q6_K_al   440 insns, 127 spills
+```
+
+VIS is **1.34x more instructions**, which matches the user's own
+`--kernel bench`: q6k vis 0.711 ms vs i8 0.712 ms, i.e. identical,
+because the runtime picks `i8` for q6k anyway.
+
+The reason is specific to the format. A Q4_K weight is one nibble and
+needs one mask. A Q6_K weight is split across two planes -- four bits
+in `ql`, two in `qh` -- so reassembling it costs mask, shift and or
+per weight, all on the integer side, and every reassembled value then
+has to cross the integer-to-FP gap that finding 57 describes. The
+format defeats the instruction.
+
+Still compiled out. `-DINFER_VIS_Q6K` remains for anyone who wants to
+re-measure on different silicon.
+
+## 60. The SPARC wins do not transfer to x86, and the reason is the call
+
+After 1.24.0 took SPARC from 25.88 to 13.87 s/tok, the obvious question
+was whether i486/MMX/Windows had the same bottlenecks. Checked all
+three, one at a time.
+
+**The `madvise` bug does not exist on Windows.** The Win32 path maps
+with `CreateFileMapping`/`MapViewOfFile` and opens the file with
+`FILE_FLAG_RANDOM_ACCESS`, which looks like the `MADV_RANDOM` mistake
+of finding 48. It is not, for a reason worth writing down: per
+Microsoft, "memory-mapped file access does not go through the cache
+manager, and consequently these cache hints have no effect". The
+weights are read only through the mapped view, so the flag never
+touches the hot path. (It does ask the cache manager to keep mapped
+views resident, which Microsoft discourages in general but which is
+mildly in our favour here.) On Linux the 1.24.0 change applies but
+measures as nothing, because Linux never freed behind us.
+
+**The inlining win is real in the object code and invisible in the
+clock.** Force-inlining `sum16()`/`rd_f16p()` (finding 58) helps every
+target's instruction count, including the shipped Windows 32-bit
+build:
+
+```
+                       q4_K      q5_K      q6_K     share-weighted
+  before (mingw)    152/4c    159/4c    330/9c          200
+  after  (mingw)    151/4c    162/4c    289/1c          186   (-7%)
+```
+
+End to end on x86, 32-bit, single thread, 12 tokens, three
+interleaved pairs:
+
+```
+  i8    before 1.418 1.420 1.379   after 1.400 1.421 1.405
+  mmx   before 3.099 3.101 3.046   after 3.041 3.057 3.050
+```
+
+Nothing. A 7% instruction reduction bought 0%.
+
+**Why.** The saving is eight *function calls* per Q6_K super-block. On
+SPARC a call is a `save` that rotates a register window, and a window
+overflow traps into the kernel to spill sixteen registers; the machine
+is in-order and single-issue, so that latency is fully exposed. On
+x86 a call is a push and a jump, with no window and no trap, and any
+out-of-order core hides it entirely.
+
+**Lesson:** an optimisation is only as portable as the *cost model*
+that motivated it. "Fewer instructions" is not a cost model. This is
+finding 36 ("instruction count is not the i486's cost model either")
+arriving from the opposite direction: the i486 turns out to be much
+closer to x86 than to SPARC on precisely this axis.
+
+The change is kept because it is free, harmless, and worth 7% of the
+instruction stream on the machine that cares.
+
 ## See also
 
 - [../PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — the full

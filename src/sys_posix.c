@@ -91,30 +91,45 @@ const unsigned char *sys_map_data(sys_map *m) {
 }
 
 void sys_map_advise_random(sys_map *m) {
-    /* MADV_RANDOM was wrong for this workload and cost real
-     * throughput. Inference walks EVERY weight of every tensor in
-     * address order, once per token -- the most sequential access
-     * pattern there is. MADV_RANDOM tells the kernel to switch off
-     * readahead, so each page fault fetched one page instead of a
-     * run, and the streaming kernels stalled on faults they should
-     * never have seen.
+    /* Advise WILLNEED, and deliberately NOT SEQUENTIAL.
      *
-     * MADV_WILLNEED asks the kernel to start pulling the mapping in;
-     * MADV_SEQUENTIAL restores (and doubles) readahead. Neither
-     * forces residency, so a machine with less RAM than the model
-     * still works -- it just pages, which is the honest behaviour.
+     * The access pattern is sequential WITHIN one token and then
+     * starts over from the beginning for the next token. Those two
+     * facts pull in opposite directions, and which one you encode
+     * matters enormously on a small machine.
      *
-     * The function keeps its name so callers do not change; what it
-     * advises is a property of the access pattern, and the pattern is
-     * sequential. */
-#if defined(MADV_SEQUENTIAL)
-    if (m) madvise(m->base, m->maplen, MADV_SEQUENTIAL);
-#endif
+     * MADV_RANDOM was the original advice and was wrong: it switches
+     * readahead off, so each fault fetched one page instead of a run.
+     *
+     * MADV_SEQUENTIAL replaced it and is ALSO wrong, but only on
+     * Solaris, which is why it survived. The two kernels do not mean
+     * the same thing by it:
+     *
+     *   Linux    widens readahead. Pages are NOT dropped behind the
+     *            read pointer.
+     *   Solaris  "pages will be accessed only once and can be freed
+     *            behind the current access point" -- the hint is
+     *            licence to DISCARD what we just read.
+     *
+     * On Solaris that turns every generated token into a full re-read
+     * of the model from disk, because the pages the next token needs
+     * are exactly the ones the hint just told the VM to throw away.
+     * Reported from a real UltraSPARC as "VERY high disk usage", with
+     * generation pinned near the disk's throughput rather than the
+     * CPU's.
+     *
+     * MADV_WILLNEED alone gives the useful half -- start pulling the
+     * mapping in -- with no licence to evict. Neither hint forces
+     * residency, so a machine with less RAM than the model still
+     * works; it just pages, which is the honest behaviour.
+     *
+     * The function keeps its name so callers do not change. */
 #if defined(MADV_WILLNEED)
     if (m) madvise(m->base, m->maplen, MADV_WILLNEED);
 #endif
     (void) m;
 }
+
 
 void sys_map_close(sys_map *m) {
     if (!m) return;

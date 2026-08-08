@@ -1,5 +1,324 @@
 # Changelog
 
+## 1.24.1 — SPARC confirmed at 1.87x, and why it does not transfer to x86
+
+No code change. This records the real-hardware result for 1.24.0 and
+the investigation into whether the same wins apply to i486/MMX/Windows.
+
+### SPARC, measured on the user's UltraSPARC
+
+| | 1.23.x | 1.24.0 |
+|---|---:|---:|
+| generation | 25.88 s/tok | **13.87 s/tok** |
+| prompt | 11.91 s/tok | **7.55 s/tok** |
+| matvec throughput | ~57 Mflop/s | **126.0 Mflop/s** |
+
+**1.87x on generation.** The 15 s/tok minimum is beaten; the 10 s/tok
+goal is not yet reached.
+
+I predicted ~10% from the instruction-count work and said the
+`madvise` fix could not be sized from the sandbox because qemu has no
+page-cache pressure. That was the right caveat and the wrong estimate:
+the `madvise` fix was the dominant one. The disk was taking roughly
+half the machine.
+
+The profile is now honest compute. Q6_K is **45.3% of matvec time**
+and still runs on the portable path — the remaining headroom.
+
+### Does it transfer to x86? No, and the reason is the call
+
+Checked all three parts of the SPARC work against i486, MMX and the
+shipped Windows builds.
+
+**The `madvise` bug is Solaris-only.** The Win32 path maps with
+`CreateFileMapping`/`MapViewOfFile` and opens the handle with
+`FILE_FLAG_RANDOM_ACCESS`, which superficially resembles the
+`MADV_RANDOM` mistake of finding 48. It is not: per Microsoft,
+"memory-mapped file access does not go through the cache manager, and
+consequently these cache hints have no effect". Weights are read only
+through the mapped view, so the flag never touches the hot path. On
+Linux the 1.24.0 change applies but measures as nothing, because Linux
+never freed behind us in the first place.
+
+**The inlining win is real in the object code.** The shipped Windows
+32-bit build, share-weighted across the three formats:
+
+```
+                     q4_K      q5_K      q6_K    weighted
+  before          152/4c    159/4c    330/9c        200
+  after           151/4c    162/4c    289/1c        186   (-7%)
+```
+
+**And it is worth 0% on the clock.** 32-bit, single thread, three
+interleaved pairs:
+
+```
+  i8    before 1.418 1.420 1.379   after 1.400 1.421 1.405
+  mmx   before 3.099 3.101 3.046   after 3.041 3.057 3.050
+```
+
+The saving is eight *function calls* per Q6_K super-block. On SPARC a
+call is a `save` that rotates a register window, and an overflow traps
+into the kernel to spill sixteen registers — on an in-order,
+single-issue core that latency is fully exposed. On x86 a call is a
+push and a jump. Same instruction saving, different cost model,
+different outcome.
+
+The change stays: it is free, harmless, and worth 7% of the
+instruction stream on the machine that cares. (Finding 60.)
+
+### Lesson
+
+An optimisation is only as portable as the cost model that motivated
+it. "Fewer instructions" is not a cost model. This is finding 36
+arriving from the opposite direction — the i486 turns out to sit much
+closer to modern x86 than to SPARC on exactly this axis.
+
+## 1.24.0 — SPARC: a Solaris madvise trap, and 35% of a token off-kernel
+
+Prompted by a report from real UltraSPARC hardware: 25.88 s/tok
+generation, and **"VERY high disk usage"** throughout.
+
+Three defects found, two fixed, one confirmed as a non-fix. Also a
+test-coverage gap that had hidden all of it.
+
+### The disk usage: `MADV_SEQUENTIAL` does not mean what it does on Linux
+
+`sys_map_advise_random()` has advised `MADV_SEQUENTIAL` since 1.20.0,
+where it correctly replaced `MADV_RANDOM`. On Linux that widens
+readahead and nothing more — pages are **not** dropped behind the read
+pointer.
+
+Solaris disagrees. Its manual says such pages "will be accessed only
+once and **can be freed behind the current access point**". That is
+licence to discard.
+
+The access pattern here is sequential *within* one token and then
+restarts from the beginning for the next. So the hint is true for a
+few milliseconds and false forever after: the pages the next token
+needs are exactly the ones Solaris was just told to throw away. On a
+machine with less RAM than the 508 MiB model, every generated token
+re-reads the model from disk — which is precisely the reported
+symptom.
+
+Now `MADV_WILLNEED` only: start pulling the mapping in, with no
+licence to evict. Neither hint forces residency, so a small machine
+still works; it just pages honestly. x86 is unaffected (14.2 tok/s
+before and after). (Finding 56.)
+
+### The compute: SPARC has no integer-to-float register move
+
+Disassembling `vis_dot_q4_K` (sparc64 gcc 14, `-O3`) showed **32
+`fmul8x16` against ~250 memory operations**, 99 of 103 stores being
+stack spills.
+
+VIS operands live in the **floating-point** register file and
+UltraSPARC has no direct move between the integer and FP files, so
+every integer-side value fed to a VIS instruction costs a store plus a
+load. `-O3` unrolls 4x, multiplies the number of such values live at
+once, and the allocator spills. Normalised per `fmul8x16` so the
+unroll factor cannot flatter the count:
+
+| flags | insns/mul | spill ops/mul |
+|---|---:|---:|
+| `-O3` | 19.5 | 4.2 |
+| `-O2` | 46.0 | 10.5 |
+| `-Os` | 38.8 | 9.2 |
+| **`-O2 -funroll-loops`** | **16.0** | **3.7** |
+
+Same ordering on `vis_dot_q5_K` (27.0/7.1 → 21.5/4.7). The Solaris GCC
+target now defaults to `-O2 -funroll-loops`, overridable with
+`SOLGCCOPT`. Sun Studio is untouched. (Finding 57.)
+
+### Eight function calls per super-block, for one array read
+
+`i8_dot_q6_K` was emitting **nine calls per Q6_K super-block** — eight
+of them to `sum16()`, which is a single array subscript. At `-O2` GCC
+declined to inline it, so each use became a real call and a SPARC
+register-window save/restore, in a kernel that is **35% of a token**
+on that machine.
+
+Force-inlining `sum16()` and `rd_f16p()`:
+
+```
+i8_dot_q6_K   328 -> 272 insns,  105 -> 54 spills,  9 -> 1 calls
+```
+
+Doing the same to `get_scale_min_k4()` was tried and is **worse** —
+big enough that inlining it twice per group pushes the share-weighted
+total across the three formats from 219 to 239. Reverted. "Small and
+hot" is the criterion, not "hot". (Finding 58.)
+
+### What did not work: the VIS Q6_K kernel
+
+Q6_K is 34.9% of a SPARC token and runs on the **portable** path, so
+the existing (compiled-out) VIS Q6_K kernel looked like the biggest
+single lever. Measured per super-block:
+
+```
+i8_dot_q6_K       328 insns, 105 spills
+vis_dot_q6_K_al   440 insns, 127 spills
+```
+
+VIS is **1.34x more instructions**, matching the user's own
+`--kernel bench` (q6k vis 0.711 ms vs i8 0.712 ms). A Q4_K weight is
+one nibble and needs one mask; a Q6_K weight is split across two
+planes, so reassembling it costs mask+shift+or per weight on the
+integer side, and every value then crosses the int→FP gap above. The
+format defeats the instruction. Finding 30 was right; it stays
+compiled out. (Finding 59.)
+
+### The coverage gap that hid this
+
+`tests/t_kbench.c` — the per-format kernel benchmark — had **no VIS
+case at all**. It knew `i8`, `mmx` and `avx2`. So the one platform
+whose kernels most needed timing was the one platform that could not
+be timed. Added.
+
+### Honest expectation
+
+The instruction-count work is worth roughly **10%** weighted by format
+share: 25.88 s/tok to about 23 s/tok. That is short of the 15 s/tok
+minimum and well short of the 10 s/tok goal.
+
+**The `madvise` fix is the one that could close the gap, and its size
+cannot be measured from here.** qemu has no page-cache pressure and
+effectively unlimited RAM, so the failure mode does not reproduce; the
+generation rate matches the isolated kernel bench (~57 Mflop/s both
+ways), which says the *CPU* sets the rate in the absence of memory
+pressure. On the real machine, with "VERY high disk usage" reported,
+the disk is doing work the CPU-bound model does not account for. That
+needs a measurement on the hardware to size.
+
+### Verification
+
+All SPARC tests pass under qemu with the new flags: `t_viskern` still
+reports **exactly `0.000e+00`** on all eleven shapes (VIS remains
+bit-identical to `i8`), plus `t_vis`, `t_vissat`, `t_thread` at 1/4,
+and `t_endian`. Every source compiles warning-free with
+`-O2 -funroll-loops`. x86: all four artifacts build with zero
+warnings, all seven host kernel tests pass, output unchanged, and
+throughput unchanged at ~14.2 tok/s.
+
+## 1.23.3 — docs rewritten, a dead flag removed, Windows perf explained
+
+No behaviour change. This release is a cleanup pass: a new
+documentation set, one build flag deleted for doing nothing, and an
+investigation into why Windows looked slower than the changelog
+claimed.
+
+### Why Windows looked slow — it was a units error in the changelog
+
+Reported as *"you said you got like 25t/s, i barely got 21t/s on a
+theoretically faster machine"*.
+
+**The 22.16 tok/s figure in the 1.23.0 changelog is a Linux number.**
+It was measured with `infer-linux64` and labelled only "sandbox Xeon",
+so it read as a platform-neutral claim. It never was one — no Windows
+measurement existed at that point, because the Windows binaries had
+never been executed (finding 55). The 1.23.0 entry now says so
+explicitly.
+
+Measured properly, same box, same model, 40 tokens greedy, idle:
+
+| | `-T 1` | `-T 2` | scaling |
+|---|---:|---:|---:|
+| Linux 64-bit native | 12.80 | 18.22 | 1.42x |
+| Windows 64-bit under Wine | 10.77 | 12.58 | 1.17x |
+
+At `-T 1` the thread pool is never entered and the kernels are
+byte-identical code, so that **16% gap is entirely Wine's
+libc/syscall layer**, not anything in `infer`. Wine also emulates the
+synchronisation primitives badly — `SetEvent` measures ~35 us under
+Wine against roughly 1 us on real Windows — so the scaling deficit
+shown here is an **upper bound**, not a real-Windows result. A
+~21 tok/s reading on a real i7 is consistent with the true Windows
+overhead being much smaller.
+
+### An optimisation that was tried and reverted
+
+The Win32 dispatcher signals every worker on every parallel region
+(~95 per token), even in spin mode when nobody is waiting. The obvious
+fix is a `tp_blocked[]` flag so only blocked workers are signalled.
+
+Implemented and measured: **no gain.** Three interleaved pairs at
+`-T 2` gave 10.51/10.47, 10.34/10.66, 10.89/10.95 — noise. Worse, in
+longer runs the patched binary intermittently produced no output at
+`-T 2` where the unpatched one never did, which points at a
+lost-wakeup race (unconfirmed: a POSIX model of that interleaving did
+not reproduce it in 20,000 batches).
+
+**A change with no measured benefit and a suspected liveness bug does
+not ship.** Reverted to the known-correct 1.23.2 logic. Revisiting it
+requires a measurement on real Windows, because under Wine there is no
+signal to optimise against.
+
+### `NO_SSE2=1` removed
+
+The flag produced a **byte-identical binary**, verified by md5: no
+source file read `INFER_HAVE_SSE2`, and there is no hand-written SSE2
+kernel. A flag that does nothing is worse than no flag, because it
+implies a capability that is absent. The plumbing is gone from the
+Makefile and from CI's flag sweep.
+
+The remaining flags were each verified to actually change the binary:
+`NO_MMX=1`, `NO_AVX2=1`, `NO_THREADS=1`, `BITS=64`, `PROFILE=1`,
+`NATIVE=1`.
+
+### New documentation set: `docs-new/`
+
+Nine files, **2,600 lines, replacing 9,743** across 43. Written for
+someone who has never seen the project, and structured so an agent can
+find one fact quickly.
+
+```
+docs-new/README.md            what it is, 60-second start, the map
+        01-USING.md           every command, flag, chat command
+        02-BUILDING.md        every target, flag, verbatim recipes
+        03-ARCHITECTURE.md    how a token is produced, and why
+        04-PERFORMANCE.md     numbers, ceilings, the OPTIMISATION LOOP
+        05-TESTING.md         all 20 tests, what each proves
+        06-PITFALLS.md        every trap, indexed BY SYMPTOM
+        07-AGENTS.md          the agent workflow
+        reference/cli.md      full flag table (generated from opts.c)
+        reference/files.md    every source file, one line each
+        reference/findings.md all 55 findings, categorised
+        reference/workspace.md sandbox budget, Wine, cleanup, backups
+```
+
+Design rules: **each fact lives in exactly one place**, tables over
+prose, headings chosen to be greppable, and every claim verified
+against the code rather than copied forward. The old `docs/` tree is
+untouched for now so nothing breaks.
+
+Verified mechanically: every internal link resolves, every `make`
+target named exists, every `--flag` named is in `opts.c`, every source
+file is covered by `reference/files.md`, and all 55 findings appear in
+the index exactly once.
+
+### `.agents/` collapsed
+
+Four files totalling 1,100 lines, all duplicating the main docs. Now
+one 14-line pointer, and `AGENTS.md` rewritten as a 90-line entry
+point: the ten hard rules, setup, the loop in one line, and a table of
+where everything is.
+
+### Also
+
+- **The optimisation loop is now written down**
+  ([04-PERFORMANCE.md](docs-new/04-PERFORMANCE.md#the-optimisation-loop)):
+  test and record, search for more tests, run them, search for
+  solutions, implement, test again, revert when needed, repeat until
+  the goal is reached. The two search steps are deliberately separate
+  and ordered — diagnostics first, fixes only once you know what is
+  broken — with the list of hypotheses that were confidently wrong.
+- **Wine is documented as a first-class tool**, including the four
+  rules that make it work (prefix ownership, `.cache` placement,
+  `Z:\` paths, killing stragglers).
+- **Workspace hygiene is documented** after a 1.4 GB Wine prefix
+  pushed the sandbox over budget and got the model evicted
+  mid-benchmark — which then looked exactly like a threading deadlock.
+
 ## 1.23.2 — CRITICAL: Windows crashed at any `-T` above 1
 
 **Every Windows user on 1.23.0 and 1.23.1 must update.** `-T 2` or
@@ -218,13 +537,20 @@ GitHub-only steps skipped as before.
 
 ## 1.23.0 — the threads were asleep more than they were working
 
-Two cores, sandbox Xeon, 64-bit AVX2, 40 tokens greedy, medians of 5
-interleaved runs against 1.22.0:
+Two cores, sandbox Xeon, **`infer-linux64` — a Linux measurement**,
+64-bit AVX2, 40 tokens greedy, medians of 5 interleaved runs against
+1.22.0:
 
 | threads | 1.22.0 | 1.23.0 | |
 |---|---|---|---|
 | `-T 1` | 13.99 tok/s | 14.12 tok/s | +1.0% (noise — the pool is not used) |
 | `-T 2` | 17.25 tok/s | **22.16 tok/s** | **+28.5%** (best seen 22.86) |
+
+**Do not compare this to a Windows run.** These are Linux figures on
+Linux binaries. No Windows number existed when this was written,
+because the Windows binaries had never been executed at all — see
+finding 55. Windows carries its own overhead and scales differently;
+1.23.2 has the first real Windows measurements.
 
 The user reported it from the other end of the fleet: on SPARC the
 process was spending ~19% of its time in the kernel and no longer

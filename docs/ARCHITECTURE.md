@@ -536,7 +536,7 @@ single recurrent state, so requests are serialised and each resets it.
 
 ## See also
 
-- [FINDINGS.md](FINDINGS.md) — 55 surprises, each with measurements
+- [FINDINGS.md](FINDINGS.md) — 60 surprises, each with measurements
 - [PERFORMANCE-ANALYSIS.md](PERFORMANCE-ANALYSIS.md) — why the kernels
   are at their hardware floor, including every rejected optimisation
 - [TEMPLATES.md](TEMPLATES.md) — the Jinja subset and how to verify one

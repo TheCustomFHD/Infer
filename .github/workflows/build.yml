@@ -520,6 +520,23 @@ jobs:
           PYEOF
           test "$fail" -eq 0
 
+      # Finding 56: MADV_SEQUENTIAL is not portable ADVICE, only a
+      # portable NAME. Linux widens readahead; Solaris takes it as
+      # licence to free pages behind the read pointer, which on a
+      # workload that rescans the whole model every token means
+      # re-reading 508 MiB from disk per token. Reported from real
+      # UltraSPARC hardware as "VERY high disk usage".
+      - name: the weight mapping is not advised SEQUENTIAL
+        run: |
+          if grep -nE '^[^*/]*madvise\([^)]*MADV_SEQUENTIAL' src/sys_posix.c; then
+            echo "::error::MADV_SEQUENTIAL on the weight mapping frees pages"
+            echo "::error::behind the read pointer on Solaris -- see finding 56"
+            exit 1
+          fi
+          grep -q 'MADV_WILLNEED' src/sys_posix.c || {
+            echo "::error::the weight mapping should still advise WILLNEED"; exit 1; }
+          echo "weight mapping advises WILLNEED only -- ok"
+
       - name: NO_THREADS=1 compiles the pool away
         run: |
           make clean >/dev/null
@@ -645,7 +662,7 @@ jobs:
       - name: every build flag still builds
         run: |
           for f in "PROFILE=1" "NATIVE=1" "BITS=64" "NO_MMX=1" \
-                   "NO_SSE2=1" "NO_AVX2=1" "NO_THREADS=1" \
+                   "NO_AVX2=1" "NO_THREADS=1" \
                    "BITS=64 PROFILE=1"; do
             echo "== make linux $f =="
             make clean >/dev/null

@@ -413,7 +413,28 @@ void bk_free_scratch(void) {
 /* Shared k-quant helpers                                              */
 /* ------------------------------------------------------------------ */
 
-static float rd_f16p(const unsigned char *p) {
+/* Force-inline hint for the tiny hot helpers.
+ *
+ * sum16() is a single array read and rd_f16p() is two bytes and a
+ * shift, but at -O2 GCC emits them as real calls. On sparc64 that
+ * showed up as EIGHT calls to sum16.isra.0 per Q6_K super-block --
+ * a save/restore register window each, in the epilogue of a kernel
+ * that is 35% of a token on that machine. C89 has no `inline`, so
+ * this is a compiler attribute behind a guard, and a plain `static`
+ * everywhere else.
+ *
+ * Applied to sum16() and rd_f16p() only. Doing the same to
+ * get_scale_min_k4() was tried and is WORSE: it is big enough that
+ * inlining it two-per-group inflates q4_K 256 -> 288 and q5_K
+ * 176 -> 216 instructions, and the share-weighted total goes
+ * 219 -> 239. Small and hot is the test, not just hot. */
+#if defined(__GNUC__)
+#define BK_INLINE __inline__ __attribute__((always_inline))
+#else
+#define BK_INLINE
+#endif
+
+BK_INLINE static float rd_f16p(const unsigned char *p) {
     return q_fp16_to_fp32((unsigned short) (p[0] | (p[1] << 8)));
 }
 
@@ -559,7 +580,7 @@ static float i8_dot_q5_K(const unsigned char *b, const bk_qx *xq, long ncols) {
 /* Sum of the quantised activations for a 16-wide group, precomputed in
  * bk_quantize_x (Q6_K weights are biased by -32; the bias term needs
  * this partial sum). */
-static int sum16(const bk_qx *xq, long idx) {
+BK_INLINE static int sum16(const bk_qx *xq, long idx) {
     return xq->s16[idx / 16];
 }
 

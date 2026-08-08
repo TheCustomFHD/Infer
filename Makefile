@@ -100,7 +100,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.23.2
+VERSION = 1.24.1
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -132,7 +132,7 @@ PROFSUF   =
 # off at build time, for a smaller binary or to isolate a codegen bug:
 #
 #     make linux NO_MMX=1
-#     make linux NO_AVX2=1 NO_SSE2=1
+#     make linux NO_AVX2=1
 #     make solaris NO_VIS=1
 #
 # All-on is the supported configuration. The runtime cost of having
@@ -156,7 +156,6 @@ USE_THRFLG = $(THRFLG_$(NO_THREADS))
 USE_THRLIB = $(THRLIB_$(NO_THREADS))
 
 NO_MMX  =
-NO_SSE2 =
 NO_AVX2 =
 NO_VIS  =
 
@@ -164,8 +163,6 @@ MMXSRC_   = $(SRCDIR)/backend_mmx.c
 MMXFLG_   = -DINFER_HAVE_MMX
 MMXSRC_1  =
 MMXFLG_1  =
-SSE2FLG_  = -DINFER_HAVE_SSE2
-SSE2FLG_1 =
 AVX2FLG_  = -DINFER_HAVE_AVX2
 AVX2FLG_1 =
 # backend_avx2.c guards its whole body on __AVX2__ as well, so it
@@ -181,7 +178,6 @@ VISFLG_1  =
 
 USE_MMXSRC  = $(MMXSRC_$(NO_MMX))
 USE_MMXFLG  = $(MMXFLG_$(NO_MMX))
-USE_SSE2FLG = $(SSE2FLG_$(NO_SSE2))
 USE_AVX2FLG = $(AVX2FLG_$(NO_AVX2))
 USE_AVX2SRC = $(AVX2SRC_$(NO_AVX2))
 USE_VISSRC  = $(VISSRC_$(NO_VIS))
@@ -311,8 +307,8 @@ help:
 	@echo "  TOOLCHAIN=gcc           build Solaris with GCC instead of Sun Studio"
 	@echo "  NATIVE=1                -march=native; runs ONLY on this machine"
 	@echo "  FAST=1                  Solaris non-IEEE float; verify with t_backend"
-	@echo "  NO_MMX=1 NO_SSE2=1      leave a kernel out"
-	@echo "  NO_AVX2=1 NO_VIS=1"
+	@echo "  NO_MMX=1 NO_AVX2=1      leave a kernel out"
+	@echo "  NO_VIS=1                leave the SPARC kernel out"
 	@echo ""
 	@echo "  make linux PROFILE=1 BITS=64"
 	@echo "  make solaris TOOLCHAIN=gcc NO_VIS=1"
@@ -369,12 +365,12 @@ A2_BUILD_WIN = $(A2CMDW_$(NO_AVX2))
 
 # Flags for that one object: the AVX2 arch REPLACES the i486 baseline.
 A2FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
-          $(AVX2ARCH) -mmmx $(USE_MMXFLG) $(USE_SSE2FLG) $(USE_AVX2FLG) \
+          $(AVX2ARCH) -mmmx $(USE_MMXFLG) $(USE_AVX2FLG) \
           $(USE_THRFLG)
 
 X86FLAGS = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
            $(USE_ARCH) -mmmx \
-           $(USE_MMXFLG) $(USE_SSE2FLG) $(USE_AVX2FLG) $(USE_THRFLG) \
+           $(USE_MMXFLG) $(USE_AVX2FLG) $(USE_THRFLG) \
            $(A2_LINKED)
 
 # TWO-STAGE. backend_avx2.c is compiled on its own with -mavx2 into an
@@ -503,8 +499,29 @@ SOLLIBS   = -lm -lsocket -lnsl
 SOL_CC_studio    = $(SUNCC)
 SOL_CC_gcc       = $(GNUCC)
 SOL_FLAGS_studio = $(SUNFLAGS) $(SOLVIS_studio$(NO_VIS))
-SOL_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
+SOL_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter \
+                   $(SOLGCCOPT) \
                    -m64 -DINFER_BIG_ENDIAN=1 $(SOLVIS_gcc$(NO_VIS)) \
+
+# -O2 -funroll-loops, NOT -O3.
+#
+# VIS values live in the FP register file and SPARC has no direct
+# integer<->float move, so every int-side value fed to a VIS op costs a
+# store plus a load. -O3 unrolls the inner loop 4x, which multiplies the
+# number of such values live at once and the register allocator spills.
+# Measured on vis_dot_q4_K, normalised per fmul8x16 (the unit of real
+# work), so the unroll factor cannot flatter the count:
+#
+#            insns/mul   stack-spill ops/mul
+#   -O3         19.5            4.2
+#   -O2         46.0           10.5      (barely unrolls at all)
+#   -Os         38.8            9.2
+#   -O2 -funroll-loops
+#               16.0            3.7      <- best on both counts
+#
+# Same ordering on vis_dot_q5_K (27.0/7.1 -> 21.5/4.7). Override with
+# `gmake solaris TOOLCHAIN=gcc SOLGCCOPT=-O3` to compare on real iron.
+SOLGCCOPT ?= -O2 -funroll-loops
 
 SOLVIS_studio    = -xarch=sparcvis -xvis
 SOLVIS_studio1   =
