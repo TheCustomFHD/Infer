@@ -485,8 +485,10 @@ SUNFLAGS  = -Xc -xc99=none $(SUNOPT) $(SUNBITS) -xtarget=$(SUNTARGET) \
 SOLLIBS   = -lm -lsocket -lnsl
 
 # One target. TOOLCHAIN picks the compiler, NO_VIS drops the VIS
-# kernels, INFER_VIS_Q6K opts the Q6_K kernel back in (it measured no
-# faster than the portable path on an UltraSPARC IIi -- finding 30).
+# kernels. INFER_VIS_Q6K is on by default: on an UltraSPARC IIi the
+# VIS Q6_K kernel is ~45% faster than the portable path on the lm
+# head (the measured #1 hotspot; old note "finding 30" was based on a
+# contaminated whole-run measurement and is retracted).
 #
 #     make solaris
 #     make solaris TOOLCHAIN=gcc
@@ -523,9 +525,9 @@ SOL_FLAGS_gcc    = -std=gnu89 -Wall -Wextra -Wno-unused-parameter \
 # `gmake solaris TOOLCHAIN=gcc SOLGCCOPT=-O3` to compare on real iron.
 SOLGCCOPT ?= -O2 -funroll-loops
 
-SOLVIS_studio    = -xarch=sparcvis -xvis
+SOLVIS_studio    = -xarch=sparcvis -xvis -DINFER_VIS_Q6K
 SOLVIS_studio1   =
-SOLVIS_gcc       = $(SOLCPU_$(NATIVE)) -mvis
+SOLVIS_gcc       = $(SOLCPU_$(NATIVE)) -mvis -DINFER_VIS_Q6K
 SOLVIS_gcc1      =
 SOLCPU_          = -mcpu=ultrasparc
 # GCC's -mcpu=native only works when the compiler runs ON a SPARC; a
