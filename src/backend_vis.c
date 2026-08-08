@@ -824,14 +824,15 @@ static float vis_dot_q6_K(const unsigned char *b, const bk_qx *xq,
 /* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
-/* Q6_K: VIS kernel present, but OFF by default                        */
+/* Q6_K: VIS kernel, ON by default                                     */
 /*                                                                     */
-/* The kernel below is correct and bit-identical to i8, and it cuts    */
-/* the instruction count 3.1x (4180 -> 1338 per super-block). On real  */
-/* UltraSPARC IIi that bought nothing measurable: the Q6_K/Q4_K cost   */
-/* ratio per weight moved 0.862 -> 0.855, and across every plausible   */
-/* correction for the contaminated session the change lands between    */
-/* -4% and +8%. See finding 30.                                        */
+/* The kernel is correct and bit-identical to i8, and it cuts the      */
+/* instruction count 3.1x (4180 -> 1338 per super-block). On real      */
+/* UltraSPARC IIi this is a decisive win for the lm head (the #1       */
+/* hotspot, 32% of runtime): measured on the box, lm head 91.9 s ->    */
+/* 53.1 s (-43%), matvec Q6_K -45%, time per forward pass -23%. The    */
+/* earlier finding 30 ("bought nothing measurable") was based on a     */
+/* contaminated whole-session comparison and is retracted.             */
 /*                                                                     */
 /* Q6_K was never instruction-bound. Per weight it has always been the */
 /* CHEAPEST format on this machine -- ~427 ns/weight against 495 for   */
