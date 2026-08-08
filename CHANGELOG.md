@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.25.0 — the VIS Q6_K kernel ships on, and SPARC meets the 10 s/tok goal
+
+The VIS Q6_K kernel is enabled by default on Solaris (PR #3, from the
+UltraSPARC contributor). It had been compiled out for nine releases on
+the strength of two findings of mine, **both of which were wrong**.
+
+### Measured on the real UltraSPARC IIi
+
+| | 1.24.x | 1.25.0 |
+|---|---:|---:|
+| generation | 13.87 s/tok | **9.48 s/tok** |
+| prompt | 7.55 s/tok | **6.93 s/tok** |
+| matvec throughput | 126.0 Mflop/s | **162.5 Mflop/s** |
+| `matvec Q6_K` (us/call) | 272 985 | **193 651** (−29.1%) |
+| lm head (us/call) | 7 777 033 | **3 746 806** (−51.8%) |
+
+**The 10 s/tok goal, open since 1.24.0, is met.** Cumulative against
+1.23.2 (25.88 s/tok) this is **2.73x**.
+
+The result is trustworthy because attention — which carries no Q6_K —
+moved **+0.2%**, the untouched control stage that finding 30 itself
+demanded. And Q6_K's 1.246 s/pass saving accounts for 99.9% of the
+1.247 s that came off the total forward pass.
+
+### Why the kernel was wrongly rejected
+
+Findings 30 and 59 are **retracted**; finding **61** replaces them.
+Finding 59 rejected the kernel on static instruction counts, which are
+accurate (`i8_dot_q6_K` 272 insns vs `vis_dot_q6_K_al` 440) and were
+re-verified on gcc 14.2. The inference was not: `i8_dot_q6_K` issues
+**8 integer multiplies** per super-block and the VIS kernel issues
+**none**, trading them for 16 pipelined `fmul8x16`. On a CPU whose
+integer multiplier is multi-cycle and whose FPU is fully pipelined,
+counting each instruction as one unit hides exactly the trade that
+matters. Instruction counts screen; they do not arbitrate between
+functional units.
+
+### Fixed: the test that could not fail
+
+`vis-shim-test` built `backend_vis.c` **without** `-DINFER_VIS_Q6K`,
+so `bk_qmv_vis()` routed Q6_K to `qmv_i8()` and the Q6_K cases passed
+no matter what the VIS kernel did. This was the only VIS coverage in
+CI that is not `continue-on-error`, and it was testing the wrong code.
+
+Both shim branches now pass the define. Negative-control tested: with
+the VIS kernel's bias term deliberately broken, the old command line
+still reported `0.000e+00 ok`, the fixed one fails at ~9.5e-02.
+
+### Other targets
+
+No change. x86-64, i686, Windows and the Geode/MMX path are unaffected
+— `INFER_VIS_Q6K` is added only to `SOLVIS_studio`/`SOLVIS_gcc`, and
+the four shipped artifacts were verified byte-identical to 1.24.1 apart
+from the version string. `NO_VIS=1` still drops the kernel correctly.
+
+### Documentation
+
+`docs/FINDINGS.md` (retractions on 30 and 59, new finding 61),
+`docs/files/backend_vis-c.md`, `docs/PERFORMANCE-ANALYSIS.md`,
+`docs-new/02-BUILDING.md`, `docs-new/04-PERFORMANCE.md`,
+`docs-new/reference/findings.md`, and the findings count in
+`README.md` and `docs/ARCHITECTURE.md`.
+
 ## 1.24.1 — SPARC confirmed at 1.87x, and why it does not transfer to x86
 
 No code change. This records the real-hardware result for 1.24.0 and

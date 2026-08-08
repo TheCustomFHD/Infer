@@ -493,6 +493,23 @@ Mixing the integer kernels (`i8`, `mmx`, `vis`) is purely a speed
 choice — they are bit-identical. Pinning `avx2` for a k-quant format
 changes that format's rounding slightly; see section 8.
 
+Two caveats on the bench, both of which cost real time once:
+
+- **When two kernels tie, the pick flips between runs.** On a fast
+  host `q8_0` often measures the same on `avx2` and `i8` (0.015
+  ms/row-block each), so consecutive runs disagree about the winner.
+  That is the timer's resolution, not a change in the binary. If you
+  are comparing two builds, run the bench several times before
+  believing a difference in the chosen kernel.
+- **It measures a 512-column synthetic row-block, not your model.**
+  Formats whose real tensors are much larger — Q6_K holds the lm head,
+  which is 248320 rows — are dominated by per-call fixed cost in the
+  bench in a way they are not in a real forward pass. A kernel can lose
+  the bench and still win the run; that is exactly what happened with
+  the SPARC VIS Q6_K kernel for nine releases (finding 61). Trust
+  `--log-stages` on the real model over the bench when the two
+  disagree.
+
 ### Other diagnostics
 
 ```sh

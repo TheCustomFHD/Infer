@@ -331,8 +331,16 @@ vis  1.14.2 (x3)      2.33     0.86-0.94
 vis  1.15.1           1.15     0.86
 ```
 
-Q5_K 2.33 -> 1.15 is the fold fix. Q6_K 0.86 -> 0.86 is the VIS kernel
-buying nothing, which is why it is off by default.
+Q5_K 2.33 -> 1.15 is the fold fix. Q6_K 0.86 -> 0.86 looked like the
+VIS kernel buying nothing, and it kept the kernel off by default for
+nine releases.
+
+**That reading was wrong.** The 1.15.1 session was contaminated (`rms
+norms`, untouched by any version, ran 4.3x slow in it), so the ratio
+above measures the session, not the kernel. Re-measured on the same
+UltraSPARC IIi in 1.25.0 with a clean run and an untouched control
+stage, the VIS Q6_K kernel is worth **−29% on `matvec Q6_K`** and
+**13.87 → 9.48 s/tok**. It is on by default now. See finding 61.
 
 ## A methodological lesson
 

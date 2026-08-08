@@ -78,22 +78,27 @@ activation quantisation — visible in `i8` too — not a kernel fault.
 Comparing against the wrong reference sends you debugging correct
 code.
 
-## Q6_K is compiled out by default
+## Q6_K is compiled in by default
 
-`INFER_VIS_Q6K` gates the Q6_K kernel, and it is **off**. Not because
-it is wrong — it passes every test — but because it measured no faster
-than `i8` on the real machine. Q6_K was never instruction-bound there,
-so a 3.1× instruction reduction was invisible end to end (finding 30).
+`INFER_VIS_Q6K` gates the Q6_K kernel, and since 1.25.0 it is **on**.
+`make solaris` adds it for both toolchains, so no hand-passed define is
+needed.
 
-There is no `make` target for it; the per-variant target ladder was
-removed in 1.21.0. Pass the define by hand:
+It was off for nine releases on the strength of findings 30 and 59,
+both of which are now retracted. Measured on the real UltraSPARC IIi it
+is worth **−29% on `matvec Q6_K`**, **−51.8% on the lm head** and
+**13.87 → 9.48 s/tok** end to end. The instruction-count argument that
+kept it off was the mistake: this kernel replaces 8 multi-cycle integer
+multiplies per super-block with 16 pipelined `fmul8x16`, and a flat
+instruction count cannot see that trade (finding 61).
 
-```sh
-gmake solaris SUNOPT='-xO5 -xunroll=16 -DINFER_VIS_Q6K'
-```
+To build without it — for A/B on different SPARC silicon — drop the
+define from `SOLVIS_studio`/`SOLVIS_gcc` in the Makefile, or use
+`NO_VIS=1` to drop the VIS kernels entirely.
 
-The default should be the path that measured faster, and re-measuring
-is the only way to change that.
+Both `vis-shim-test` branches pass `-DINFER_VIS_Q6K` too. Without it,
+`bk_qmv_vis()` routes Q6_K to `qmv_i8()` and the test's Q6_K cases pass
+regardless of what the VIS kernel does.
 
 ## Two compilers, one file
 

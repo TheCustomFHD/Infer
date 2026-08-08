@@ -100,7 +100,7 @@ TARGET  = infer
 # src/infer.h, and CI runs it.
 #
 #     make SUFFIX=      ->  plain `infer`, no version in the name
-VERSION = 1.24.1
+VERSION = 1.25.0
 SUFFIX  = -$(VERSION)
 BIN     = $(TARGET)$(SUFFIX)
 
@@ -602,6 +602,13 @@ solaris-test: tests/t_vis.c tests/t_viskern.c tests/t_vissat.c
 #   vis-shim-test  both VIS compiler branches on any host (finding 27:
 #                  little-endian, so it cannot check lane order)
 #   i8-split-test  i8 Q4_K split-loop integer exactness (finding 31)
+#
+# Both shim branches pass -DINFER_VIS_Q6K. This is not optional: the
+# Q6_K kernel ships ON since finding 61, and without the define
+# bk_qmv_vis() routes Q6_K to qmv_i8(), so t_viskern's Q6_K cases pass
+# whether the VIS kernel is right, wrong, or absent. This is the only
+# VIS coverage that is not continue-on-error in CI -- the qemu SPARC
+# job is advisory -- so it has to actually reach the kernel.
 vis-shim-test: tests/t_viskern.c $(VISSRC)
 	@mkdir -p $(BUILD)
 	@echo "NOTE: runs on the HOST's byte order. Checks types and"
@@ -609,7 +616,7 @@ vis-shim-test: tests/t_viskern.c $(VISSRC)
 	@echo "      big-endian machine for that. (Finding 27.)"
 	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
 		-D__SUNPRO_C=0x5150 -Itests/vis_shim \
-		-DINFER_HAVE_VIS -I$(SRCDIR) \
+		-DINFER_HAVE_VIS -DINFER_VIS_Q6K -I$(SRCDIR) \
 		-o $(BUILD)/t_viskern_sun tests/t_viskern.c $(VISSRC) \
 		$(STEST_DEPS) -lm
 	$(CC) -std=gnu89 -Wall -Wextra -Wno-unused-parameter -O3 \
@@ -618,7 +625,7 @@ vis-shim-test: tests/t_viskern.c $(VISSRC)
 		-D__builtin_vis_fpadd32=shim_fpadd32 \
 		-D__builtin_vis_fmuld8ulx16=shim_fmuld8ulx16 \
 		-include tests/vis_shim/gcc_shim.h \
-		-DINFER_HAVE_VIS -I$(SRCDIR) \
+		-DINFER_HAVE_VIS -DINFER_VIS_Q6K -I$(SRCDIR) \
 		-o $(BUILD)/t_viskern_gcc tests/t_viskern.c $(VISSRC) \
 		$(STEST_DEPS) -lm
 	@echo "run: ./$(BUILD)/t_viskern_sun   then   ./$(BUILD)/t_viskern_gcc"

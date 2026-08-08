@@ -421,10 +421,17 @@ the ~10% the instruction counts alone predicted. Recorded because the
 prediction was wrong in an instructive direction — the effect that
 could not be measured in the sandbox was the one that mattered.
 
-Remaining headroom on SPARC: Q6_K is 45.3% of matvec time and runs on
-the portable path, and the VIS kernel for it is measurably worse
-(finding 59). Closing the last gap to 10 s/tok needs either a better
-Q6_K approach or fewer bytes (see below).
+**Update (1.25.0): the last gap is closed.** Q6_K was 45.3% of matvec
+time on the portable path because the VIS kernel for it was believed
+worse (finding 59). It is not — enabling it gave **−29% on `matvec
+Q6_K`** and **13.87 → 9.48 s/tok**, beating the 10 s/tok goal. The
+instruction-count argument that kept it off could not see that the
+kernel trades 8 multi-cycle integer multiplies for 16 pipelined
+`fmul8x16`. Findings 30 and 59 are retracted; see finding 61.
+
+Remaining headroom on SPARC is now Q4_K (36.1% of matvec) and Q5_K
+(22.2%), both already on VIS kernels, so further gains need fewer
+bytes rather than better kernels (see below).
 
 ## What is left
 

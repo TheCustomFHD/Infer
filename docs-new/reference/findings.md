@@ -1,6 +1,6 @@
 # Findings index
 
-60 measured findings. Each is a thing that was surprising, cost real
+61 measured findings. Each is a thing that was surprising, cost real
 debugging time, or would bite the next person — and each is backed by
 a measurement.
 
@@ -83,7 +83,7 @@ The most actionable ones are distilled by symptom in
 
 ## Design decisions
 
-- **30.** us/call is the wrong unit when call sizes differ 6x
+- **30.** us/call is the wrong unit when call sizes differ 6x *(Q6_K subsection retracted — see 61)*
 - **48.** 6.3 -> 14.4 tok/s: the kernel was never the bottleneck
 - **50.** An ISA ladder was the wrong shape; a gated object is the right one
 
@@ -92,5 +92,6 @@ The most actionable ones are distilled by symptom in
 - **56.** SPARC: MADV_SEQUENTIAL means something different on Solaris
 - **57.** SPARC has no integer-to-float register move, and -O3 makes it worse
 - **58.** Eight function calls per super-block, for a single array read
-- **59.** The VIS Q6_K kernel is still not worth enabling
+- **59.** The VIS Q6_K kernel is still not worth enabling *(RETRACTED — see 61)*
 - **60.** The SPARC wins do not transfer to x86, and the reason is the call
+- **61.** Instruction counts cannot arbitrate between two functional units

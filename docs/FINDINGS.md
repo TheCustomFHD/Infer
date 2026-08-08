@@ -850,6 +850,18 @@ it — the ISA ladder of per-variant targets was collapsed in 1.21.0
 gmake solaris SUNOPT='-xO5 -xunroll=16 -DINFER_VIS_Q6K'
 ```
 
+> **RETRACTED (1.25.0) — this subsection only.** The verdict above is
+> wrong. The VIS Q6_K kernel is **on by default** since 1.25.0 and is
+> worth **−29% on `matvec Q6_K`** and **13.87 → 9.48 s/tok** on the
+> real UltraSPARC IIi. What failed here was the evidence, not the
+> reasoning: the 1.15.1 session was contaminated, so the 0.8% ratio it
+> produced was never a measurement of the kernel. "Inconclusive" was
+> recorded as "no gain". See **finding 61**.
+>
+> The rest of finding 30 — that `us/call` is the wrong unit, and that
+> Q6_K's profile share reflects its weight count — still stands, and is
+> still the reason the 1.15.0 effort was misdirected.
+
 ### The rules this produces
 
 - **Normalise by work, not by call.** A profile grouped by anything
@@ -2612,6 +2624,14 @@ format defeats the instruction.
 Still compiled out. `-DINFER_VIS_Q6K` remains for anyone who wants to
 re-measure on different silicon.
 
+> **RETRACTED (1.25.0).** Someone did re-measure on the silicon, and
+> the kernel is worth **−29% on `matvec Q6_K`** and **13.87 → 9.48
+> s/tok**. The instruction counts above are correct and were verified
+> again on gcc 14.2; the conclusion drawn from them is not. Counting
+> instructions treats an `smul` and an `add` as one unit each, and the
+> whole point of this kernel is that it trades 8 multi-cycle integer
+> multiplies for 16 pipelined `fmul8x16`. See **finding 61**.
+
 ## 60. The SPARC wins do not transfer to x86, and the reason is the call
 
 After 1.24.0 took SPARC from 25.88 to 13.87 s/tok, the obvious question
@@ -2666,6 +2686,82 @@ closer to x86 than to SPARC on precisely this axis.
 
 The change is kept because it is free, harmless, and worth 7% of the
 instruction stream on the machine that cares.
+
+## 61. Instruction counts cannot arbitrate between two functional units
+
+Findings 30 and 59 both rejected the VIS Q6_K kernel. Both are wrong.
+A contributor with an UltraSPARC IIi enabled it by default (PR #3) and
+measured, on the machine:
+
+```
+                    1.24.0      1.25.0     delta
+generation        13.87 s/tok  9.48 s/tok  -31.7%
+prompt             7.55        6.93         -8.2%
+matvec throughput  126.0       162.5 Mflop/s +29%
+
+per call (us), normalised so 27 vs 52 passes cannot flatter either
+  matvec Q6_K     272985      193651       -29.1%
+  lm head        7777033     3746806       -51.8%
+  feed-forward    144643      122446       -15.3%
+  attention        82010       82152        +0.2%   <- control
+```
+
+The **10 s/tok goal that had been open since 1.24.0 is met.**
+
+### Why the measurement is trustworthy
+
+Attention carries no Q6_K, and it moved +0.2%. That is the control
+finding 30 itself demanded ("always check a stage nobody touched"),
+and it rules out the session contamination that poisoned 1.15.1.
+
+The arithmetic also closes: Q6_K saves 1.246 s per forward pass, and
+the total pass moved 1.247 s. A change that recompiles exactly one
+kernel should account for the whole delta and nothing else — it
+accounts for 99.9%. Q4_K drifted the *wrong* way by 5%, which is what
+honest noise looks like.
+
+### Why finding 59 got it backwards
+
+The counts in finding 59 are real; re-derived on gcc 14.2:
+
+```
+                 insns  smul  fmul8x16
+i8_dot_q6_K        272     8         0
+vis_dot_q6_K_al    440     0        16
+```
+
+VIS is 1.6x the *instructions* and that is why it was rejected. But
+`i8_dot_q6_K` issues **8 integer multiplies** per super-block and the
+VIS kernel issues **none**, replacing them with 16 pipelined
+`fmul8x16`. Sun's own UltraSPARC manual describes "a multi-cycle
+integer multiplier" against an FPU where "most instructions are fully
+pipelined, with a throughput of one per cycle". Counting each
+instruction as one unit hides exactly the trade the kernel exists to
+make.
+
+The `--kernel bench` number that seemed to confirm it (`q6k vis 0.711
+ms vs i8 0.712`) measured the wrong shape: a 512-column synthetic
+row-block is dominated by per-call fixed cost, while the real Q6_K
+consumer is a 248320-row lm head. **The bench is not a proxy for the
+lm head, and should not be read as one.**
+
+### The rules this produces
+
+- **Static instruction counts screen; they do not arbitrate.** They
+  are fair between two kernels using the same functional units. Between
+  the integer multiplier and the FP pipe they are meaningless. On a
+  machine with no performance counters, a whole-run measurement with an
+  untouched control stage outranks any count.
+- **"Inconclusive" is not "no gain".** Finding 30's data could not
+  size the change (+8% to −4% under plausible corrections). It was
+  recorded as a rejection and inherited as settled fact for nine
+  releases.
+- **A gated kernel needs a gated test.** `vis-shim-test` built
+  `backend_vis.c` without `-DINFER_VIS_Q6K`, so its Q6_K cases silently
+  exercised `qmv_i8` instead. Verified by breaking the VIS kernel's
+  bias term: the old command line reported `0.000e+00 ok` on a kernel
+  that was provably wrong, while the fixed one fails with ~9.5e-02.
+  Both shim branches now pass the define.
 
 ## See also
 

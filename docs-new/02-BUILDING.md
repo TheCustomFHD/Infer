@@ -205,7 +205,7 @@ directly, so threading costs no extra library on Windows.
 | `-DINFER_A2_LINKED` | tells `backend_a2stub.c` to stand down; set by the Makefile, not derivable from `__AVX2__` |
 | `-DINFER_HAVE_THREADS` | compiles the thread pool in. Needs `-lpthread` on POSIX |
 | `-DINFER_HAVE_VIS` | compiles `backend_vis.c` in and registers `vis` (SPARC) |
-| `-DINFER_VIS_Q6K` | SPARC: opts the VIS Q6_K kernel back in. Off by default — it measured no faster than `i8`. No make target; pass it by hand |
+| `-DINFER_VIS_Q6K` | SPARC: the VIS Q6_K kernel. **On by default** since 1.25.0 (`make solaris` adds it) — worth −29% on `matvec Q6_K` and 13.87 → 9.48 s/tok on an UltraSPARC IIi. Findings 30 and 59, which kept it off, are retracted; see finding 61 |
 | `-DINFER_PROFILE` | per-stage timers. Without it every timer macro expands to nothing |
 | `-DINFER_BIG_ENDIAN=1`/`=0` | forces byte order. Autodetected; the build **fails** rather than guessing |
 | `-DINFER_BACKEND="i8"` | changes the default backend when none is given |
